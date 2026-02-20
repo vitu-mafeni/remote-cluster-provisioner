@@ -39,10 +39,47 @@ spec:
           spec:
             description: spec defines the desired state of RemoteCluster
             properties:
-              foo:
+              auth:
+                properties:
+                  passwordSecretRef:
+                    description: |-
+                      LocalObjectReference contains enough information to let you locate the
+                      referenced object inside the same namespace.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - passwordSecretRef
+                type: object
+              host:
                 description: foo is an example field of RemoteCluster. Edit remotecluster_types.go
                   to remove/update
                 type: string
+              kubernetes:
+                properties:
+                  version:
+                    type: string
+                required:
+                - version
+                type: object
+              port:
+                type: integer
+              user:
+                type: string
+            required:
+            - auth
+            - kubernetes
+            - port
+            - user
             type: object
           status:
             description: status defines the observed state of RemoteCluster
@@ -116,6 +153,10 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              message:
+                type: string
+              phase:
+                type: string
             type: object
         required:
         - spec

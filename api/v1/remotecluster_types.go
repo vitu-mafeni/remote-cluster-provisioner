@@ -37,13 +37,16 @@ type RemoteClusterSpec struct {
 	Port int    `json:"port"`
 	User string `json:"user"`
 
-	Auth struct {
-		PasswordSecretRef corev1.LocalObjectReference `json:"passwordSecretRef"`
-	} `json:"auth"`
+	Auth       RemoteClusterAuth       `json:"auth"`
+	Kubernetes RemoteClusterKubernetes `json:"kubernetes"`
+}
 
-	Kubernetes struct {
-		Version string `json:"version"`
-	} `json:"kubernetes"`
+type RemoteClusterAuth struct {
+	PasswordSecretRef corev1.LocalObjectReference `json:"passwordSecretRef"`
+}
+
+type RemoteClusterKubernetes struct {
+	Version string `json:"version"`
 }
 
 // RemoteClusterStatus defines the observed state of RemoteCluster.
