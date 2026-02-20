@@ -13,9 +13,10 @@ spec:
   auth:
     passwordSecretRef:
       name: remote-cluster-credentials
+      key: password
 
   kubernetes:
-    version: "v1.29.3"
+    version: "v1.34.2"
 
 ---
 apiVersion: v1

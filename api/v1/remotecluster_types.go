@@ -17,7 +17,6 @@ limitations under the License.
 package v1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -42,11 +41,16 @@ type RemoteClusterSpec struct {
 }
 
 type RemoteClusterAuth struct {
-	PasswordSecretRef corev1.LocalObjectReference `json:"passwordSecretRef"`
+	PasswordSecretRef SecretKeyReference `json:"passwordSecretRef"`
 }
 
 type RemoteClusterKubernetes struct {
 	Version string `json:"version"`
+}
+
+type SecretKeyReference struct {
+	Name string `json:"name"`
+	Key  string `json:"key"`
 }
 
 // RemoteClusterStatus defines the observed state of RemoteCluster.
