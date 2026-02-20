@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - infra.dcn.ssu.ac.kr
+  resources:
+  - remoteclusters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - infra.dcn.ssu.ac.kr
+  resources:
+  - remoteclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - infra.dcn.ssu.ac.kr
+  resources:
+  - remoteclusters/status
+  verbs:
+  - get
+  - patch
+  - update
