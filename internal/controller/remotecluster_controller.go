@@ -107,6 +107,8 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{}, nil
 }
 
+// register nephio resources to the scheme and create a repository object for the cluster
+
 func (r *RemoteClusterReconciler) fail(ctx context.Context, c *infrav1.RemoteCluster, err error) (ctrl.Result, error) {
 	c.Status.Phase = "Failed"
 	c.Status.Message = err.Error()

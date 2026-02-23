@@ -104,6 +104,8 @@ func SingleNode(client *sshhelper.Client, version string) error {
 		// Install Flannel CNI
 		// =========================
 		"kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml",
+		"kubectl create namespace argocd",
+		"kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
 	}
 
 	for _, cmd := range steps {
