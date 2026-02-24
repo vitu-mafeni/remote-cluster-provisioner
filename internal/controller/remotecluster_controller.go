@@ -118,7 +118,7 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	// defer client.Close()
 
-	err = provision.SingleNode(client, cluster.Spec.Kubernetes.Version)
+	err = provision.SingleNode(client, cluster)
 	if err != nil {
 		return r.fail(ctx, cluster, err)
 	}

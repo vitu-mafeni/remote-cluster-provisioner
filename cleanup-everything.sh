@@ -43,7 +43,7 @@ sudo rm -rf /var/lib/kubelet
 sudo rm -rf /var/lib/etcd
 sudo rm -rf /var/lib/cni
 sudo rm -rf /etc/cni
-sudo rm -rf /opt/cni
+# sudo rm -rf /opt/cni
 sudo rm -rf /etc/containerd
 sudo rm -rf /var/run/containerd
 sudo rm -rf $HOME/.kube

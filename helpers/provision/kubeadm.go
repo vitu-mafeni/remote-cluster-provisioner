@@ -4,16 +4,17 @@ import (
 	"fmt"
 	"strings"
 
+	infrav1 "dcn.ssu.ac.kr/infra/api/v1" // Add the correct import path for infrav1
 	sshhelper "dcn.ssu.ac.kr/infra/helpers/ssh"
 )
 
-func SingleNode(client *sshhelper.Client, version string) error {
+func SingleNode(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
 
-	clean := strings.TrimPrefix(version, "v")
+	clean := strings.TrimPrefix(cluster.Spec.Kubernetes.Version, "v")
 
 	parts := strings.Split(clean, ".")
 	if len(parts) < 2 {
-		return fmt.Errorf("invalid kubernetes version: %s", version)
+		return fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.Kubernetes.Version)
 	}
 
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
@@ -115,6 +116,10 @@ func SingleNode(client *sshhelper.Client, version string) error {
 		if err != nil {
 			return fmt.Errorf("command failed: %s\nOutput:\n%s", cmd, output)
 		}
+	}
+
+	if err := ConfigureArgoCD(client, cluster); err != nil {
+		return err
 	}
 
 	return nil
