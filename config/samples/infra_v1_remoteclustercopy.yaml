@@ -6,7 +6,8 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: remotecluster-sample
 spec:
-  host: "192.168.3.182"
+  clusterName: "edge"
+  host: "192.168.3.234"
   port: 22
   user: "ubuntu"
 
@@ -17,7 +18,10 @@ spec:
 
   kubernetes:
     version: "v1.34.2"
-
+  gitConfig:
+    enable: "true"
+    gitServer: "http://192.168.3.99:31810"
+    gitUsername: "nephio"
 ---
 apiVersion: v1
 kind: Secret

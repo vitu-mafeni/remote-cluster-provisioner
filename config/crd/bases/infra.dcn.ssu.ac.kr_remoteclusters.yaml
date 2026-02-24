@@ -54,9 +54,20 @@ spec:
                 required:
                 - passwordSecretRef
                 type: object
-              host:
+              clusterName:
                 description: foo is an example field of RemoteCluster. Edit remotecluster_types.go
                   to remove/update
+                type: string
+              gitConfig:
+                properties:
+                  enable:
+                    type: string
+                  gitServer:
+                    type: string
+                  gitUsername:
+                    type: string
+                type: object
+              host:
                 type: string
               kubernetes:
                 properties:
@@ -71,6 +82,7 @@ spec:
                 type: string
             required:
             - auth
+            - host
             - kubernetes
             - port
             - user

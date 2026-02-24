@@ -21,10 +21,14 @@ import (
 	"fmt"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
@@ -39,6 +43,11 @@ type RemoteClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
+
+const (
+	remoteClusterFinalizer = "infra.dcn.ssu.ac.kr/remotecluster-finalizer"
+	remoteClusterLabelKey  = "infra.dcn.ssu.ac.kr/remotecluster"
+)
 
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters/status,verbs=get;update;patch
@@ -62,6 +71,21 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	cluster := &infrav1.RemoteCluster{}
 	if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if cluster.ObjectMeta.DeletionTimestamp.IsZero() {
+
+		// ADD finalizer if missing
+		if !controllerutil.ContainsFinalizer(cluster, remoteClusterFinalizer) {
+			controllerutil.AddFinalizer(cluster, remoteClusterFinalizer)
+			if err := r.Update(ctx, cluster); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+	} else {
+		// BEING DELETED
+		return r.handleDelete(ctx, cluster)
 	}
 
 	if cluster.Status.Phase == "Ready" {
@@ -104,10 +128,263 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	cluster.Status.Message = "Cluster provisioned"
 	_ = r.Status().Update(ctx, cluster)
 
+	err = r.createClusterRepo(ctx, cluster)
+	if err != nil {
+		return r.fail(ctx, cluster, err)
+	}
+
 	return ctrl.Result{}, nil
 }
 
-// register nephio resources to the scheme and create a repository object for the cluster
+func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *infrav1.RemoteCluster) (ctrl.Result, error) {
+
+	log := logf.FromContext(ctx)
+	log.Info("Cleaning up resources for RemoteCluster", "remotecluster", cluster.Name)
+
+	if err := r.deleteClusterResources(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	controllerutil.RemoveFinalizer(cluster, remoteClusterFinalizer)
+	if err := r.Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// cleanup ssh kubeadm reset via SSH on deletion, Remote node cleanup
+	unInstallK8sRemoteCluster()
+
+	return ctrl.Result{}, nil
+}
+
+func unInstallK8sRemoteCluster() {
+	log := logf.FromContext(context.Background())
+	log.Info("Uninstalling Kubernetes on remote cluster via SSH")
+}
+
+func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+
+	labels := client.MatchingLabels{
+		remoteClusterFinalizer: cluster.Spec.ClusterName,
+	}
+
+	// -------------------------
+	// Delete Repository
+	// -------------------------
+	repoList := &unstructured.UnstructuredList{}
+	repoList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.porch.kpt.dev",
+		Version: "v1alpha1",
+		Kind:    "RepositoryList",
+	})
+
+	if err := r.List(ctx, repoList, labels, client.InNamespace(cluster.Namespace)); err != nil {
+		return err
+	}
+
+	for _, repo := range repoList.Items {
+		_ = r.Delete(ctx, &repo) // ignore notfound
+	}
+
+	// -------------------------
+	// Delete Token
+	// -------------------------
+	tokenList := &unstructured.UnstructuredList{}
+	tokenList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infra.nephio.org",
+		Version: "v1alpha1",
+		Kind:    "TokenList",
+	})
+
+	if err := r.List(ctx, tokenList, labels, client.InNamespace(cluster.Namespace)); err != nil {
+		return err
+	}
+
+	for _, token := range tokenList.Items {
+		_ = r.Delete(ctx, &token)
+	}
+
+	return nil
+}
+
+// create cluster repository on the management cluster if git integration is enabled
+func (r *RemoteClusterReconciler) createClusterRepo(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+
+	if cluster.Spec.GitConfig.Enable != "true" {
+		return nil
+	}
+
+	log := logf.FromContext(ctx)
+	log.Info("Creating cluster repositories", "remotecluster", cluster.Name)
+
+	labels := map[string]string{
+		remoteClusterLabelKey: cluster.Spec.ClusterName,
+	}
+
+	secretRefName := cluster.Spec.ClusterName + "-access-token-porch"
+
+	/*
+		--------------------------------------------------
+		Porch Repository (config.porch.kpt.dev)
+		--------------------------------------------------
+	*/
+	porchRepo := &unstructured.Unstructured{}
+	porchRepo.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.porch.kpt.dev",
+		Version: "v1alpha1",
+		Kind:    "Repository",
+	})
+
+	porchRepo.SetName(cluster.Spec.ClusterName)
+	porchRepo.SetNamespace(cluster.Namespace)
+	porchRepo.SetLabels(labels)
+
+	err := r.Get(ctx, client.ObjectKeyFromObject(porchRepo), porchRepo)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	if apierrors.IsNotFound(err) {
+		porchRepo.Object["spec"] = map[string]interface{}{
+			"content":    "Package",
+			"deployment": true,
+			"git": map[string]interface{}{
+				"repo":      cluster.Spec.GitConfig.GitServer + "/" + cluster.Spec.GitConfig.GitUsername + "/" + cluster.Spec.ClusterName + ".git",
+				"branch":    "main",
+				"directory": "/",
+				"secretRef": map[string]interface{}{
+					"name": secretRefName,
+				},
+			},
+			"type": "git",
+		}
+
+		if err := controllerutil.SetControllerReference(cluster, porchRepo, r.Scheme); err != nil {
+			return err
+		}
+
+		if err := r.Create(ctx, porchRepo); err != nil {
+			return err
+		}
+	}
+
+	/*
+		--------------------------------------------------
+		Nephio Repository (infra.nephio.org)
+		--------------------------------------------------
+	*/
+	nephioRepo := &unstructured.Unstructured{}
+	nephioRepo.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infra.nephio.org",
+		Version: "v1alpha1",
+		Kind:    "Repository",
+	})
+
+	nephioRepo.SetName(cluster.Spec.ClusterName)
+	nephioRepo.SetNamespace(cluster.Namespace)
+	// nephioRepo.SetLabels(labels)
+
+	err = r.Get(ctx, client.ObjectKeyFromObject(nephioRepo), nephioRepo)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	if apierrors.IsNotFound(err) {
+		nephioRepo.Object["spec"] = map[string]interface{}{
+			"description":   "Repository for " + cluster.Spec.ClusterName,
+			"defaultBranch": "main",
+		}
+
+		// if err := controllerutil.SetControllerReference(cluster, nephioRepo, r.Scheme); err != nil {
+		// 	return err
+		// }
+
+		if err := r.Create(ctx, nephioRepo); err != nil {
+			return err
+		}
+	}
+
+	/*
+		--------------------------------------------------
+		Token (infra.nephio.org)
+		--------------------------------------------------
+	*/
+	token := &unstructured.Unstructured{}
+	token.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infra.nephio.org",
+		Version: "v1alpha1",
+		Kind:    "Token",
+	})
+
+	token.SetName(secretRefName)
+	token.SetNamespace(cluster.Namespace)
+	token.SetLabels(labels)
+
+	err = r.Get(ctx, client.ObjectKeyFromObject(token), token)
+	if err == nil {
+		return nil
+	}
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	// token.SetAnnotations(map[string]string{
+	// 	"nephio.org/gitops":           "configsync",
+	// 	"nephio.org/app":              "tobeinstalledonremotecluster",
+	// 	"nephio.org/remote-namespace": "config-management-system",
+	// })
+
+	token.Object["spec"] = map[string]interface{}{}
+
+	if err := controllerutil.SetControllerReference(cluster, token, r.Scheme); err != nil {
+		return err
+	}
+
+	if err := r.Create(ctx, token); err != nil {
+		return err
+	}
+
+	/*
+		--------------------------------------------------
+		Nephio Token (infra.nephio.org)
+		--------------------------------------------------
+	*/
+	nephioToken := &unstructured.Unstructured{}
+	nephioToken.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infra.nephio.org",
+		Version: "v1alpha1",
+		Kind:    "Token",
+	})
+
+	nephioToken.SetName(cluster.Spec.ClusterName + "-access-token-configsync")
+	nephioToken.SetNamespace(cluster.Namespace)
+	nephioToken.SetLabels(labels)
+
+	err = r.Get(ctx, client.ObjectKeyFromObject(nephioToken), nephioToken)
+	if err == nil {
+		return nil
+	}
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	nephioToken.SetAnnotations(map[string]string{
+		"nephio.org/gitops":           "configsync",
+		"nephio.org/app":              "tobeinstalledonremotecluster",
+		"nephio.org/remote-namespace": "config-management-system",
+	})
+
+	nephioToken.Object["spec"] = map[string]interface{}{}
+
+	if err := controllerutil.SetControllerReference(cluster, nephioToken, r.Scheme); err != nil {
+		return err
+	}
+
+	if err := r.Create(ctx, nephioToken); err != nil {
+		return err
+	}
+
+	return nil
+}
 
 func (r *RemoteClusterReconciler) fail(ctx context.Context, c *infrav1.RemoteCluster, err error) (ctrl.Result, error) {
 	c.Status.Phase = "Failed"

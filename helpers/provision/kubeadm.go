@@ -99,6 +99,8 @@ func SingleNode(client *sshhelper.Client, version string) error {
 		"mkdir -p $HOME/.kube",
 		"sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config",
 		"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
+		// allow scheduling on control-plane node (for single-node cluster)
+		"kubectl taint nodes --all node-role.kubernetes.io/control-plane- || kubectl taint nodes --all node-role.kubernetes.io/master- || true",
 
 		// =========================
 		// Install Flannel CNI

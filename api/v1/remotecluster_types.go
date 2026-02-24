@@ -32,12 +32,20 @@ type RemoteClusterSpec struct {
 
 	// foo is an example field of RemoteCluster. Edit remotecluster_types.go to remove/update
 	// +optional
-	Host string `json:"host"`
-	Port int    `json:"port"`
-	User string `json:"user"`
+	ClusterName string `json:"clusterName"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	User        string `json:"user"`
 
 	Auth       RemoteClusterAuth       `json:"auth"`
 	Kubernetes RemoteClusterKubernetes `json:"kubernetes"`
+	GitConfig  GitConfig               `json:"gitConfig,omitempty"`
+}
+
+type GitConfig struct {
+	Enable      string `json:"enable,omitempty"`      // "true" or "false"
+	GitServer   string `json:"gitServer,omitempty"`   // e.g., "https://github.com"
+	GitUsername string `json:"gitUsername,omitempty"` // e.g., "nephio"
 }
 
 type RemoteClusterAuth struct {
