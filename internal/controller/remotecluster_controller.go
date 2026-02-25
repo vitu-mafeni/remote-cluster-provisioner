@@ -118,6 +118,10 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	// defer client.Close()
 
+	err = r.createClusterRepo(ctx, cluster)
+	if err != nil {
+		return r.fail(ctx, cluster, err)
+	}
 	err = provision.SingleNode(client, cluster)
 	if err != nil {
 		return r.fail(ctx, cluster, err)
@@ -128,15 +132,15 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	cluster.Status.Message = "Cluster provisioned"
 	_ = r.Status().Update(ctx, cluster)
 
-	err = r.createClusterRepo(ctx, cluster)
+	// delay 2mins
+	logger.Info("Waiting for cluster repo to be ready before creating PackageVariants", "duration", "3m")
+	time.Sleep(3 * time.Minute)
+	err = r.createCorePackageVariants(ctx, cluster)
 	if err != nil {
 		return r.fail(ctx, cluster, err)
 	}
 
-	// delay 2mins
-	logger.Info("Waiting for cluster repo to be ready before creating PackageVariants", "duration", "3m")
-	time.Sleep(3 * time.Minute)
-	err = r.createPackageVariants(ctx, cluster)
+	err = r.createOverlaysPlusPostInstallPackageVariants(ctx, cluster)
 	if err != nil {
 		return r.fail(ctx, cluster, err)
 	}
@@ -414,8 +418,10 @@ func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cl
 }
 
 // install packagevariants once cluster is ready, and git repo is created, then create packagevariants that deploy ml-platform on the remote cluster
-func (r *RemoteClusterReconciler) createPackageVariants(ctx context.Context, clusterRemote *infrav1.RemoteCluster) error {
+func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context, clusterRemote *infrav1.RemoteCluster) error {
 
+	log := logf.FromContext(ctx)
+	log.Info("Creating Platform Core PackageVariants", "remotecluster", clusterRemote.Name)
 	labels := map[string]string{
 		remoteClusterLabelKey: clusterRemote.Spec.ClusterName,
 	}
@@ -626,6 +632,23 @@ func (r *RemoteClusterReconciler) createPackageVariants(ctx context.Context, clu
 				},
 			},
 		},
+		{
+			"name": "ml-platform-admin",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "ml-platform-admin",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "ml-platform-admin",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
 	}
 
 	gvk := schema.GroupVersionKind{
@@ -670,7 +693,106 @@ func (r *RemoteClusterReconciler) createPackageVariants(ctx context.Context, clu
 				}
 
 			} else {
-				return fmt.Errorf("failed creating PackageVariant %s: %w",
+				return fmt.Errorf("failed creating Core PackageVariant %s: %w",
+					obj.GetName(), err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// after install createCorePackageVariants create platform overlay packagevariants
+func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(ctx context.Context, clusterRemote *infrav1.RemoteCluster) error {
+
+	log := logf.FromContext(ctx)
+	log.Info("Creating Platform Overlays and Post Install Config PackageVariants", "remotecluster", clusterRemote.Name)
+
+	labels := map[string]string{
+		remoteClusterLabelKey: clusterRemote.Spec.ClusterName,
+	}
+
+	variants := []map[string]interface{}{
+
+		{
+			"name": "platform-overlays-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "platform-overlays",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "platform-overlays",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "post-install-config-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "post-install-config",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "post-install-config",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+	}
+
+	gvk := schema.GroupVersionKind{
+		Group:   "config.porch.kpt.dev",
+		Version: "v1alpha1",
+		Kind:    "PackageVariant",
+	}
+
+	for _, v := range variants {
+
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		obj.SetName(v["name"].(string))
+		obj.SetNamespace("default")
+		obj.SetLabels(labels)
+
+		obj.Object["spec"] = v["spec"]
+
+		err := r.Client.Create(ctx, obj)
+		if err != nil {
+
+			if apierrors.IsAlreadyExists(err) {
+
+				existing := &unstructured.Unstructured{}
+				existing.SetGroupVersionKind(gvk)
+
+				err = r.Client.Get(ctx,
+					client.ObjectKey{
+						Name:      obj.GetName(),
+						Namespace: obj.GetNamespace(),
+					},
+					existing)
+				if err != nil {
+					return err
+				}
+
+				existing.Object["spec"] = obj.Object["spec"]
+
+				err = r.Client.Update(ctx, existing)
+				if err != nil {
+					return err
+				}
+
+			} else {
+				return fmt.Errorf("failed creating Platform Overlays PackageVariant %s: %w",
 					obj.GetName(), err)
 			}
 		}

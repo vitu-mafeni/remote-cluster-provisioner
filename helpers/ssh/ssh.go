@@ -2,11 +2,14 @@ package ssh
 
 import (
 	"fmt"
+	"log"
 
 	cryptossh "golang.org/x/crypto/ssh"
 )
 
 func Connect(host string, port int, user, password string) (*Client, error) {
+	log.Printf("Connecting to %s:%d with user %s", host, port, user)
+
 	config := &cryptossh.ClientConfig{
 		User: user,
 		Auth: []cryptossh.AuthMethod{

@@ -2,6 +2,7 @@ package provision
 
 import (
 	"fmt"
+	"log"
 	"strings"
 
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1" // Add the correct import path for infrav1
@@ -9,6 +10,7 @@ import (
 )
 
 func SingleNode(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
+	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
 
 	clean := strings.TrimPrefix(cluster.Spec.Kubernetes.Version, "v")
 
