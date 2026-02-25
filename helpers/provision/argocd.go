@@ -77,7 +77,7 @@ spec:
 		// Apply Application
 		fmt.Sprintf("cat <<EOF | kubectl apply -f -\n%s\nEOF", applicationYAML),
 	}
-
+	fmt.Printf("Applying ArgoCD resources for cluster %s:\n", cluster.Spec.ClusterName)
 	for _, cmd := range commands {
 		output, err := sshhelper.Run(client, cmd)
 		if err != nil {

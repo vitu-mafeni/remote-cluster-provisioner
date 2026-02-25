@@ -133,77 +133,15 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.fail(ctx, cluster, err)
 	}
 
-	return ctrl.Result{}, nil
-}
-
-func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *infrav1.RemoteCluster) (ctrl.Result, error) {
-
-	log := logf.FromContext(ctx)
-	log.Info("Cleaning up resources for RemoteCluster", "remotecluster", cluster.Name)
-
-	if err := r.deleteClusterResources(ctx, cluster); err != nil {
-		return ctrl.Result{}, err
+	// delay 2mins
+	logger.Info("Waiting for cluster repo to be ready before creating PackageVariants", "duration", "2m")
+	time.Sleep(3 * time.Minute)
+	err = r.createPackageVariants(ctx, cluster)
+	if err != nil {
+		return r.fail(ctx, cluster, err)
 	}
-
-	controllerutil.RemoveFinalizer(cluster, remoteClusterFinalizer)
-	if err := r.Update(ctx, cluster); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// cleanup ssh kubeadm reset via SSH on deletion, Remote node cleanup
-	unInstallK8sRemoteCluster()
 
 	return ctrl.Result{}, nil
-}
-
-func unInstallK8sRemoteCluster() {
-	log := logf.FromContext(context.Background())
-	log.Info("Uninstalling Kubernetes on remote cluster via SSH")
-}
-
-func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cluster *infrav1.RemoteCluster) error {
-
-	labels := client.MatchingLabels{
-		remoteClusterFinalizer: cluster.Spec.ClusterName,
-	}
-
-	// -------------------------
-	// Delete Repository
-	// -------------------------
-	repoList := &unstructured.UnstructuredList{}
-	repoList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "config.porch.kpt.dev",
-		Version: "v1alpha1",
-		Kind:    "RepositoryList",
-	})
-
-	if err := r.List(ctx, repoList, labels, client.InNamespace(cluster.Namespace)); err != nil {
-		return err
-	}
-
-	for _, repo := range repoList.Items {
-		_ = r.Delete(ctx, &repo) // ignore notfound
-	}
-
-	// -------------------------
-	// Delete Token
-	// -------------------------
-	tokenList := &unstructured.UnstructuredList{}
-	tokenList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "infra.nephio.org",
-		Version: "v1alpha1",
-		Kind:    "TokenList",
-	})
-
-	if err := r.List(ctx, tokenList, labels, client.InNamespace(cluster.Namespace)); err != nil {
-		return err
-	}
-
-	for _, token := range tokenList.Items {
-		_ = r.Delete(ctx, &token)
-	}
-
-	return nil
 }
 
 // create cluster repository on the management cluster if git integration is enabled
@@ -381,6 +319,318 @@ func (r *RemoteClusterReconciler) createClusterRepo(ctx context.Context, cluster
 
 	if err := r.Create(ctx, nephioToken); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *infrav1.RemoteCluster) (ctrl.Result, error) {
+
+	log := logf.FromContext(ctx)
+	log.Info("Cleaning up resources for RemoteCluster", "remotecluster", cluster.Name)
+
+	if err := r.deleteClusterResources(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	controllerutil.RemoveFinalizer(cluster, remoteClusterFinalizer)
+	if err := r.Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// cleanup ssh kubeadm reset via SSH on deletion, Remote node cleanup
+	unInstallK8sRemoteCluster()
+
+	return ctrl.Result{}, nil
+}
+
+func unInstallK8sRemoteCluster() {
+	log := logf.FromContext(context.Background())
+	log.Info("Uninstalling Kubernetes on remote cluster via SSH")
+}
+
+func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+
+	labels := client.MatchingLabels{
+		remoteClusterFinalizer: cluster.Spec.ClusterName,
+	}
+
+	// -------------------------
+	// Delete Repository
+	// -------------------------
+	repoList := &unstructured.UnstructuredList{}
+	repoList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.porch.kpt.dev",
+		Version: "v1alpha1",
+		Kind:    "RepositoryList",
+	})
+
+	if err := r.List(ctx, repoList, labels, client.InNamespace(cluster.Namespace)); err != nil {
+		return err
+	}
+
+	for _, repo := range repoList.Items {
+		_ = r.Delete(ctx, &repo) // ignore notfound
+	}
+
+	// -------------------------
+	// Delete Token
+	// -------------------------
+	tokenList := &unstructured.UnstructuredList{}
+	tokenList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "infra.nephio.org",
+		Version: "v1alpha1",
+		Kind:    "TokenList",
+	})
+
+	if err := r.List(ctx, tokenList, labels, client.InNamespace(cluster.Namespace)); err != nil {
+		return err
+	}
+
+	for _, token := range tokenList.Items {
+		_ = r.Delete(ctx, &token)
+	}
+
+	return nil
+}
+
+// install packagevariants once cluster is ready, and git repo is created, then create packagevariants that deploy ml-platform on the remote cluster
+func (r *RemoteClusterReconciler) createPackageVariants(ctx context.Context, clusterRemote *infrav1.RemoteCluster) error {
+
+	variants := []map[string]interface{}{
+		{
+			"name": "enterprise-gateway-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package": "enterprise-gateway",
+					"repo":    "catalog-workloads-mlplatform",
+				},
+				"downstream": map[string]interface{}{
+					"package": "enterprise-gateway",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "gpu-operator-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "gpu-operator",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "gpu-operator",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "harbor-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "harbor",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "harbor",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "k8s-dra-driver-gpu-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "k8s-dra-driver-gpu",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "k8s-dra-driver-gpu",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "kai-scheduler-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "kai-scheduler",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "kai-scheduler",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "keycloak-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "keycloak",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "keycloak",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "kubeflow-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "kubeflow",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "kubeflow",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "kueue-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "kueue",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "kueue",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "kyverno-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "kyverno",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "kyverno",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "prometheus-stack-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package":  "prometheus-stack",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "prometheus-stack",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+		{
+			"name": "nfs-provisioner-variant",
+			"spec": map[string]interface{}{
+				// "annotations": map[string]interface{}{
+				// 	"approval.nephio.org/policy": "initial",
+				// },
+				"upstream": map[string]interface{}{
+					"package":  "nfs-provisioner",
+					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+				},
+				"downstream": map[string]interface{}{
+					"package": "nfs-provisioner",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
+	}
+
+	gvk := schema.GroupVersionKind{
+		Group:   "config.porch.kpt.dev",
+		Version: "v1alpha1",
+		Kind:    "PackageVariant",
+	}
+
+	for _, v := range variants {
+
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(gvk)
+		obj.SetName(v["name"].(string))
+		obj.SetNamespace("default")
+
+		obj.Object["spec"] = v["spec"]
+
+		err := r.Client.Create(ctx, obj)
+		if err != nil {
+
+			if apierrors.IsAlreadyExists(err) {
+
+				existing := &unstructured.Unstructured{}
+				existing.SetGroupVersionKind(gvk)
+
+				err = r.Client.Get(ctx,
+					client.ObjectKey{
+						Name:      obj.GetName(),
+						Namespace: obj.GetNamespace(),
+					},
+					existing)
+				if err != nil {
+					return err
+				}
+
+				existing.Object["spec"] = obj.Object["spec"]
+
+				err = r.Client.Update(ctx, existing)
+				if err != nil {
+					return err
+				}
+
+			} else {
+				return fmt.Errorf("failed creating PackageVariant %s: %w",
+					obj.GetName(), err)
+			}
+		}
 	}
 
 	return nil

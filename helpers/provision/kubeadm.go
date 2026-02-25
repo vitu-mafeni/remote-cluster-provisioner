@@ -12,6 +12,57 @@ func SingleNode(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error 
 
 	clean := strings.TrimPrefix(cluster.Spec.Kubernetes.Version, "v")
 
+	kubeadmConfig := fmt.Sprintf(`
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "0.0.0.0"
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///var/run/containerd/containerd.sock
+  imagePullPolicy: IfNotPresent
+  imagePullSerial: true
+  taints:
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/control-plane
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: "v%s"
+clusterName: %s
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+  dnsDomain: cluster.local
+controlPlaneEndpoint: ""
+apiServer:
+  extraArgs:
+    - name: runtime-config
+      value: "resource.k8s.io/v1beta1=true"
+    - name: feature-gates
+      value: "DynamicResourceAllocation=true"
+controllerManager:
+  extraArgs:
+    - name: feature-gates
+      value: "DynamicResourceAllocation=true"
+scheduler:
+  extraArgs:
+    - name: feature-gates
+      value: "DynamicResourceAllocation=true"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+containerRuntimeEndpoint: unix:///var/run/containerd/containerd.sock
+featureGates:
+  DynamicResourceAllocation: true
+runtimeRequestTimeout: "15m"
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: ipvs
+`, clean, cluster.Spec.ClusterName)
+
 	parts := strings.Split(clean, ".")
 	if len(parts) < 2 {
 		return fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.Kubernetes.Version)
@@ -66,7 +117,8 @@ func SingleNode(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error 
 
 		// Configure containerd
 		"sudo mkdir -p /etc/containerd",
-		"sudo containerd config default | sudo tee /etc/containerd/config.toml",
+		// "sudo containerd config default | sudo tee /etc/containerd/config.toml",
+		"test -f /etc/containerd/config.toml || containerd config default | sudo tee /etc/containerd/config.toml",
 		"sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml",
 		"sudo systemctl restart containerd",
 		"sudo systemctl enable containerd",
@@ -92,7 +144,9 @@ func SingleNode(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error 
 		// =========================
 		// Initialize cluster (single node)
 		// =========================
-		"test -f /etc/kubernetes/admin.conf || sudo kubeadm init --pod-network-cidr=10.244.0.0/16",
+		fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF", kubeadmConfig),
+		// "test -f /etc/kubernetes/admin.conf || sudo kubeadm init --pod-network-cidr=10.244.0.0/16",
+		"test -f /etc/kubernetes/admin.conf || sudo kubeadm init --config /tmp/kubeadm-config.yaml",
 
 		// =========================
 		// Kubeconfig setup
@@ -109,6 +163,8 @@ func SingleNode(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error 
 		"kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml",
 		"kubectl create namespace argocd",
 		"kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
+		"git clone https://github.com/vitu-mafeni/catalog.git /tmp/catalog",
+		"kubectl apply -f /tmp/catalog/nephio/optional/flux-helm-controllers",
 	}
 
 	for _, cmd := range steps {
