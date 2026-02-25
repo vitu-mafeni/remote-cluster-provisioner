@@ -53,8 +53,8 @@ spec:
     namespace: default
   syncPolicy:
     automated:
-      prune: true
-      selfHeal: true
+      prune: false
+      selfHeal: false
       allowEmpty: true
     syncOptions:
       - CreateNamespace=true

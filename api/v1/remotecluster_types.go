@@ -43,12 +43,12 @@ type RemoteClusterSpec struct {
 }
 
 type GitConfig struct {
-	Enable      string `json:"enable,omitempty"`      // "true" or "false"
-	GitServer   string `json:"gitServer,omitempty"`   // e.g., "https://github.com"
-	GitUsername string `json:"gitUsername,omitempty"` // e.g., "nephio"
+	Enable      string `json:"enable,omitempty"` // "true" or "false"
+	GitServer   string `json:"gitServer"`        // e.g., "https://github.com"
+	GitUsername string `json:"gitUsername"`      // e.g., "nephio"
 	// UpstreamPlatformRepo is the name of the git repository in the management cluster that serves as the source of truth for platform configuration.
-	UpstreamPlatformRepo string `json:"upstreamPlatformRepo,omitempty"` // e.g., "catalog-workloads-mlplatform"
-	PackageRevision      string `json:"packageRevision,omitempty"`      // e.g., branch/tag/commit like "main" or "v1.0.0"
+	UpstreamPlatformRepo string `json:"upstreamPlatformRepo"` // e.g., "catalog-workloads-mlplatform"
+	PackageRevision      string `json:"packageRevision"`      // e.g., branch/tag/commit like "main" or "v1.0.0"
 }
 
 type RemoteClusterAuth struct {

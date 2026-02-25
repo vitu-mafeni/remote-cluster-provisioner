@@ -134,7 +134,7 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// delay 2mins
-	logger.Info("Waiting for cluster repo to be ready before creating PackageVariants", "duration", "2m")
+	logger.Info("Waiting for cluster repo to be ready before creating PackageVariants", "duration", "3m")
 	time.Sleep(3 * time.Minute)
 	err = r.createPackageVariants(ctx, cluster)
 	if err != nil {
@@ -324,6 +324,7 @@ func (r *RemoteClusterReconciler) createClusterRepo(ctx context.Context, cluster
 	return nil
 }
 
+// actually delete cluster resources like repo and token when remotecluster is deleted, and also cleanup k8s cluster via SSH kubeadm reset, and any other cleanup needed on the remote node
 func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *infrav1.RemoteCluster) (ctrl.Result, error) {
 
 	log := logf.FromContext(ctx)
@@ -398,6 +399,23 @@ func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cl
 func (r *RemoteClusterReconciler) createPackageVariants(ctx context.Context, clusterRemote *infrav1.RemoteCluster) error {
 
 	variants := []map[string]interface{}{
+
+		{
+			"name": "minio-variant",
+			"spec": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					"approval.nephio.org/policy": "initial",
+				},
+				"upstream": map[string]interface{}{
+					"package": "minio",
+					"repo":    "catalog-nephio-optional",
+				},
+				"downstream": map[string]interface{}{
+					"package": "minio",
+					"repo":    clusterRemote.Spec.ClusterName,
+				},
+			},
+		},
 		{
 			"name": "enterprise-gateway-variant",
 			"spec": map[string]interface{}{

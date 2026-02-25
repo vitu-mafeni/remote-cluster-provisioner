@@ -66,6 +66,18 @@ spec:
                     type: string
                   gitUsername:
                     type: string
+                  packageRevision:
+                    type: string
+                  upstreamPlatformRepo:
+                    description: UpstreamPlatformRepo is the name of the git repository
+                      in the management cluster that serves as the source of truth
+                      for platform configuration.
+                    type: string
+                required:
+                - gitServer
+                - gitUsername
+                - packageRevision
+                - upstreamPlatformRepo
                 type: object
               host:
                 type: string

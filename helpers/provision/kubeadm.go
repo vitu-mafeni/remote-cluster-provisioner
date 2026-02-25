@@ -19,7 +19,7 @@ localAPIEndpoint:
   advertiseAddress: "0.0.0.0"
   bindPort: 6443
 nodeRegistration:
-  criSocket: unix:///var/run/containerd/containerd.sock
+  criSocket: unix:///var/run/crio/crio.sock
   imagePullPolicy: IfNotPresent
   imagePullSerial: true
   taints:
@@ -53,7 +53,7 @@ scheduler:
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 cgroupDriver: systemd
-containerRuntimeEndpoint: unix:///var/run/containerd/containerd.sock
+containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
 featureGates:
   DynamicResourceAllocation: true
 runtimeRequestTimeout: "15m"
@@ -103,25 +103,30 @@ mode: ipvs
 		"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https",
 
 		// =========================
-		// Install containerd (Docker repo)
+		// Install CRI-O
 		// =========================
-		"sudo rm -f /etc/apt/keyrings/docker.gpg",
+		// fmt.Sprintf("CRIO_VERSION=v%s", repoVersion),
 		"sudo install -m 0755 -d /etc/apt/keyrings",
-		"sudo rm -f /etc/apt/sources.list.d/docker-ce.list",
 
-		"curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg",
-		"sudo chmod a+r /etc/apt/keyrings/docker.gpg",
-		`echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list`,
+		"sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg",
+
+		fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
+| gpg --dearmor | sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
+
+		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
+https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
+| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
+
 		"sudo apt-get update",
-		"sudo apt-get install -y containerd.io",
+		"sudo apt-get install -y cri-o cri-tools",
 
-		// Configure containerd
-		"sudo mkdir -p /etc/containerd",
-		// "sudo containerd config default | sudo tee /etc/containerd/config.toml",
-		"test -f /etc/containerd/config.toml || containerd config default | sudo tee /etc/containerd/config.toml",
-		"sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml",
-		"sudo systemctl restart containerd",
-		"sudo systemctl enable containerd",
+		// Enable CRI-O
+		"sudo systemctl enable crio",
+		"sudo systemctl restart crio",
+
+		// Optional sanity checks (very helpful)
+		"sudo crictl info || true",
+		"sudo systemctl status crio --no-pager || true",
 
 		// =========================
 		// Kubernetes repository
