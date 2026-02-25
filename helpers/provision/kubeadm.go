@@ -166,8 +166,9 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		// Install Flannel CNI
 		// =========================
 		"kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml",
-		"kubectl create namespace argocd",
+		"kubectl create namespace argocd || true",
 		"kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
+		"rm /tmp/catalog/ -rf",
 		"git clone https://github.com/vitu-mafeni/catalog.git /tmp/catalog",
 		"kubectl apply -f /tmp/catalog/nephio/optional/flux-helm-controllers",
 	}

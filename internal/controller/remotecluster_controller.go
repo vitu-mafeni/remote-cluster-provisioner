@@ -392,11 +392,33 @@ func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cl
 		_ = r.Delete(ctx, &token)
 	}
 
+	// -------------------------
+	// Delete PackageVariant
+	// -------------------------
+	pkgVariantList := &unstructured.UnstructuredList{}
+	pkgVariantList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "config.porch.kpt.dev",
+		Version: "v1alpha1",
+		Kind:    "PackageVariantList",
+	})
+
+	if err := r.List(ctx, pkgVariantList, labels, client.InNamespace(cluster.Namespace)); err != nil {
+		return err
+	}
+
+	for _, pkgVariant := range pkgVariantList.Items {
+		_ = r.Delete(ctx, &pkgVariant)
+	}
+
 	return nil
 }
 
 // install packagevariants once cluster is ready, and git repo is created, then create packagevariants that deploy ml-platform on the remote cluster
 func (r *RemoteClusterReconciler) createPackageVariants(ctx context.Context, clusterRemote *infrav1.RemoteCluster) error {
+
+	labels := map[string]string{
+		remoteClusterLabelKey: clusterRemote.Spec.ClusterName,
+	}
 
 	variants := []map[string]interface{}{
 
@@ -407,8 +429,9 @@ func (r *RemoteClusterReconciler) createPackageVariants(ctx context.Context, clu
 					"approval.nephio.org/policy": "initial",
 				},
 				"upstream": map[string]interface{}{
-					"package": "minio",
-					"repo":    "catalog-nephio-optional",
+					"package":  "minio",
+					"repo":     "catalog-nephio-optional",
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
 				},
 				"downstream": map[string]interface{}{
 					"package": "minio",
@@ -423,8 +446,9 @@ func (r *RemoteClusterReconciler) createPackageVariants(ctx context.Context, clu
 					"approval.nephio.org/policy": "initial",
 				},
 				"upstream": map[string]interface{}{
-					"package": "enterprise-gateway",
-					"repo":    "catalog-workloads-mlplatform",
+					"package":  "enterprise-gateway",
+					"repo":     "catalog-workloads-mlplatform",
+					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
 				},
 				"downstream": map[string]interface{}{
 					"package": "enterprise-gateway",
@@ -616,6 +640,7 @@ func (r *RemoteClusterReconciler) createPackageVariants(ctx context.Context, clu
 		obj.SetGroupVersionKind(gvk)
 		obj.SetName(v["name"].(string))
 		obj.SetNamespace("default")
+		obj.SetLabels(labels)
 
 		obj.Object["spec"] = v["spec"]
 
