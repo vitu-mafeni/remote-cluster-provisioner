@@ -6,7 +6,7 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: remotecluster-sample2
 spec:
-  clusterName: "edge12"
+  clusterName: "cluster2"
   host: "192.168.3.234"
   port: 22
   user: "ubuntu"

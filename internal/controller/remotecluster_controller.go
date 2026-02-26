@@ -635,9 +635,9 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			"name": "ml-platform-admin",
 			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
+				// "annotations": map[string]interface{}{
+				// 	"approval.nephio.org/policy": "initial",
+				// },
 				"upstream": map[string]interface{}{
 					"package":  "ml-platform-admin",
 					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
@@ -717,9 +717,9 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 		{
 			"name": "platform-overlays-variant",
 			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
+				// "annotations": map[string]interface{}{
+				// 	"approval.nephio.org/policy": "initial",
+				// },
 				"upstream": map[string]interface{}{
 					"package":  "platform-overlays",
 					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
@@ -734,9 +734,9 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 		{
 			"name": "post-install-config-variant",
 			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
+				// "annotations": map[string]interface{}{
+				// 	"approval.nephio.org/policy": "initial",
+				// },
 				"upstream": map[string]interface{}{
 					"package":  "post-install-config",
 					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
