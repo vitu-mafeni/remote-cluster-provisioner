@@ -80,6 +80,25 @@ mode: ipvs
 		// "test -f /etc/kubernetes/admin.conf && echo 'already-initialized'",
 
 		// =========================
+		// Install prerequisites
+		// =========================
+		// Install NFS
+		"sudo apt-get install -y nfs-kernel-server nfs-common",
+
+		// Create directory
+		"sudo mkdir -p /srv/nfs/k8s",
+		"sudo chown -R nobody:nogroup /srv/nfs/k8s",
+		"sudo chmod 755 /srv/nfs/k8s",
+
+		// Declarative export
+		"echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports",
+
+		// Reload exports
+		"sudo exportfs -ra",
+		"sudo systemctl enable nfs-kernel-server",
+		"sudo systemctl restart nfs-kernel-server",
+
+		// =========================
 		// Disable swap
 		// =========================
 		"sudo swapoff -a",
@@ -119,8 +138,16 @@ mode: ipvs
 https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
 
+		// Install crictl matching Kubernetes minor version
+		fmt.Sprintf("CRICTL_VERSION=v%s", clean),
+		// "curl -L https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34/crictl-${CRICTL_VERSION#v}-linux-amd64.tar.gz -o crictl.tar.gz",
+		// Download crictl using major.minor.0
+		fmt.Sprintf("curl -fL -o crictl.tar.gz https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s.0/crictl-v%s.0-linux-amd64.tar.gz", repoVersion, repoVersion),
+		"sudo tar -xzf crictl.tar.gz -C /usr/local/bin",
+		"rm -f crictl.tar.gz",
+
 		"sudo apt-get update",
-		"sudo apt-get install -y cri-o cri-tools",
+		"sudo apt-get install -y cri-o ",
 
 		// Enable CRI-O
 		"sudo systemctl enable crio",

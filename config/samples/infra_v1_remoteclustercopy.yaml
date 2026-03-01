@@ -6,8 +6,8 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: remotecluster-sample2
 spec:
-  clusterName: "cluster2"
-  host: "192.168.3.234"
+  clusterName: "developer-cluster1"
+  host: "192.168.40.245"
   port: 22
   user: "ubuntu"
 
@@ -20,7 +20,7 @@ spec:
     version: "v1.34.2"
   gitConfig:
     enable: "true"
-    gitServer: "http://192.168.3.182:31810"
+    gitServer: "http://192.168.40.111:31810"
     gitUsername: "nephio"
     upstreamPlatformRepo: "catalog-workloads-mlplatform"
     packageRevision: "v1.0.0"

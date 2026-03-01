@@ -1,4 +1,12 @@
 # remote-cluster-provisioner
+## Prerequisites
+### Management cluster
+### GPU Node/Cluster
+- use ubuntu 22 jammy
+- make passwordless user
+- Install GPU Drivers
+
+
 ## Troubleshooting
 You initialized Kubernetes but:
 

@@ -89,6 +89,8 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if cluster.Status.Phase == "Ready" {
+		logger.Info("Cluster " + cluster.Spec.ClusterName + " is provisioned and ready.")
+		logger.Info(cluster.Spec.ClusterName + " is provisioned and ready, check for packages deployment and final configuration in the nephio webui")
 		return ctrl.Result{}, nil
 	}
 
@@ -118,11 +120,11 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	// defer client.Close()
 
-	err = r.createClusterRepo(ctx, cluster)
+	err = provision.SingleNode(client, cluster)
 	if err != nil {
 		return r.fail(ctx, cluster, err)
 	}
-	err = provision.SingleNode(client, cluster)
+	err = r.createClusterRepo(ctx, cluster)
 	if err != nil {
 		return r.fail(ctx, cluster, err)
 	}
