@@ -140,17 +140,16 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 
 		// Install crictl matching Kubernetes minor version
 		fmt.Sprintf("CRICTL_VERSION=v%s", clean),
-		// "curl -L https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34/crictl-${CRICTL_VERSION#v}-linux-amd64.tar.gz -o crictl.tar.gz",
 		// Download crictl using major.minor.0
-		fmt.Sprintf("curl -fL -o crictl.tar.gz https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s.0/crictl-v%s.0-linux-amd64.tar.gz", repoVersion, repoVersion),
-		"sudo tar -xzf crictl.tar.gz -C /usr/local/bin",
-		"rm -f crictl.tar.gz",
+		// fmt.Sprintf("curl -fL -o crictl.tar.gz https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s.0/crictl-v%s.0-linux-amd64.tar.gz", repoVersion, repoVersion),
+		// "sudo tar -xzf crictl.tar.gz -C /usr/local/bin",
+		// "rm -f crictl.tar.gz",
 
 		"sudo apt-get update",
 		"sudo apt-get install -y cri-o ",
 
 		// Enable CRI-O
-		"sudo systemctl enable crio",
+		"sudo systemctl enable crio --now",
 		"sudo systemctl restart crio",
 
 		// Optional sanity checks (very helpful)
@@ -174,6 +173,7 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-*", clean, clean, clean),
 		"sudo apt-mark hold kubelet kubeadm kubectl",
 		"sudo systemctl enable kubelet",
+		"sudo systemctl daemon-reload",
 
 		// =========================
 		// Initialize cluster (single node)
