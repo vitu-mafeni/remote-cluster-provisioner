@@ -4,16 +4,16 @@ metadata:
   labels:
     app.kubernetes.io/name: remote-cluster-provisioner
     app.kubernetes.io/managed-by: kustomize
-  name: remotecluster-sample2
+  name: remotecluster-subnet30
 spec:
-  clusterName: "developer-cluster1"
-  host: "192.168.40.245"
+  clusterName: "remotecluster-subnet30"
+  host: "192.168.30.87"
   port: 22
   user: "ubuntu"
 
   auth:
     passwordSecretRef:
-      name: remote-cluster-credentials
+      name: remote-cluster-subnet30-secret
       key: password
 
   kubernetes:
@@ -28,8 +28,8 @@ spec:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: remote-cluster-credentials
+  name: remote-cluster-subnet30-secret
   namespace: default
 type: Opaque
 stringData:
-  password: "1"
+  password: "ckddmlrhks401!"
