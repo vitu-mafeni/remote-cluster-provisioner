@@ -170,7 +170,7 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 
 		// Install specific version
 
-		fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-*", clean, clean, clean),
+		fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages", clean, clean, clean),
 		"sudo apt-mark hold kubelet kubeadm kubectl",
 		"sudo systemctl enable kubelet",
 		"sudo systemctl daemon-reload",
