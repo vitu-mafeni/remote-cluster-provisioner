@@ -18,7 +18,7 @@ func SingleNode(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error 
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 localAPIEndpoint:
-  advertiseAddress: "0.0.0.0"
+  advertiseAddress: %s
   bindPort: 6443
 nodeRegistration:
   criSocket: unix:///var/run/crio/crio.sock
@@ -63,7 +63,7 @@ runtimeRequestTimeout: "15m"
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
 mode: ipvs
-`, clean, cluster.Spec.ClusterName)
+`, cluster.Spec.Host, clean, cluster.Spec.ClusterName)
 
 	parts := strings.Split(clean, ".")
 	if len(parts) < 2 {
