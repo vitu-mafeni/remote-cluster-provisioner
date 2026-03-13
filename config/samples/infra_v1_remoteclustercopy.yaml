@@ -4,23 +4,23 @@ metadata:
   labels:
     app.kubernetes.io/name: remote-cluster-provisioner
     app.kubernetes.io/managed-by: kustomize
-  name: remotecluster-subnet30
+  name: remotecluster-sample
 spec:
-  clusterName: "remotecluster-subnet30"
-  host: "192.168.30.87"
+  clusterName: "remotecluster-new"
+  host: "192.168.3.234"
   port: 22
   user: "ubuntu"
 
   auth:
     passwordSecretRef:
-      name: remote-cluster-subnet30-secret
+      name: remote-cluster-new-secret
       key: password
 
   kubernetes:
     version: "v1.34.2"
   gitConfig:
     enable: "true"
-    gitServer: "http://192.168.40.111:31810"
+    gitServer: "http://192.168.3.99:31810"
     gitUsername: "nephio"
     upstreamPlatformRepo: "catalog-workloads-mlplatform"
     packageRevision: "v1.0.0"
@@ -28,8 +28,8 @@ spec:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: remote-cluster-subnet30-secret
+  name: remote-cluster-new-secret
   namespace: default
 type: Opaque
 stringData:
-  password: "ckddmlrhks401!"
+  password: "1"
