@@ -27,3 +27,21 @@ wget https://github.com/containernetworking/plugins/releases/download/${CNI_VERS
 sudo tar -C /opt/cni/bin -xzf cni-plugins-linux-amd64-${CNI_VERSION}.tgz
 
 ```
+
+```bash 
+kubectl delete packagevariants enterprise-gateway-variant gpu-operator-variant harbor-variant k8s-dra-driver-gpu-variant kai-scheduler-variant keycloak-variant kubeflow-variant kueue-variant kyverno-variant minio-variant nfs-provisioner-variant prometheus-stack-variant ml-platform-admin platform-overlays-variant post-install-config-variant
+
+
+# add finalizer delete for
+
+kubectl delete repository.infra.nephio.org
+
+
+kubectl patch svc dex -n auth --type=json -p='[{"op":"replace","path":"/spec/selector","value":{"app":"dex"}}]'
+
+
+kubectl patch kustomization ml-platform-system \
+-n ml-platform-system \
+--type merge \
+-p '{"spec":{"suspend":true}}'
+```
