@@ -33,6 +33,7 @@ kubectl delete packagevariants enterprise-gateway-variant gpu-operator-variant h
 
 
 # add finalizer delete for
+kubectl get repository.infra.nephio.org
 
 kubectl delete repository.infra.nephio.org
 
