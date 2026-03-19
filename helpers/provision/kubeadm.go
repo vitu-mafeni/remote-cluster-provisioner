@@ -54,6 +54,7 @@ scheduler:
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
+maxPods: 200
 cgroupDriver: systemd
 containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
 featureGates:

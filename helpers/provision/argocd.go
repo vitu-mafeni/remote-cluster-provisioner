@@ -58,6 +58,8 @@ spec:
       allowEmpty: true
     syncOptions:
       - CreateNamespace=true
+      - SkipDryRunOnMissingResource=true
+      - ApplyOutOfSyncOnly=true
   ignoreDifferences:
     - group: fn.kpt.dev
       kind: ApplyReplacements
