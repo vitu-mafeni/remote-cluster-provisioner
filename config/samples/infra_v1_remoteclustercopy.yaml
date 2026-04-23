@@ -6,10 +6,14 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: remotecluster-sample
 spec:
-  clusterName: "remotecluster-new"
+#This is for nodes with provided by user by IP address, if control-plane node, it will be used for cluster provisioning, if worker node, it will be added to the cluster after provisioning.
+  clusterName: "remotecluster-new" ## this has to be unique for each cluster, and will be used as the cluster name when provisioning, and also will be used as the parent cluster name when adding worker node to the cluster.
   host: "192.168.3.234"
   port: 22
   user: "ubuntu"
+  nodeInfo:
+    nodeType: "control-plane" #control-plane or worker
+    hardwareType: "cpu" #cpu or gpu
 
   auth:
     passwordSecretRef:

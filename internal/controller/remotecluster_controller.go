@@ -114,37 +114,84 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	password := string(passwordBytes)
 
-	client, err := ssh.Connect(cluster.Spec.Host, cluster.Spec.Port, cluster.Spec.User, password)
+	sshClient, err := ssh.Connect(cluster.Spec.Host, cluster.Spec.Port, cluster.Spec.User, password)
 	if err != nil {
 		return r.fail(ctx, cluster, err)
 	}
-	// defer client.Close()
+	// defer sshClient.Close()
 
-	err = provision.SingleNode(client, cluster)
-	if err != nil {
-		return r.fail(ctx, cluster, err)
-	}
-	err = r.createClusterRepo(ctx, cluster)
-	if err != nil {
-		return r.fail(ctx, cluster, err)
-	}
+	switch cluster.Spec.NodeInfo.NodeType {
+	case "control-plane":
 
-	// Success
-	cluster.Status.Phase = "Ready"
-	cluster.Status.Message = "Cluster provisioned"
-	_ = r.Status().Update(ctx, cluster)
+		joinCommand, err := provision.InitializeControlPlane(sshClient, cluster)
+		if err != nil {
+			return r.fail(ctx, cluster, err)
+		}
+		err = r.createClusterRepo(ctx, cluster)
+		if err != nil {
+			return r.fail(ctx, cluster, err)
+		}
 
-	// delay 2mins
-	logger.Info("Waiting for cluster repo to be ready before creating PackageVariants", "duration", "3m")
-	time.Sleep(3 * time.Minute)
-	err = r.createCorePackageVariants(ctx, cluster)
-	if err != nil {
-		return r.fail(ctx, cluster, err)
-	}
+		// Success
+		cluster.Status.Phase = "Ready"
+		cluster.Status.Message = "Cluster provisioned"
+		cluster.Status.JoinCommand = joinCommand
+		_ = r.Status().Update(ctx, cluster)
 
-	err = r.createOverlaysPlusPostInstallPackageVariants(ctx, cluster)
-	if err != nil {
-		return r.fail(ctx, cluster, err)
+		// delay 2mins
+		logger.Info("Waiting for cluster repo to be ready before creating PackageVariants", "duration", "3m")
+		time.Sleep(3 * time.Minute)
+		err = r.createCorePackageVariants(ctx, cluster)
+		if err != nil {
+			return r.fail(ctx, cluster, err)
+		}
+
+		err = r.createOverlaysPlusPostInstallPackageVariants(ctx, cluster)
+		if err != nil {
+			return r.fail(ctx, cluster, err)
+		}
+	case "worker":
+		clusterParentName := cluster.Spec.ClusterName
+		// find the parent cluster's join command from status, and then run the join command via SSH to add this worker node to the cluster
+		var remoteClusterList infrav1.RemoteClusterList
+
+		err := r.List(ctx, &remoteClusterList, client.InNamespace(cluster.Namespace))
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		var clusterParent *infrav1.RemoteCluster
+
+		for i, rc := range remoteClusterList.Items {
+			if rc.Spec.ClusterName == clusterParentName &&
+				rc.Spec.NodeInfo.NodeType == "control-plane" {
+
+				clusterParent = &remoteClusterList.Items[i]
+				break
+			}
+		}
+
+		if clusterParent == nil {
+			return ctrl.Result{}, fmt.Errorf("no control-plane node found for clusterName %s", clusterParentName)
+		}
+
+		joinCommand := clusterParent.Status.JoinCommand
+		if joinCommand == "" || clusterParent.Status.Phase != "Ready" {
+			return ctrl.Result{}, fmt.Errorf("control-plane not ready or join command not found in parent cluster status for clusterName %s", clusterParentName)
+		}
+
+		err = provision.JoinWorkerNode(sshClient, cluster, joinCommand)
+		if err != nil {
+			return r.fail(ctx, cluster, err)
+		}
+
+		// Success
+		cluster.Status.Phase = "Ready"
+		cluster.Status.Message = "Worker node joined to cluster"
+		_ = r.Status().Update(ctx, cluster)
+
+		logger.Info("Worker node joined to cluster " + clusterParentName)
+
 	}
 
 	return ctrl.Result{}, nil
