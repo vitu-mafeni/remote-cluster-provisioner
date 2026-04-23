@@ -447,23 +447,23 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				},
 			},
 		},
-		{
-			"name": "enterprise-gateway-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "enterprise-gateway",
-					"repo":     "catalog-workloads-mlplatform",
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "enterprise-gateway",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
+		// {
+		// 	"name": "enterprise-gateway-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "enterprise-gateway",
+		// 			"repo":     "catalog-workloads-mlplatform",
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "enterprise-gateway",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
 		{
 			"name": "gpu-operator-variant",
 			"spec": map[string]interface{}{
