@@ -88,6 +88,16 @@ spec:
                 required:
                 - version
                 type: object
+              nodeInfo:
+                properties:
+                  hardwareType:
+                    type: string
+                  nodeType:
+                    type: string
+                required:
+                - hardwareType
+                - nodeType
+                type: object
               port:
                 type: integer
               user:
@@ -171,6 +181,8 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              joinCommand:
+                type: string
               message:
                 type: string
               phase:

@@ -100,6 +100,7 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
 		fmt.Sprintf("CRICTL_VERSION=v%s", clean),
 		"sudo apt-get update",
+		"sudo apt-get install -y jq",
 		"sudo apt-get install -y cri-o ",
 		"sudo systemctl enable crio --now",
 		"sudo systemctl restart crio",
@@ -172,7 +173,7 @@ func getJoinCommand(client *sshhelper.Client) (string, error) {
 // FOR WORKER NODES, we will run the join command in the controller and add the node to the cluster after provisioning, so no need to return join command for worker nodes here.
 // JoinWorkerNode installs all prerequisites on the worker and joins it to the cluster.
 // joinCmd is the full string returned by InitializeControlPlane (or getJoinCommand).
-func JoinWorkerNode(client *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string) error {
+func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string) error {
 	log.Printf("Joining worker node %s to cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)
 
 	if joinCmd == "" {
@@ -240,7 +241,7 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
 		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null`, repoVersion),
 		"sudo apt-get update",
-		fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages", clean, clean, clean),
+		fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages --allow-downgrades", clean, clean, clean),
 		"sudo apt-mark hold kubelet kubeadm kubectl",
 		"sudo systemctl enable kubelet",
 		"sudo systemctl daemon-reload",
@@ -250,10 +251,10 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		// =========================
 		fmt.Sprintf("sudo %s", joinCmd),
 
-		// =========================
-		// Label this node
-		// =========================
-		fmt.Sprintf("kubectl label node $(hostname) hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
+		// // =========================
+		// // Label this node
+		// // =========================
+		// fmt.Sprintf("kubectl label nodes --all hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
 	}
 
 	for _, cmd := range steps {
@@ -261,6 +262,37 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		if err != nil {
 			return fmt.Errorf("command failed: %s\nOutput:\n%s", cmd, output)
 		}
+	}
+
+	// Label the worker from the control plane, where kubectl is configured.
+	// node whose InternalIP matches the worker's host address.
+	// We print each node's name repeated alongside every address it has, then grep
+	// for the target IP — this handles nodes with multiple addresses correctly.
+	// Dump all node names and addresses so we can match by IP or hostname.
+	// Log the raw output first to help debug mismatches.
+	rawNodeOutput, err := sshhelper.Run(cpClient, `kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n | .status.addresses[].address | [$n, .] | @tsv'`)
+	if err != nil {
+		return fmt.Errorf("failed to list nodes: %w\nOutput:\n%s", err, rawNodeOutput)
+	}
+	log.Printf("Node address table for cluster %s:\n%s", cluster.Spec.ClusterName, rawNodeOutput)
+
+	// Find the node name whose address column matches cluster.Spec.Host.
+	nodeName := ""
+	for _, line := range strings.Split(strings.TrimSpace(rawNodeOutput), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == cluster.Spec.Host {
+			nodeName = fields[0]
+			break
+		}
+	}
+	if nodeName == "" {
+		return fmt.Errorf("failed to resolve node name for host %s — address table:\n%s", cluster.Spec.Host, rawNodeOutput)
+	}
+
+	// cluster.Spec.Host is the node ip as registered in the cluster.
+	labelCmd := fmt.Sprintf("kubectl label node %s hardware-type=%s --overwrite", nodeName, cluster.Spec.NodeInfo.HardwareType)
+	if output, err := sshhelper.Run(cpClient, labelCmd); err != nil {
+		return fmt.Errorf("failed to label worker node %s: %w\nOutput:\n%s", nodeName, err, output)
 	}
 
 	log.Printf("Worker node %s successfully joined cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)

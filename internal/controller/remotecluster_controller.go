@@ -98,23 +98,7 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	cluster.Status.Phase = "Provisioning"
 	_ = r.Status().Update(ctx, cluster)
 
-	secret := &corev1.Secret{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      cluster.Spec.Auth.PasswordSecretRef.Name,
-		Namespace: cluster.Namespace,
-	}, secret)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	passwordBytes, ok := secret.Data[cluster.Spec.Auth.PasswordSecretRef.Key]
-	if !ok {
-		return ctrl.Result{}, fmt.Errorf("key %s not found in secret",
-			cluster.Spec.Auth.PasswordSecretRef.Key)
-	}
-	password := string(passwordBytes)
-
-	sshClient, err := ssh.Connect(cluster.Spec.Host, cluster.Spec.Port, cluster.Spec.User, password)
+	sshClient, err := r.getSSHClient(ctx, cluster)
 	if err != nil {
 		return r.fail(ctx, cluster, err)
 	}
@@ -139,8 +123,8 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		_ = r.Status().Update(ctx, cluster)
 
 		// delay 2mins
-		logger.Info("Waiting for cluster repo to be ready before creating PackageVariants", "duration", "3m")
-		time.Sleep(3 * time.Minute)
+		logger.Info("Waiting for cluster repo to be ready before creating PackageVariants", "duration", "2m")
+		time.Sleep(2 * time.Minute)
 		err = r.createCorePackageVariants(ctx, cluster)
 		if err != nil {
 			return r.fail(ctx, cluster, err)
@@ -180,7 +164,12 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, fmt.Errorf("control-plane not ready or join command not found in parent cluster status for clusterName %s", clusterParentName)
 		}
 
-		err = provision.JoinWorkerNode(sshClient, cluster, joinCommand)
+		sshClientCP, err := r.getSSHClient(ctx, clusterParent)
+		if err != nil {
+			return r.fail(ctx, cluster, err)
+		}
+
+		err = provision.JoinWorkerNode(sshClient, sshClientCP, cluster, joinCommand)
 		if err != nil {
 			return r.fail(ctx, cluster, err)
 		}
@@ -195,6 +184,30 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *infrav1.RemoteCluster) (*ssh.Client, error) {
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      cluster.Spec.Auth.PasswordSecretRef.Name,
+		Namespace: cluster.Namespace,
+	}, secret)
+	if err != nil {
+		return nil, err
+	}
+
+	passwordBytes, ok := secret.Data[cluster.Spec.Auth.PasswordSecretRef.Key]
+	if !ok {
+		return nil, fmt.Errorf("key %s not found in secret",
+			cluster.Spec.Auth.PasswordSecretRef.Key)
+	}
+	password := string(passwordBytes)
+
+	sshClient, err := ssh.Connect(cluster.Spec.Host, cluster.Spec.Port, cluster.Spec.User, password)
+	if err != nil {
+		return nil, err
+	}
+	return sshClient, nil
 }
 
 // create cluster repository on the management cluster if git integration is enabled
