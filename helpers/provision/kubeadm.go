@@ -12,6 +12,13 @@ import (
 func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (string, error) {
 	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
 
+	// Resolve the control plane's VPN IP from tun0 first — needed for kubeadmConfig and kubelet args.
+	tunIP, err := getTunIP(client)
+	if err != nil {
+		return "", fmt.Errorf("failed to get control plane tun0 IP: %w", err)
+	}
+	log.Printf("Control plane VPN IP: %s", tunIP)
+
 	clean := strings.TrimPrefix(cluster.Spec.Kubernetes.Version, "v")
 
 	kubeadmConfig := fmt.Sprintf(`
@@ -64,7 +71,7 @@ runtimeRequestTimeout: "15m"
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
 mode: ipvs
-`, cluster.Spec.Host, clean, cluster.Spec.ClusterName)
+`, tunIP, clean, cluster.Spec.ClusterName)
 
 	parts := strings.Split(clean, ".")
 	if len(parts) < 2 {
@@ -115,6 +122,9 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		"sudo apt-mark hold kubelet kubeadm kubectl",
 		"sudo systemctl enable kubelet",
 		"sudo systemctl daemon-reload",
+		// Set kubelet node IP to VPN IP before init.
+		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, tunIP),
+		"sudo systemctl daemon-reload",
 		fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF", kubeadmConfig),
 		"test -f /etc/kubernetes/admin.conf || sudo kubeadm init --config /tmp/kubeadm-config.yaml",
 		"mkdir -p $HOME/.kube",
@@ -148,7 +158,7 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		return "", fmt.Errorf("failed to retrieve join command: %w", err)
 	}
 
-	log.Printf("Control plane ready. Join command: %s", joinCmd)
+	log.Print("Control plane ready. Join command is available for worker nodes to join the cluster.")
 	return joinCmd, nil
 }
 
@@ -182,6 +192,13 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 	if cluster.Spec.NodeInfo.HardwareType == "" {
 		return fmt.Errorf("cluster.Spec.NodeInfo.HardwareType must not be empty")
 	}
+
+	// Resolve the worker's VPN IP from tun0.
+	nodeIP, err := getTunIP(client)
+	if err != nil {
+		return fmt.Errorf("failed to get worker tun0 IP: %w", err)
+	}
+	log.Printf("Worker VPN IP: %s", nodeIP)
 
 	clean := strings.TrimPrefix(cluster.Spec.Kubernetes.Version, "v")
 
@@ -221,13 +238,11 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		// =========================
 		// Install CRI-O
 		// =========================
+		"sudo mkdir -p /etc/apt/keyrings",
 		"sudo install -m 0755 -d /etc/apt/keyrings",
 		"sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg",
-		fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
-| gpg --dearmor | sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
-		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
-https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
-| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
+		fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg`, repoVersion),
+		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
 		"sudo apt-get update",
 		"sudo apt-get install -y cri-o",
 		"sudo systemctl enable crio --now",
@@ -249,6 +264,9 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		// =========================
 		// Join the cluster
 		// =========================
+		// Set kubelet node IP before joining so the node registers with the correct address.
+		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, nodeIP),
+		"sudo systemctl daemon-reload",
 		fmt.Sprintf("sudo %s", joinCmd),
 
 		// // =========================
@@ -274,19 +292,19 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 	if err != nil {
 		return fmt.Errorf("failed to list nodes: %w\nOutput:\n%s", err, rawNodeOutput)
 	}
-	log.Printf("Node address table for cluster %s:\n%s", cluster.Spec.ClusterName, rawNodeOutput)
+	// log.Printf("Node address table for cluster %s:\n%s", cluster.Spec.ClusterName, rawNodeOutput)
 
 	// Find the node name whose address column matches cluster.Spec.Host.
 	nodeName := ""
 	for _, line := range strings.Split(strings.TrimSpace(rawNodeOutput), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[1] == cluster.Spec.Host {
+		if len(fields) == 2 && fields[1] == nodeIP {
 			nodeName = fields[0]
 			break
 		}
 	}
 	if nodeName == "" {
-		return fmt.Errorf("failed to resolve node name for host %s — address table:\n%s", cluster.Spec.Host, rawNodeOutput)
+		return fmt.Errorf("failed to resolve node name for host %s vpn ip: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput)
 	}
 
 	// cluster.Spec.Host is the node ip as registered in the cluster.
@@ -297,4 +315,18 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 
 	log.Printf("Worker node %s successfully joined cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)
 	return nil
+}
+
+// getTunIP returns the IPv4 address of the tun0 interface on the remote host.
+// It is used to register nodes with their VPN IP rather than their LAN IP.
+func getTunIP(client *sshhelper.Client) (string, error) {
+	output, err := sshhelper.Run(client, `ip -4 addr show tun0 | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'`)
+	if err != nil {
+		return "", fmt.Errorf("ip addr show tun0 failed: %w\nOutput: %s", err, output)
+	}
+	ip := strings.TrimSpace(output)
+	if ip == "" {
+		return "", fmt.Errorf("tun0 has no IPv4 address — is the VPN connected?")
+	}
+	return ip, nil
 }

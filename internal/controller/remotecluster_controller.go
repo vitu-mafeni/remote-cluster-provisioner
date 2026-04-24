@@ -490,23 +490,23 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 
 	variants := []map[string]interface{}{
 
-		{
-			"name": "minio-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "minio",
-					"repo":     "catalog-nephio-optional",
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "minio",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
+		// {
+		// 	"name": "minio-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "minio",
+		// 			"repo":     "catalog-nephio-optional",
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "minio",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
 		// {
 		// 	"name": "enterprise-gateway-variant",
 		// 	"spec": map[string]interface{}{
@@ -524,40 +524,40 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		// 		},
 		// 	},
 		// },
-		{
-			"name": "gpu-operator-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "gpu-operator",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "gpu-operator",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
-		{
-			"name": "harbor-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "harbor",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "harbor",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
+		// {
+		// 	"name": "gpu-operator-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "gpu-operator",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "gpu-operator",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
+		// {
+		// 	"name": "harbor-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "harbor",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "harbor",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
 		{
 			"name": "k8s-dra-driver-gpu-variant",
 			"spec": map[string]interface{}{
@@ -575,108 +575,108 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				},
 			},
 		},
-		{
-			"name": "kai-scheduler-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "kai-scheduler",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "kai-scheduler",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
-		{
-			"name": "keycloak-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "keycloak",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "keycloak",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
-		{
-			"name": "kubeflow-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "kubeflow",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "kubeflow",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
-		{
-			"name": "kueue-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "kueue",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "kueue",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
-		{
-			"name": "kyverno-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "kyverno",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "kyverno",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
-		{
-			"name": "prometheus-stack-variant",
-			"spec": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					"approval.nephio.org/policy": "initial",
-				},
-				"upstream": map[string]interface{}{
-					"package":  "prometheus-stack",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "prometheus-stack",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
+		// {
+		// 	"name": "kai-scheduler-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "kai-scheduler",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "kai-scheduler",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
+		// {
+		// 	"name": "keycloak-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "keycloak",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "keycloak",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
+		// {
+		// 	"name": "kubeflow-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "kubeflow",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "kubeflow",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
+		// {
+		// 	"name": "kueue-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "kueue",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "kueue",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
+		// {
+		// 	"name": "kyverno-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "kyverno",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "kyverno",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
+		// {
+		// 	"name": "prometheus-stack-variant",
+		// 	"spec": map[string]interface{}{
+		// 		"annotations": map[string]interface{}{
+		// 			"approval.nephio.org/policy": "initial",
+		// 		},
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "prometheus-stack",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "prometheus-stack",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
 		{
 			"name": "nfs-provisioner-variant",
 			"spec": map[string]interface{}{
@@ -694,23 +694,23 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				},
 			},
 		},
-		{
-			"name": "ml-platform-admin",
-			"spec": map[string]interface{}{
-				// "annotations": map[string]interface{}{
-				// 	"approval.nephio.org/policy": "initial",
-				// },
-				"upstream": map[string]interface{}{
-					"package":  "ml-platform-admin",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "ml-platform-admin",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
+		// {
+		// 	"name": "ml-platform-admin",
+		// 	"spec": map[string]interface{}{
+		// 		// "annotations": map[string]interface{}{
+		// 		// 	"approval.nephio.org/policy": "initial",
+		// 		// },
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "ml-platform-admin",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "ml-platform-admin",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
 	}
 
 	gvk := schema.GroupVersionKind{
@@ -776,40 +776,40 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 
 	variants := []map[string]interface{}{
 
-		{
-			"name": "platform-overlays-variant",
-			"spec": map[string]interface{}{
-				// "annotations": map[string]interface{}{
-				// 	"approval.nephio.org/policy": "initial",
-				// },
-				"upstream": map[string]interface{}{
-					"package":  "platform-overlays",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "platform-overlays",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
-		{
-			"name": "post-install-config-variant",
-			"spec": map[string]interface{}{
-				// "annotations": map[string]interface{}{
-				// 	"approval.nephio.org/policy": "initial",
-				// },
-				"upstream": map[string]interface{}{
-					"package":  "post-install-config",
-					"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
-					"revision": clusterRemote.Spec.GitConfig.PackageRevision,
-				},
-				"downstream": map[string]interface{}{
-					"package": "post-install-config",
-					"repo":    clusterRemote.Spec.ClusterName,
-				},
-			},
-		},
+		// {
+		// 	"name": "platform-overlays-variant",
+		// 	"spec": map[string]interface{}{
+		// 		// "annotations": map[string]interface{}{
+		// 		// 	"approval.nephio.org/policy": "initial",
+		// 		// },
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "platform-overlays",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "platform-overlays",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
+		// {
+		// 	"name": "post-install-config-variant",
+		// 	"spec": map[string]interface{}{
+		// 		// "annotations": map[string]interface{}{
+		// 		// 	"approval.nephio.org/policy": "initial",
+		// 		// },
+		// 		"upstream": map[string]interface{}{
+		// 			"package":  "post-install-config",
+		// 			"repo":     clusterRemote.Spec.GitConfig.UpstreamPlatformRepo,
+		// 			"revision": clusterRemote.Spec.GitConfig.PackageRevision,
+		// 		},
+		// 		"downstream": map[string]interface{}{
+		// 			"package": "post-install-config",
+		// 			"repo":    clusterRemote.Spec.ClusterName,
+		// 		},
+		// 	},
+		// },
 	}
 
 	gvk := schema.GroupVersionKind{
