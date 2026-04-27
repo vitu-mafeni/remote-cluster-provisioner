@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -180,6 +182,20 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		_ = r.Status().Update(ctx, cluster)
 
 		logger.Info("Worker node joined to cluster " + clusterParentName)
+
+		if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+			log.Printf("Skipping NVIDIA driver install — node %s is not a GPU node", cluster.Spec.Host)
+			return ctrl.Result{}, nil
+		}
+
+		if err := provision.InstallNvidiaDrivers(sshClient, cluster); err != nil {
+			return r.fail(ctx, cluster, fmt.Errorf("failed to install nvidia drivers on worker node: %w", err))
+		}
+
+		logger.Info("NVIDIA drivers installed on worker node "+cluster.Spec.Host, "worker will reboot now for drivers to take effect...")
+
+		// Then reboot the worker — drivers won't be active until after reboot
+		ssh.Run(sshClient, "sudo reboot")
 
 	}
 
