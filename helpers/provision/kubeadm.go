@@ -275,6 +275,24 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		// fmt.Sprintf("kubectl label nodes --all hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
 	}
 
+	// =========================
+	// GPU node: enable CDI in CRI-O (required by Hami DRA driver)
+	// =========================
+	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+		gpuSteps := []string{
+			// Create CDI directories
+			"sudo mkdir -p /etc/cdi /var/run/cdi",
+			// Write CRI-O CDI config drop-in and restart only if it doesn't already exist.
+			// The inner subshell writes the file and restarts crio; the outer test skips both if already present.
+			`test -f /etc/crio/crio.conf.d/99-cdi.conf || (echo '[crio.runtime]
+enable_cdi = true
+cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/99-cdi.conf && sudo systemctl restart crio)`,
+			// Verify CDI is active
+			"sudo crictl info | grep -i cdi || true",
+		}
+		steps = append(steps, gpuSteps...)
+	}
+
 	for _, cmd := range steps {
 		output, err := sshhelper.Run(client, cmd)
 		if err != nil {
@@ -308,7 +326,7 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 	}
 
 	// cluster.Spec.Host is the node ip as registered in the cluster.
-	labelCmd := fmt.Sprintf("kubectl label node %s hardware-type=%s --overwrite", nodeName, cluster.Spec.NodeInfo.HardwareType)
+	labelCmd := fmt.Sprintf("kubectl label node %s hardware-type=%s gpu=on --overwrite", nodeName, cluster.Spec.NodeInfo.HardwareType)
 	if output, err := sshhelper.Run(cpClient, labelCmd); err != nil {
 		return fmt.Errorf("failed to label worker node %s: %w\nOutput:\n%s", nodeName, err, output)
 	}
@@ -329,4 +347,155 @@ func getTunIP(client *sshhelper.Client) (string, error) {
 		return "", fmt.Errorf("tun0 has no IPv4 address — is the VPN connected?")
 	}
 	return ip, nil
+}
+
+// InstallNvidiaContainerToolkit installs the NVIDIA container toolkit on a GPU node
+// and configures CRI-O to use it. This should be called after JoinWorkerNode for
+// nodes where cluster.Spec.NodeInfo.HardwareType == "gpu".
+func InstallNvidiaContainerToolkit(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
+	if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+		log.Printf("Skipping NVIDIA container toolkit install — node %s is not a GPU node", cluster.Spec.Host)
+		return nil
+	}
+
+	log.Printf("Installing NVIDIA container toolkit on GPU node %s", cluster.Spec.Host)
+
+	const nvidiaToolkitVersion = "1.19.0-1"
+
+	steps := []string{
+		// =========================
+		// Prerequisites
+		// =========================
+		"sudo apt-get update",
+		"sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
+
+		// =========================
+		// NVIDIA repository + GPG key
+		// =========================
+		// Add GPG key
+		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
+
+		// Add repository
+		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
+
+		// Enable experimental packages
+		"sudo sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list",
+
+		"sudo apt-get update",
+
+		// =========================
+		// Install toolkit (pinned version)
+		// =========================
+		fmt.Sprintf(`sudo apt-get install -y \
+nvidia-container-toolkit=%s \
+nvidia-container-toolkit-base=%s \
+libnvidia-container-tools=%s \
+libnvidia-container1=%s`,
+			nvidiaToolkitVersion,
+			nvidiaToolkitVersion,
+			nvidiaToolkitVersion,
+			nvidiaToolkitVersion,
+		),
+
+		// =========================
+		// Configure CRI-O runtime
+		// =========================
+		"sudo nvidia-ctk runtime configure --runtime=crio",
+		"sudo systemctl restart crio",
+
+		// Sanity check
+		"sudo nvidia-ctk --version",
+	}
+
+	for _, cmd := range steps {
+		output, err := sshhelper.Run(client, cmd)
+		if err != nil {
+			return fmt.Errorf("nvidia toolkit install failed: %s\nOutput:\n%s", cmd, output)
+		}
+	}
+
+	log.Printf("NVIDIA container toolkit installed successfully on %s", cluster.Spec.Host)
+	return nil
+}
+
+// InstallNvidiaDrivers installs the NVIDIA drivers on a GPU node.
+// It should be called after InstallNvidiaContainerToolkit.
+// A reboot is typically required after driver installation for the drivers to take effect.
+func InstallNvidiaDrivers(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
+	// if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+	// 	log.Printf("Skipping NVIDIA driver install — node %s is not a GPU node", cluster.Spec.Host)
+	// 	return nil
+	// }
+
+	log.Printf("Installing NVIDIA drivers on GPU node %s", cluster.Spec.Host)
+
+	const nvidiaDriverVersion = "580"
+	const nvidiaToolkitVersion = "1.19.0-1"
+
+	steps := []string{
+		// =========================
+		// Prerequisites
+		// =========================
+		"sudo apt-get update",
+		"sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
+
+		// =========================
+		// NVIDIA container toolkit repository + GPG key
+		// =========================
+		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
+		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
+		"sudo sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list",
+		"sudo apt-get update",
+
+		// =========================
+		// Install container toolkit (pinned version)
+		// =========================
+		fmt.Sprintf(`sudo apt-get install -y \
+nvidia-container-toolkit=%s \
+nvidia-container-toolkit-base=%s \
+libnvidia-container-tools=%s \
+libnvidia-container1=%s`,
+			nvidiaToolkitVersion,
+			nvidiaToolkitVersion,
+			nvidiaToolkitVersion,
+			nvidiaToolkitVersion,
+		),
+
+		// Configure CRI-O to use NVIDIA runtime
+		"sudo nvidia-ctk runtime configure --runtime=crio",
+		"sudo systemctl restart crio",
+
+		// =========================
+		// Install NVIDIA GPU drivers
+		// =========================
+		// List available GPU drivers (informational, non-fatal)
+		"sudo ubuntu-drivers list --gpgpu || true",
+
+		// Install display + compute driver
+		fmt.Sprintf("sudo ubuntu-drivers install nvidia:%s", nvidiaDriverVersion),
+
+		// Install server-grade GPU driver
+		fmt.Sprintf("sudo ubuntu-drivers install --gpgpu nvidia:%s-server", nvidiaDriverVersion),
+
+		// Install nvidia-utils for tools like nvidia-smi
+		fmt.Sprintf("sudo apt-get install -y nvidia-utils-%s-server", nvidiaDriverVersion),
+
+		// Sanity checks
+		"nvidia-smi || true",
+		"sudo nvidia-ctk --version",
+	}
+
+	for _, cmd := range steps {
+		output, err := sshhelper.Run(client, cmd)
+		if err != nil {
+			return fmt.Errorf("nvidia driver install failed: %s\nOutput:\n%s", cmd, output)
+		}
+	}
+
+	log.Printf("NVIDIA drivers installed on %s — a reboot is required for drivers to take effect", cluster.Spec.Host)
+	return nil
 }
