@@ -192,7 +192,7 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return r.fail(ctx, cluster, fmt.Errorf("failed to install nvidia drivers on worker node: %w", err))
 		}
 
-		logger.Info("NVIDIA drivers installed on worker node "+cluster.Spec.Host, "worker will reboot now for drivers to take effect...")
+		logger.Info("NVIDIA drivers installed on worker node " + cluster.Spec.Host + " — worker will reboot now for drivers to take effect...")
 
 		// Then reboot the worker — drivers won't be active until after reboot
 		ssh.Run(sshClient, "sudo reboot")

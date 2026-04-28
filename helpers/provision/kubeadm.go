@@ -238,11 +238,16 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		// =========================
 		// Install CRI-O
 		// =========================
-		"sudo mkdir -p /etc/apt/keyrings",
-		"sudo install -m 0755 -d /etc/apt/keyrings",
-		"sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg",
-		fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg`, repoVersion),
-		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
+		fmt.Sprintf(`if which crio > /dev/null 2>&1; then
+			echo "CRI-O already installed, skipping"
+		else
+			sudo mkdir -p /etc/apt/keyrings &&
+			sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg &&
+			curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg &&
+			echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null &&
+			sudo apt-get update &&
+			sudo apt-get install -y cri-o
+		fi`, repoVersion, repoVersion),
 		"sudo apt-get update",
 		"sudo apt-get install -y cri-o",
 		"sudo systemctl enable crio --now",
@@ -465,6 +470,10 @@ libnvidia-container1=%s`,
 			nvidiaToolkitVersion,
 		),
 
+		"sudo mkdir -p /etc/cdi",
+		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
+		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml --mode=nvml",
+
 		// Configure CRI-O to use NVIDIA runtime
 		"sudo nvidia-ctk runtime configure --runtime=crio",
 		"sudo systemctl restart crio",
@@ -487,6 +496,47 @@ libnvidia-container1=%s`,
 		// Sanity checks
 		"nvidia-smi || true",
 		"sudo nvidia-ctk --version",
+
+		// =========================
+		// Configure CRI-O NVIDIA runtime
+		// Only write and restart if the config is missing or different.
+		// =========================
+
+		// Find conmon path dynamically
+		`CONMON_PATH=$(which conmon 2>/dev/null || find /usr -name conmon 2>/dev/null | head -1) && echo "conmon found at: $CONMON_PATH"`,
+
+		// Write the expected config to a temp file for comparison
+		`CONMON_PATH=$(which conmon 2>/dev/null || find /usr -name conmon 2>/dev/null | head -1) && sudo tee /tmp/99-nvidia.conf > /dev/null <<'EOFCONF'
+[crio]
+
+  [crio.runtime]
+    default_runtime = "nvidia"
+
+    [crio.runtime.runtimes]
+
+      [crio.runtime.runtimes.nvidia]
+        runtime_path = "/usr/bin/nvidia-container-runtime"
+        runtime_type = "oci"
+EOFCONF`,
+
+		"sudo nvidia-ctk runtime configure --runtime=crio --set-as-default --config=/etc/crio/crio.conf.d/99-nvidia.conf",
+
+		// // Apply config and restart CRI-O only if missing or different
+		// `if [ ! -f /etc/crio/crio.conf.d/99-nvidia.conf ] || ! diff -q /tmp/99-nvidia.conf /etc/crio/crio.conf.d/99-nvidia.conf > /dev/null 2>&1; then sudo cp /tmp/99-nvidia.conf /etc/crio/crio.conf.d/99-nvidia.conf && sudo systemctl restart crio && echo "CRI-O restarted with updated NVIDIA runtime config"; else echo "CRI-O NVIDIA runtime config already up to date — skipping"; fi`,
+
+		// // Verify NVIDIA is the default runtime
+		// `sudo crictl info | python3 -m json.tool | grep '"DefaultRuntime"' || true`,
+		// Remove monitor_path ONLY from 99-nvidia.conf — it is deprecated for
+		// non-default runtimes in CRI-O >= 1.28. The base 10-crio.conf legitimately
+		// uses monitor_path for crun/runc and must not be modified.
+		`sudo sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf`,
+		// CRI-O requires conmon in $PATH for monitor fields translation.
+		// It is installed at /usr/libexec/crio/conmon but not symlinked by default.
+		`sudo ln -sf /usr/libexec/crio/conmon /usr/local/bin/conmon`,
+		"sudo systemctl restart crio",
+
+		// Verify NVIDIA is the default runtime
+		`sudo crictl info | python3 -m json.tool | grep '"DefaultRuntime"' || true`,
 	}
 
 	for _, cmd := range steps {
