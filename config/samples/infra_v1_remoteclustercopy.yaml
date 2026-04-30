@@ -14,6 +14,8 @@ spec:
   nodeInfo:
     nodeType: "control-plane" #control-plane or worker
     hardwareType: "cpu" #cpu or gpu
+    softwareConfig:
+      k8sDevicePluginVersion: "v0.17.1" #k8s device plugin version for gpu node, e.g. v0.13.0
 
   auth:
     passwordSecretRef:
