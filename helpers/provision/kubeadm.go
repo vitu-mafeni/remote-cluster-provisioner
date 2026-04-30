@@ -137,7 +137,7 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		"kubectl create namespace argocd || true",
 		"kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
 
-		fmt.Sprintf("kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/%s/deployments/static/nvidia-device-plugin.yml", cluster.Spec.NodeInfo.HardwareType),
+		fmt.Sprintf("kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/%s/deployments/static/nvidia-device-plugin.yml ", cluster.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion),
 		"rm /tmp/catalog/ -rf",
 		"git clone https://github.com/vitu-mafeni/catalog.git /tmp/catalog",
 		"kubectl apply -f /tmp/catalog/nephio/optional/flux-helm-controllers",
