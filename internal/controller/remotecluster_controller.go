@@ -23,7 +23,6 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -116,11 +115,14 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	case "", phaseProvisioning:
 		return r.reconcileProvisioning(ctx, cluster)
 	case phaseReady:
-		if cluster.Annotations[annotationPkgVariantsCreated] == "true" {
-			log.Info("Cluster fully ready — no action required")
-			return ctrl.Result{}, nil
+		if cluster.Spec.NodeInfo.NodeType == "control-plane" {
+			if cluster.Annotations[annotationPkgVariantsCreated] == "true" {
+				log.Info("Cluster fully ready — no action required")
+				return ctrl.Result{}, nil
+			}
+			return r.reconcilePackageVariants(ctx, cluster)
 		}
-		return r.reconcilePackageVariants(ctx, cluster)
+		return ctrl.Result{}, nil
 	case phaseFailed:
 		// Terminal state: manual intervention required to reset phase.
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
@@ -302,7 +304,8 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	return ctrl.Result{}, nil
 }
 
-// setStatus writes Phase, Message, and a Condition to the cluster status in a single call.
+// setStatus appends a new progress condition to the cluster status, preserving
+// the full history of all steps (both successes and failures).
 func (r *RemoteClusterReconciler) setStatus(
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
@@ -312,15 +315,14 @@ func (r *RemoteClusterReconciler) setStatus(
 	cluster.Status.Phase = phase
 	cluster.Status.Message = message
 
-	condType := "Ready"
 	condStatus := metav1.ConditionTrue
 	if isError {
-		condType = "Error"
 		condStatus = metav1.ConditionFalse
 	}
 
-	apimeta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
-		Type:               condType,
+	// Append rather than upsert so every step is recorded in order.
+	cluster.Status.Conditions = append(cluster.Status.Conditions, metav1.Condition{
+		Type:               reason,
 		Status:             condStatus,
 		Reason:             reason,
 		Message:            message,

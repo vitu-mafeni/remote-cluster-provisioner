@@ -85,17 +85,9 @@ type RemoteClusterStatus struct {
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
-	// conditions represent the current state of the RemoteCluster resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
-	// +listType=map
-	// +listMapKey=type
+	// conditions is an ordered list of provisioning progress entries.
+	// Each entry records one step (success or failure) as it happens, building
+	// a full audit trail rather than overwriting prior state.
 	// +optional
 	Conditions  []metav1.Condition `json:"conditions,omitempty"`
 	Phase       string             `json:"phase,omitempty"`
