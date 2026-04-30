@@ -49,15 +49,15 @@ apiServer:
     - name: runtime-config
       value: "resource.k8s.io/v1beta1=true"
     - name: feature-gates
-      value: "DynamicResourceAllocation=true"
+      value: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
 controllerManager:
   extraArgs:
     - name: feature-gates
-      value: "DynamicResourceAllocation=true"
+      value: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
 scheduler:
   extraArgs:
     - name: feature-gates
-      value: "DynamicResourceAllocation=true"
+      value: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
@@ -66,6 +66,7 @@ cgroupDriver: systemd
 containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
 featureGates:
   DynamicResourceAllocation: true
+  DRAConsumableCapacity: true
 runtimeRequestTimeout: "15m"
 ---
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
@@ -135,6 +136,8 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		"kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml",
 		"kubectl create namespace argocd || true",
 		"kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
+
+		fmt.Sprintf("kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/%s/deployments/static/nvidia-device-plugin.yml", cluster.Spec.NodeInfo.HardwareType),
 		"rm /tmp/catalog/ -rf",
 		"git clone https://github.com/vitu-mafeni/catalog.git /tmp/catalog",
 		"kubectl apply -f /tmp/catalog/nephio/optional/flux-helm-controllers",
@@ -436,8 +439,8 @@ func InstallNvidiaDrivers(client *sshhelper.Client, cluster *infrav1.RemoteClust
 
 	log.Printf("Installing NVIDIA drivers on GPU node %s", cluster.Spec.Host)
 
-	const nvidiaDriverVersion = "580"
-	const nvidiaToolkitVersion = "1.19.0-1"
+	nvidiaDriverVersion := cluster.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion
+	nvidiaToolkitVersion := cluster.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
 
 	steps := []string{
 		// =========================

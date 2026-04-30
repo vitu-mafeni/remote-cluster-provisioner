@@ -94,6 +94,15 @@ spec:
                     type: string
                   nodeType:
                     type: string
+                  softwareConfig:
+                    properties:
+                      k8sDevicePluginVersion:
+                        type: string
+                      nvidiaContainerToolkitVersion:
+                        type: string
+                      nvidiaDriverVersion:
+                        type: string
+                    type: object
                 required:
                 - hardwareType
                 - nodeType
