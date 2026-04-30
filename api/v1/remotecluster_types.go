@@ -44,8 +44,15 @@ type RemoteClusterSpec struct {
 }
 
 type NodeInfo struct {
-	NodeType     string `json:"nodeType"`     // control-plane or worker
-	HardwareType string `json:"hardwareType"` // cpu or gpu
+	NodeType       string         `json:"nodeType"`     // control-plane or worker
+	HardwareType   string         `json:"hardwareType"` // cpu or gpu
+	SoftwareConfig SoftwareConfig `json:"softwareConfig,omitempty"`
+}
+
+type SoftwareConfig struct {
+	NvidiaDriverVersion           string `json:"nvidiaDriverVersion,omitempty"`
+	NvidiaContainerToolkitVersion string `json:"nvidiaContainerToolkitVersion,omitempty"`
+	K8sDevicePluginVersion        string `json:"k8sDevicePluginVersion,omitempty"`
 }
 
 type GitConfig struct {

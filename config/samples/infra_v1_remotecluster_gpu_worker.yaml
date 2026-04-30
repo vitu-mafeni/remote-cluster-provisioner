@@ -14,6 +14,11 @@ spec:
   nodeInfo:
     nodeType: "worker" #control-plane or worker
     hardwareType: "gpu" #cpu or gpu
+    softwareConfig:
+      nvidiaDriverVersion: "580" #nvidia driver version for gpu node, e.g. 535.104.05
+      nvidiaContainerToolkitVersion: "1.19.0-1" #nvidia container toolkit version for gpu node
+      k8sDevicePluginVersion: "v0.19.1" #k8s device plugin version for gpu node, e.g. v0.13.0
+
 
   auth:
     passwordSecretRef:
