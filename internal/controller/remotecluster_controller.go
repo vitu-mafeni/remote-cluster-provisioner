@@ -640,21 +640,21 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 	log.Info("Creating Platform Core PackageVariants", "remotecluster", cluster.Name)
 
 	variants := []packageVariantSpec{
-		{
-			name: "k8s-dra-driver-gpu-variant",
-			upstream: packageRef{
-				pkg:      "k8s-dra-driver-gpu",
-				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-				revision: cluster.Spec.GitConfig.PackageRevision,
-			},
-			downstream: packageRef{
-				pkg:  "k8s-dra-driver-gpu",
-				repo: cluster.Spec.ClusterName,
-			},
-			annotations: map[string]interface{}{
-				"approval.nephio.org/policy": "initial",
-			},
-		},
+		// {
+		// 	name: "k8s-dra-driver-gpu-variant",
+		// 	upstream: packageRef{
+		// 		pkg:      "k8s-dra-driver-gpu",
+		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+		// 		revision: cluster.Spec.GitConfig.PackageRevision,
+		// 	},
+		// 	downstream: packageRef{
+		// 		pkg:  "k8s-dra-driver-gpu",
+		// 		repo: cluster.Spec.ClusterName,
+		// 	},
+		// 	annotations: map[string]interface{}{
+		// 		"approval.nephio.org/policy": "initial",
+		// 	},
+		// },
 		// {
 		// 	name: "gpu-operator-variant",
 		// 	upstream: packageRef{
@@ -683,21 +683,21 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 			},
 		},
 
-		{
-			name: "prometheus-stack-variant",
-			upstream: packageRef{
-				pkg:      "prometheus-stack",
-				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-				revision: cluster.Spec.GitConfig.PackageRevision,
-			},
-			downstream: packageRef{
-				pkg:  "prometheus-stack",
-				repo: cluster.Spec.ClusterName,
-			},
-			annotations: map[string]interface{}{
-				"approval.nephio.org/policy": "initial",
-			},
-		},
+		// {
+		// 	name: "prometheus-stack-variant",
+		// 	upstream: packageRef{
+		// 		pkg:      "prometheus-stack",
+		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+		// 		revision: cluster.Spec.GitConfig.PackageRevision,
+		// 	},
+		// 	downstream: packageRef{
+		// 		pkg:  "prometheus-stack",
+		// 		repo: cluster.Spec.ClusterName,
+		// 	},
+		// 	annotations: map[string]interface{}{
+		// 		"approval.nephio.org/policy": "initial",
+		// 	},
+		// },
 		// Commented-out variants (re-enable as needed):
 		// minio-variant, enterprise-gateway-variant, gpu-operator-variant,
 		// harbor-variant, kai-scheduler-variant, keycloak-variant,

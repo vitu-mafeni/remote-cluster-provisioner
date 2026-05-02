@@ -134,6 +134,8 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		"kubectl taint nodes --all node-role.kubernetes.io/control-plane- || kubectl taint nodes --all node-role.kubernetes.io/master- || true",
 		fmt.Sprintf("kubectl label nodes --all hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
 		"kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml",
+		"kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--iface=tun0\"}]'",
+		"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
 		"kubectl create namespace argocd || true",
 		"kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
 
@@ -504,12 +506,11 @@ libnvidia-container1=%s`,
 		// Configure CRI-O NVIDIA runtime
 		// Only write and restart if the config is missing or different.
 		// =========================
-
-		// Find conmon path dynamically
-		`CONMON_PATH=$(which conmon 2>/dev/null || find /usr -name conmon 2>/dev/null | head -1) && echo "conmon found at: $CONMON_PATH"`,
+		`sudo rm -rf /etc/crio/crio.conf.d`,
+		`sudo mkdir -p /etc/crio/crio.conf.d`,
 
 		// Write the expected config to a temp file for comparison
-		`CONMON_PATH=$(which conmon 2>/dev/null || find /usr -name conmon 2>/dev/null | head -1) && sudo tee /tmp/99-nvidia.conf > /dev/null <<'EOFCONF'
+		`sudo tee /etc/crio/crio.conf.d/99-nvidia.conf > /dev/null <<'EOFCONF'
 [crio]
 
   [crio.runtime]
@@ -521,8 +522,6 @@ libnvidia-container1=%s`,
         runtime_path = "/usr/bin/nvidia-container-runtime"
         runtime_type = "oci"
 EOFCONF`,
-
-		"sudo nvidia-ctk runtime configure --runtime=crio --set-as-default --config=/etc/crio/crio.conf.d/99-nvidia.conf",
 
 		// // Apply config and restart CRI-O only if missing or different
 		// `if [ ! -f /etc/crio/crio.conf.d/99-nvidia.conf ] || ! diff -q /tmp/99-nvidia.conf /etc/crio/crio.conf.d/99-nvidia.conf > /dev/null 2>&1; then sudo cp /tmp/99-nvidia.conf /etc/crio/crio.conf.d/99-nvidia.conf && sudo systemctl restart crio && echo "CRI-O restarted with updated NVIDIA runtime config"; else echo "CRI-O NVIDIA runtime config already up to date — skipping"; fi`,
