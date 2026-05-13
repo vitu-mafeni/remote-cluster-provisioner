@@ -57,6 +57,8 @@ const (
 	annotationWorkerJoined = "infra.dcn.ssu.ac.kr/worker-joined"
 	// annotationNvidiaInstalled marks that NVIDIA drivers have been installed on this node.
 	annotationNvidiaInstalled = "infra.dcn.ssu.ac.kr/nvidia-installed"
+	// annotationCDIGenerated marks that the CDI spec has been generated after the post-driver reboot.
+	annotationCDIGenerated = "infra.dcn.ssu.ac.kr/nvidia-cdi-generated"
 
 	phaseProvisioning = "Provisioning"
 	phaseReady        = "Ready"
@@ -277,30 +279,48 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		return ctrl.Result{}, nil
 	}
 
-	if cluster.Annotations[annotationNvidiaInstalled] == "true" {
-		log.Info("NVIDIA drivers already installed; skipping")
+	if cluster.Annotations[annotationNvidiaInstalled] != "true" {
+		if err := provision.InstallNvidiaDrivers(sshClient, cluster); err != nil {
+			return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
+		}
+
+		// Refresh and stamp the nvidia annotation before rebooting.
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking NVIDIA installed: %w", err)
+		}
+		ensureAnnotations(cluster)[annotationNvidiaInstalled] = "true"
+		if err := r.Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("marking NVIDIA as installed: %w", err)
+		}
+
+		log.Info("NVIDIA drivers installed; rebooting worker node for drivers to take effect")
+		// Reboot is best-effort; SSH connection closes before the response arrives.
+		if _, err := ssh.Run(sshClient, "sudo reboot"); err != nil {
+			log.Info("Reboot command returned an error (expected — connection closes on reboot)", "err", err)
+		}
 		return ctrl.Result{}, nil
 	}
 
-	if err := provision.InstallNvidiaDrivers(sshClient, cluster); err != nil {
-		return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
+	if cluster.Annotations[annotationCDIGenerated] == "true" {
+		log.Info("CDI spec already generated; skipping")
+		return ctrl.Result{}, nil
 	}
 
-	// Refresh and stamp the nvidia annotation before rebooting.
+	// Drivers are installed and the node has rebooted — the kernel module is now
+	// loaded, so CDI generation via NVML will succeed.
+	if err := provision.GenerateCDI(sshClient); err != nil {
+		return r.fail(ctx, cluster, "CDIGenerateFailed", fmt.Errorf("generating CDI spec on worker node: %w", err))
+	}
+
 	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking NVIDIA installed: %w", err)
+		return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking CDI generated: %w", err)
 	}
-	ensureAnnotations(cluster)[annotationNvidiaInstalled] = "true"
+	ensureAnnotations(cluster)[annotationCDIGenerated] = "true"
 	if err := r.Update(ctx, cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("marking NVIDIA as installed: %w", err)
+		return ctrl.Result{}, fmt.Errorf("marking CDI as generated: %w", err)
 	}
 
-	log.Info("NVIDIA drivers installed; rebooting worker node for drivers to take effect")
-	// Reboot is best-effort; SSH connection closes before the response arrives.
-	if _, err := ssh.Run(sshClient, "sudo reboot"); err != nil {
-		log.Info("Reboot command returned an error (expected — connection closes on reboot)", "err", err)
-	}
-
+	log.Info("CDI spec generated successfully")
 	return ctrl.Result{}, nil
 }
 
