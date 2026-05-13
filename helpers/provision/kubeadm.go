@@ -475,10 +475,6 @@ libnvidia-container1=%s`,
 			nvidiaToolkitVersion,
 		),
 
-		"sudo mkdir -p /etc/cdi",
-		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
-		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml --mode=nvml",
-
 		// Configure CRI-O to use NVIDIA runtime
 		"sudo nvidia-ctk runtime configure --runtime=crio",
 		"sudo systemctl restart crio",
@@ -489,11 +485,19 @@ libnvidia-container1=%s`,
 		// List available GPU drivers (informational, non-fatal)
 		"sudo ubuntu-drivers list --gpgpu || true",
 
+		// Kernel headers are required for DKMS to build modules for the current kernel.
+		"sudo apt-get install -y linux-headers-$(uname -r) linux-headers-generic",
+
 		// Install display + compute driver
 		fmt.Sprintf("sudo ubuntu-drivers install nvidia:%s", nvidiaDriverVersion),
 
 		// Install server-grade GPU driver
 		fmt.Sprintf("sudo ubuntu-drivers install --gpgpu nvidia:%s-server", nvidiaDriverVersion),
+
+		// Install the DKMS package so modules are rebuilt if the kernel is ever updated.
+		// ubuntu-drivers installs the no-dkms precompiled variant by default, which only
+		// covers the kernel running at install time.
+		fmt.Sprintf("sudo apt-get install -y nvidia-dkms-%s-server", nvidiaDriverVersion),
 
 		// Install nvidia-utils for tools like nvidia-smi
 		fmt.Sprintf("sudo apt-get install -y nvidia-utils-%s-server", nvidiaDriverVersion),
@@ -549,5 +553,22 @@ EOFCONF`,
 	}
 
 	log.Printf("NVIDIA drivers installed on %s — a reboot is required for drivers to take effect", cluster.Spec.Host)
+	return nil
+}
+
+// GenerateCDI generates the CDI spec for the NVIDIA GPUs on the node.
+// Must be called after the node has rebooted post driver installation so that
+// the NVIDIA kernel module is loaded and NVML can enumerate devices.
+func GenerateCDI(client *sshhelper.Client) error {
+	steps := []string{
+		"sudo mkdir -p /etc/cdi",
+		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
+	}
+	for _, cmd := range steps {
+		output, err := sshhelper.Run(client, cmd)
+		if err != nil {
+			return fmt.Errorf("cdi generate failed: %s\nOutput:\n%s", cmd, output)
+		}
+	}
 	return nil
 }
