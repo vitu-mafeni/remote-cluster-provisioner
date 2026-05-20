@@ -12,10 +12,10 @@ import (
 func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (string, error) {
 	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
 
-	// Resolve the control plane's VPN IP from tun0 first — needed for kubeadmConfig and kubelet args.
+	// Resolve the control plane's VPN IP from wg0 first — needed for kubeadmConfig and kubelet args.
 	tunIP, err := getTunIP(client)
 	if err != nil {
-		return "", fmt.Errorf("failed to get control plane tun0 IP: %w", err)
+		return "", fmt.Errorf("failed to get control plane wg0 IP: %w", err)
 	}
 	log.Printf("Control plane VPN IP: %s", tunIP)
 
@@ -134,7 +134,7 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		"kubectl taint nodes --all node-role.kubernetes.io/control-plane- || kubectl taint nodes --all node-role.kubernetes.io/master- || true",
 		fmt.Sprintf("kubectl label nodes --all hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
 		"kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml",
-		"kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--iface=tun0\"}]'",
+		"kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--iface=wg0\"}]'",
 		"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
 		"kubectl create namespace argocd || true",
 		"kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
@@ -198,10 +198,10 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		return fmt.Errorf("cluster.Spec.NodeInfo.HardwareType must not be empty")
 	}
 
-	// Resolve the worker's VPN IP from tun0.
+	// Resolve the worker's VPN IP from wg0.
 	nodeIP, err := getTunIP(client)
 	if err != nil {
-		return fmt.Errorf("failed to get worker tun0 IP: %w", err)
+		return fmt.Errorf("failed to get worker wg0 IP: %w", err)
 	}
 	log.Printf("Worker VPN IP: %s", nodeIP)
 
@@ -345,16 +345,16 @@ cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/9
 	return nil
 }
 
-// getTunIP returns the IPv4 address of the tun0 interface on the remote host.
+// getTunIP returns the IPv4 address of the wg0 interface on the remote host.
 // It is used to register nodes with their VPN IP rather than their LAN IP.
 func getTunIP(client *sshhelper.Client) (string, error) {
-	output, err := sshhelper.Run(client, `ip -4 addr show tun0 | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'`)
+	output, err := sshhelper.Run(client, `ip -4 addr show wg0 | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'`)
 	if err != nil {
-		return "", fmt.Errorf("ip addr show tun0 failed: %w\nOutput: %s", err, output)
+		return "", fmt.Errorf("ip addr show wg0 failed: %w\nOutput: %s", err, output)
 	}
 	ip := strings.TrimSpace(output)
 	if ip == "" {
-		return "", fmt.Errorf("tun0 has no IPv4 address — is the VPN connected?")
+		return "", fmt.Errorf("wg0 has no IPv4 address — is the VPN connected?")
 	}
 	return ip, nil
 }

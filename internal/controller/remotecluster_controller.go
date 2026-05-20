@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -413,9 +414,21 @@ func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *inf
 		return nil, fmt.Errorf("key %q not found in secret %q", secretRef.Key, secretRef.Name)
 	}
 
-	sshClient, err := ssh.Connect(cluster.Spec.Host, cluster.Spec.Port, cluster.Spec.User, string(passwordBytes))
+	var host string
+	if cluster.Spec.VPNConfig.IP != "" {
+		host = cluster.Spec.VPNConfig.IP
+	} else {
+		host = cluster.Spec.Host
+	}
+
+	// VPNConfig is a struct (not a pointer) in the API; compare against its zero value.
+	if !reflect.DeepEqual(cluster.Spec.VPNConfig, infrav1.VPNConfig{}) {
+		// TODO: implement VPN-aware SSH connectivity (e.g., start tunnel) when needed.
+	}
+
+	sshClient, err := ssh.Connect(host, cluster.Spec.Port, cluster.Spec.User, string(passwordBytes))
 	if err != nil {
-		return nil, fmt.Errorf("SSH connect to %s:%d: %w", cluster.Spec.Host, cluster.Spec.Port, err)
+		return nil, fmt.Errorf("SSH connect to %s:%d: %w", host, cluster.Spec.Port, err)
 	}
 	return sshClient, nil
 }

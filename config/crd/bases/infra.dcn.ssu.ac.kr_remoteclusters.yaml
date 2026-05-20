@@ -111,6 +111,11 @@ spec:
                 type: integer
               user:
                 type: string
+              vpnConfig:
+                properties:
+                  ip:
+                    type: string
+                type: object
             required:
             - auth
             - host

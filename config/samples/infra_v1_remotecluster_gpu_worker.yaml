@@ -11,6 +11,8 @@ spec:
   host: "192.168.30.87"
   port: 22
   user: "ubuntu"
+  vpnConfig:
+    ip: "10.9.0.10"
   nodeInfo:
     nodeType: "worker" #control-plane or worker
     hardwareType: "gpu" #cpu or gpu
