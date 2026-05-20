@@ -40,6 +40,7 @@ cat publickey
 
 On ASUS Router:
 
+Go to WAN → Virtual Server / Port Forwarding the add:
 - Protocol: BOTH
 - External Port: 51820
 - Internal Port: 51820
