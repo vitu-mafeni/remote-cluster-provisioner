@@ -50,9 +50,9 @@ spec:
 
   # SSH authentication
   auth:
-    passwordSecretRef:
+    sshPrivateKeySecretRef:
       name: "remote-cluster-new-secret"
-      key: "password"
+      key: "id_rsa"
 
   # Kubernetes configuration
   kubernetes:
