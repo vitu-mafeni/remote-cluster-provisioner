@@ -196,7 +196,7 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 			return ctrl.Result{}, fmt.Errorf("updating status to Ready: %w", err)
 		}
 
-		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, sshClient, *&cluster.Spec.VPNConfig.IP, "create"); err != nil {
+		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, sshClient, cluster.Spec.VPNConfig.IP, "create"); err != nil {
 			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed", fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
 		}
 
@@ -436,6 +436,11 @@ spec:
     nvidiaContainerToolkitVersion: %s
     k8sDevicePluginVersion: %s
   vpnRange: %s
+  vpnServerPublicConfig:
+    publicIP: %s
+    vpnSshCredentialsRef:
+      name: %s
+	  namespace: %s
 status:
   clusterJoinCommand: "%s"
   usedIPAddresses:
@@ -449,6 +454,9 @@ status:
 			cluster.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion,
 			cluster.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion,
 			vpnCIDR,
+			cluster.Spec.VPNConfig.VPNServerPublicIP,
+			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
+			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
 			cluster.Status.JoinCommand,
 			nodeIP,
 		)

@@ -32,9 +32,20 @@ type NodeProvisionNetConfigSpec struct {
 
 	// foo is an example field of NodeProvisionNetConfig. Edit nodeprovisionnetconfig_types.go to remove/update
 	// +optional
-	VPNRange       *string        `json:"vpnRange,omitempty"`
-	ClusterName    string         `json:"clusterName,omitempty"`
-	SoftwareConfig SoftwareConfig `json:"softwareConfig,omitempty"`
+	VPNRange              *string         `json:"vpnRange,omitempty"`
+	VPNServerPublicConfig VPNServerConfig `json:"vpnServerPublicConfig,omitempty"`
+	ClusterName           string          `json:"clusterName,omitempty"`
+	SoftwareConfig        SoftwareConfig  `json:"softwareConfig,omitempty"`
+}
+
+type VPNServerConfig struct {
+	PublicIP             string               `json:"publicIP,omitempty"`
+	VPNSSHCredentialsRef VPNSSHCredentialsRef `json:"vpnSshCredentialsRef,omitempty"`
+}
+
+type VPNSSHCredentialsRef struct {
+	Name      string `json:"name,omitempty"`
+	NameSpace string `json:"namespace,omitempty"`
 }
 
 type SoftwareConfig struct {
