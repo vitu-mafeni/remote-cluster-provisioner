@@ -78,7 +78,14 @@ type GitConfig struct {
 }
 
 type RemoteClusterAuth struct {
-	PasswordSecretRef SecretKeyReference `json:"passwordSecretRef"`
+	// PasswordSecretRef holds the secret reference for password-based SSH authentication.
+	// +optional
+	PasswordSecretRef *SecretKeyReference `json:"passwordSecretRef,omitempty"`
+
+	// SSHPrivateKeySecretRef holds the secret reference for private-key based SSH authentication.
+	// The secret value should be the raw private key data.
+	// +optional
+	SSHPrivateKeySecretRef *SecretKeyReference `json:"sshPrivateKeySecretRef,omitempty"`
 }
 
 type RemoteClusterKubernetes struct {
