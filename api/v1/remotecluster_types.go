@@ -45,7 +45,14 @@ type RemoteClusterSpec struct {
 }
 
 type VPNConfig struct {
-	IP string `json:"ip,omitempty"`
+	IP                   string               `json:"ip,omitempty"`
+	VPNServerPublicIP    string               `json:"vpnServerPublicIP,omitempty"`
+	VPNSSHCredentialsRef VPNSSHCredentialsRef `json:"vpnSshCredentialsRef,omitempty"`
+}
+
+type VPNSSHCredentialsRef struct {
+	Name      string `json:"name,omitempty"`
+	NameSpace string `json:"namespace,omitempty"`
 }
 
 type NodeInfo struct {
