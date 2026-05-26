@@ -599,7 +599,17 @@ func (r *RemoteClusterReconciler) findControlPlane(ctx context.Context, cluster 
 }
 
 func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *infrav1.RemoteCluster) (*ssh.Client, error) {
-	secretRef := cluster.Spec.Auth.PasswordSecretRef
+	var secretRef *infrav1.SecretKeyReference
+	usePrivateKey := false
+
+	if cluster.Spec.Auth.SSHPrivateKeySecretRef != nil {
+		secretRef = cluster.Spec.Auth.SSHPrivateKeySecretRef
+		usePrivateKey = true
+	} else if cluster.Spec.Auth.PasswordSecretRef != nil {
+		secretRef = cluster.Spec.Auth.PasswordSecretRef
+	} else {
+		return nil, fmt.Errorf("no SSH auth credentials configured in spec.auth")
+	}
 
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{
@@ -609,7 +619,7 @@ func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *inf
 		return nil, fmt.Errorf("fetching SSH credential secret %q: %w", secretRef.Name, err)
 	}
 
-	passwordBytes, ok := secret.Data[secretRef.Key]
+	credentialBytes, ok := secret.Data[secretRef.Key]
 	if !ok {
 		return nil, fmt.Errorf("key %q not found in secret %q", secretRef.Key, secretRef.Name)
 	}
@@ -626,7 +636,13 @@ func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *inf
 		// TODO: implement VPN-aware SSH connectivity (e.g., start tunnel) when needed.
 	}
 
-	sshClient, err := ssh.Connect(host, cluster.Spec.Port, cluster.Spec.User, string(passwordBytes))
+	var sshClient *ssh.Client
+	var err error
+	if usePrivateKey {
+		sshClient, err = ssh.ConnectWithPrivateKey(host, cluster.Spec.Port, cluster.Spec.User, string(credentialBytes))
+	} else {
+		sshClient, err = ssh.Connect(host, cluster.Spec.Port, cluster.Spec.User, string(credentialBytes))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("SSH connect to %s:%d: %w", host, cluster.Spec.Port, err)
 	}
