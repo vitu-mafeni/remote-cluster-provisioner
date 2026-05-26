@@ -1,0 +1,106 @@
+apiVersion: infra.dcn.ssu.ac.kr/v1
+kind: RemoteCluster
+metadata:
+  name: remotecluster-sample
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+
+spec:
+  # This must be unique for each cluster.
+  # Used as:
+  # 1. Kubernetes cluster name during provisioning
+  # 2. Parent cluster name when adding worker nodes
+  clusterName: "remotecluster-new"
+
+  # Target node SSH information
+  host: "192.168.28.221"
+  port: 22
+  user: "ubuntu"
+
+  # Node information
+  nodeInfo:
+    # control-plane or worker
+    nodeType: "control-plane"
+
+    # cpu or gpu
+    hardwareType: "cpu"
+
+    softwareConfig:
+      # GPU-related fields are optional.
+      # Only required when hardwareType=gpu
+
+      # nvidiaDriverVersion: ""
+      # nvidiaContainerToolkitVersion: ""
+      k8sDevicePluginVersion: "v0.17.1"
+
+  # VPN configuration
+  vpnConfig:
+    # VPN IP assigned to this node
+    ip: "10.9.0.83"
+
+    # Public IP of VPN server
+    vpnServerPublicIP: "13.215.206.108"
+
+    vpnSshCredentialsRef:
+      name: "vpn-server-secret"
+      namespace: "default"
+      key: "id_rsa"
+
+  # SSH authentication
+  auth:
+    passwordSecretRef:
+      name: "remote-cluster-new-secret"
+      key: "password"
+
+  # Kubernetes configuration
+  kubernetes:
+    version: "v1.34.2"
+
+  # GitOps configuration
+  gitConfig:
+    # "true" or "false"
+    enable: "true"
+
+    # Git server URL
+    gitServer: "http://192.168.28.111:31650"
+
+    # Git username
+    gitUsername: "nephio"
+
+    # Upstream platform repository
+    upstreamPlatformRepo: "catalog-workloads-mlplatform"
+
+    # Branch/tag/commit
+    packageRevision: "v1.0.0"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: remote-cluster-new-secret
+  namespace: default
+type: Opaque
+stringData:
+  password: "1"
+
+---
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: vpn-server-secret
+#   namespace: default
+# type: Opaque
+# stringData:
+#   password: "vpn-password"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vpn-server-secret
+  namespace: default
+type: Opaque
+stringData:
+  id_rsa: |
+    -----BEGIN RSA PRIVATE KEY----- CHANGE ME TO YOUR VPN SERVER PRIVATE KEY -----END RSA PRIVATE KEY-----
