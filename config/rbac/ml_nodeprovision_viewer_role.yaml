@@ -1,0 +1,29 @@
+# This rule is not used by the project remote-cluster-provisioner itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants read-only access to ml.dcn.ssu.ac.kr resources.
+# This role is intended for users who need visibility into these resources
+# without permissions to modify them. It is ideal for monitoring purposes and limited-access viewing.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+  name: ml-nodeprovision-viewer-role
+rules:
+- apiGroups:
+  - ml.dcn.ssu.ac.kr
+  resources:
+  - nodeprovisions
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ml.dcn.ssu.ac.kr
+  resources:
+  - nodeprovisions/status
+  verbs:
+  - get

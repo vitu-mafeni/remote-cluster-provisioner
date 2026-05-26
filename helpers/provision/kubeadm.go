@@ -13,7 +13,7 @@ func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteClu
 	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
 
 	// Resolve the control plane's VPN IP from wg0 first — needed for kubeadmConfig and kubelet args.
-	tunIP, err := getTunIP(client)
+	tunIP, err := GetTunIP(client)
 	if err != nil {
 		return "", fmt.Errorf("failed to get control plane wg0 IP: %w", err)
 	}
@@ -188,20 +188,20 @@ func getJoinCommand(client *sshhelper.Client) (string, error) {
 // FOR WORKER NODES, we will run the join command in the controller and add the node to the cluster after provisioning, so no need to return join command for worker nodes here.
 // JoinWorkerNode installs all prerequisites on the worker and joins it to the cluster.
 // joinCmd is the full string returned by InitializeControlPlane (or getJoinCommand).
-func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string) error {
+func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string) (error, string) {
 	log.Printf("Joining worker node %s to cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)
 
 	if joinCmd == "" {
-		return fmt.Errorf("joinCmd must not be empty")
+		return fmt.Errorf("joinCmd must not be empty"), ""
 	}
 	if cluster.Spec.NodeInfo.HardwareType == "" {
-		return fmt.Errorf("cluster.Spec.NodeInfo.HardwareType must not be empty")
+		return fmt.Errorf("cluster.Spec.NodeInfo.HardwareType must not be empty"), ""
 	}
 
 	// Resolve the worker's VPN IP from wg0.
-	nodeIP, err := getTunIP(client)
+	nodeIP, err := GetTunIP(client)
 	if err != nil {
-		return fmt.Errorf("failed to get worker wg0 IP: %w", err)
+		return fmt.Errorf("failed to get worker wg0 IP: %w", err), ""
 	}
 	log.Printf("Worker VPN IP: %s", nodeIP)
 
@@ -209,7 +209,7 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 
 	parts := strings.Split(clean, ".")
 	if len(parts) < 2 {
-		return fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.Kubernetes.Version)
+		return fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.Kubernetes.Version), ""
 	}
 
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
@@ -306,7 +306,7 @@ cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/9
 	for _, cmd := range steps {
 		output, err := sshhelper.Run(client, cmd)
 		if err != nil {
-			return fmt.Errorf("command failed: %s\nOutput:\n%s", cmd, output)
+			return fmt.Errorf("command failed: %s\nOutput:\n%s", cmd, output), ""
 		}
 	}
 
@@ -318,7 +318,7 @@ cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/9
 	// Log the raw output first to help debug mismatches.
 	rawNodeOutput, err := sshhelper.Run(cpClient, `kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n | .status.addresses[].address | [$n, .] | @tsv'`)
 	if err != nil {
-		return fmt.Errorf("failed to list nodes: %w\nOutput:\n%s", err, rawNodeOutput)
+		return fmt.Errorf("failed to list nodes: %w\nOutput:\n%s", err, rawNodeOutput), ""
 	}
 	// log.Printf("Node address table for cluster %s:\n%s", cluster.Spec.ClusterName, rawNodeOutput)
 
@@ -332,22 +332,22 @@ cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/9
 		}
 	}
 	if nodeName == "" {
-		return fmt.Errorf("failed to resolve node name for host %s vpn ip: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput)
+		return fmt.Errorf("failed to resolve node name for host %s vpn ip: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput), ""
 	}
 
 	// cluster.Spec.Host is the node ip as registered in the cluster.
 	labelCmd := fmt.Sprintf("kubectl label node %s hardware-type=%s gpu=on --overwrite", nodeName, cluster.Spec.NodeInfo.HardwareType)
 	if output, err := sshhelper.Run(cpClient, labelCmd); err != nil {
-		return fmt.Errorf("failed to label worker node %s: %w\nOutput:\n%s", nodeName, err, output)
+		return fmt.Errorf("failed to label worker node %s: %w\nOutput:\n%s", nodeName, err, output), ""
 	}
 
 	log.Printf("Worker node %s successfully joined cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)
-	return nil
+	return nil, nodeIP
 }
 
-// getTunIP returns the IPv4 address of the wg0 interface on the remote host.
+// GetTunIP returns the IPv4 address of the wg0 interface on the remote host.
 // It is used to register nodes with their VPN IP rather than their LAN IP.
-func getTunIP(client *sshhelper.Client) (string, error) {
+func GetTunIP(client *sshhelper.Client) (string, error) {
 	output, err := sshhelper.Run(client, `ip -4 addr show wg0 | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'`)
 	if err != nil {
 		return "", fmt.Errorf("ip addr show wg0 failed: %w\nOutput: %s", err, output)

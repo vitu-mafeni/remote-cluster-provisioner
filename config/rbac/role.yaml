@@ -30,3 +30,32 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - ml.dcn.ssu.ac.kr
+  resources:
+  - nodeprovisionnetconfigs
+  - nodeprovisions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ml.dcn.ssu.ac.kr
+  resources:
+  - nodeprovisionnetconfigs/finalizers
+  - nodeprovisions/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - ml.dcn.ssu.ac.kr
+  resources:
+  - nodeprovisionnetconfigs/status
+  - nodeprovisions/status
+  verbs:
+  - get
+  - patch
+  - update
