@@ -53,6 +53,7 @@ type VPNConfig struct {
 type VPNSSHCredentialsRef struct {
 	Name      string `json:"name,omitempty"`
 	NameSpace string `json:"namespace,omitempty"`
+	Key       string `json:"key,omitempty"`
 }
 
 type NodeInfo struct {
