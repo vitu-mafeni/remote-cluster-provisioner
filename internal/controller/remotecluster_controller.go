@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
 	"time"
@@ -39,6 +40,7 @@ import (
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/helpers/provision"
 	"dcn.ssu.ac.kr/infra/helpers/ssh"
+	sshhelper "dcn.ssu.ac.kr/infra/helpers/ssh"
 )
 
 // RemoteClusterReconciler reconciles a RemoteCluster object.
@@ -194,6 +196,10 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 			return ctrl.Result{}, fmt.Errorf("updating status to Ready: %w", err)
 		}
 
+		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, sshClient, *&cluster.Spec.VPNConfig.IP, "create"); err != nil {
+			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed", fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
+		}
+
 		log.Info("Control plane provisioned; waiting for cluster repo before creating PackageVariants",
 			"requeueAfter", repoReadyWait)
 	} else {
@@ -202,6 +208,25 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 	}
 
 	return ctrl.Result{RequeueAfter: repoReadyWait}, nil
+}
+
+func VPNRangeToCIDR(s string) string {
+
+	ip := net.ParseIP(strings.TrimSpace(s))
+	if ip == nil {
+		return ""
+	}
+
+	ip = ip.To4()
+	if ip == nil {
+		return ""
+	}
+
+	mask := net.CIDRMask(24, 32)
+
+	network := ip.Mask(mask)
+
+	return fmt.Sprintf("%s/24", network.String())
 }
 
 func (r *RemoteClusterReconciler) reconcilePackageVariants(ctx context.Context, cluster *infrav1.RemoteCluster) (ctrl.Result, error) {
@@ -254,8 +279,26 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		}
 		defer func() { _ = sshClientCP.Conn.Close() }()
 
-		if err := provision.JoinWorkerNode(sshClient, sshClientCP, cluster, clusterParent.Status.JoinCommand); err != nil {
-			return r.fail(ctx, cluster, "WorkerJoinFailed", fmt.Errorf("joining worker node to cluster: %w", err))
+		// if err, nodeIP := provision.JoinWorkerNode(sshClient, sshClientCP, cluster, clusterParent.Status.JoinCommand); err != nil {
+		// 	return r.fail(ctx, cluster, "WorkerJoinFailed", fmt.Errorf("joining worker node to cluster: %w", err))
+		// }
+
+		err, nodeIP := provision.JoinWorkerNode(
+			sshClient,
+			sshClientCP,
+			cluster,
+			clusterParent.Status.JoinCommand,
+		)
+		if err != nil {
+			return r.fail(
+				ctx,
+				cluster,
+				"WorkerJoinFailed",
+				fmt.Errorf(
+					"joining worker node to cluster: %w",
+					err,
+				),
+			)
 		}
 
 		// Refresh, stamp the joined annotation, then update status — all in one pass.
@@ -269,8 +312,12 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		if err := r.setStatus(ctx, cluster, phaseReady, "WorkerJoined", "Worker node joined to cluster", false); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating worker status to Ready: %w", err)
 		}
-
 		log.Info("Worker node joined to cluster")
+
+		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, sshClientCP, nodeIP, "update"); err != nil {
+			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed", fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
+		}
+
 	} else {
 		log.Info("Worker already joined; skipping join step")
 	}
@@ -322,6 +369,151 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	}
 
 	log.Info("CDI spec generated successfully")
+	return ctrl.Result{}, nil
+}
+
+func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig(
+	ctx context.Context,
+	cluster *infrav1.RemoteCluster,
+	sshClient *ssh.Client,
+	nodeIP,
+	action string,
+) (ctrl.Result, error) {
+
+	log := logf.FromContext(ctx).WithValues(
+		"cluster",
+		cluster.Name,
+	)
+
+	// ============================================================
+	// Resolve wg0 IP from remote node
+	// ============================================================
+
+	output, err := sshhelper.Run(
+		sshClient,
+		"ip -4 addr show wg0 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'",
+	)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf(
+			"getting wg0 ip: %w",
+			err,
+		)
+	}
+
+	nodeIP = strings.TrimSpace(output)
+
+	if nodeIP == "" {
+		return ctrl.Result{}, fmt.Errorf(
+			"empty wg0 ip",
+		)
+	}
+
+	log.Info(
+		"Resolved wg0 IP",
+		"nodeIP",
+		nodeIP,
+	)
+
+	// ============================================================
+	// CREATE
+	// ============================================================
+
+	if action == "create" {
+
+		vpnCIDR := VPNRangeToCIDR(nodeIP)
+
+		yaml := fmt.Sprintf(`
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvisionNetConfig
+metadata:
+  name: %s-netconfig
+  namespace: %s
+spec:
+  clusterName: %s
+  softwareConfig:
+    kubernetesVersion: %s
+    nvidiaDriverVersion: %s
+    nvidiaContainerToolkitVersion: %s
+    k8sDevicePluginVersion: %s
+  vpnRange: %s
+status:
+  clusterJoinCommand: "%s"
+  usedIPAddresses:
+    - %s
+`,
+			cluster.Spec.ClusterName,
+			cluster.Namespace,
+			cluster.Spec.ClusterName,
+			cluster.Spec.Kubernetes.Version,
+			cluster.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion,
+			cluster.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion,
+			cluster.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion,
+			vpnCIDR,
+			cluster.Status.JoinCommand,
+			nodeIP,
+		)
+
+		cmd := fmt.Sprintf(
+			"cat <<'EOF' | kubectl apply -f -\n%s\nEOF",
+			yaml,
+		)
+
+		output, err := sshhelper.Run(sshClient, cmd)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf(
+				"creating remote NodeProvisionNetConfig: %w\nOutput:\n%s",
+				err,
+				output,
+			)
+		}
+
+		log.Info(
+			"Created NodeProvisionNetConfig remotely",
+		)
+	}
+
+	// ============================================================
+	// UPDATE
+	// ============================================================
+
+	if action == "update" {
+
+		patchCmd := fmt.Sprintf(`
+kubectl patch nodeprovisionnetconfig %s-netconfig \
+-n %s \
+--type='json' \
+-p='[
+  {
+    "op": "add",
+    "path": "/status/usedIPAddresses/-",
+    "value": "%s"
+  }
+]' --subresource=status
+`,
+			cluster.Spec.ClusterName,
+			cluster.Namespace,
+			nodeIP,
+		)
+
+		output, err := sshhelper.Run(
+			sshClient,
+			patchCmd,
+		)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf(
+				"patching remote NodeProvisionNetConfig: %w\nOutput:\n%s",
+				err,
+				output,
+			)
+		}
+
+		log.Info(
+			"Updated NodeProvisionNetConfig remotely",
+			"nodeIP",
+			nodeIP,
+		)
+	}
+
 	return ctrl.Result{}, nil
 }
 

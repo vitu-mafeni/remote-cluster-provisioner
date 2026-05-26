@@ -35,8 +35,10 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/internal/controller"
+	mlcontroller "dcn.ssu.ac.kr/infra/internal/controller/ml"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -49,6 +51,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(infrav1.AddToScheme(scheme))
+	utilruntime.Must(mlv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -183,6 +186,20 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RemoteCluster")
+		os.Exit(1)
+	}
+	if err := (&mlcontroller.NodeProvisionReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "NodeProvision")
+		os.Exit(1)
+	}
+	if err := (&mlcontroller.NodeProvisionNetConfigReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "NodeProvisionNetConfig")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
