@@ -25,3 +25,27 @@ func Connect(host string, port int, user, password string) (*Client, error) {
 
 	return &Client{Conn: conn}, nil
 }
+
+func ConnectWithPrivateKey(host string, port int, user, privateKey string) (*Client, error) {
+	signer, err := cryptossh.ParsePrivateKey([]byte(privateKey))
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("Connecting to %s:%d with user %s via private key", host, port, user)
+
+	config := &cryptossh.ClientConfig{
+		User: user,
+		Auth: []cryptossh.AuthMethod{
+			cryptossh.PublicKeys(signer),
+		},
+		HostKeyCallback: cryptossh.InsecureIgnoreHostKey(),
+	}
+
+	conn, err := cryptossh.Dial("tcp", fmt.Sprintf("%s:%d", host, port), config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Client{Conn: conn}, nil
+}

@@ -51,8 +51,16 @@ spec:
                     - key
                     - name
                     type: object
-                required:
-                - passwordSecretRef
+                  sshPrivateKeySecretRef:
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
                 type: object
               clusterName:
                 description: foo is an example field of RemoteCluster. Edit remotecluster_types.go
@@ -115,6 +123,17 @@ spec:
                 properties:
                   ip:
                     type: string
+                  vpnServerPublicIP:
+                    type: string
+                  vpnSshCredentialsRef:
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    type: object
                 type: object
             required:
             - auth
