@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
@@ -422,7 +424,52 @@ func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig(
 
 		vpnCIDR := VPNRangeToCIDR(nodeIP)
 
-		yaml := fmt.Sprintf(`
+		// Ensure the VPN SSH credentials secret exists on the remote cluster so
+		// the NodeProvisionNetConfig controller there can read it.
+		if cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
+			vpnSecret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
+				Namespace: cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
+			}, vpnSecret); err != nil {
+				return ctrl.Result{}, fmt.Errorf(
+					"fetching VPN SSH credentials secret %q: %w",
+					cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
+					err,
+				)
+			}
+
+			secretData := ""
+			for k, v := range vpnSecret.Data {
+				secretData += fmt.Sprintf("  %s: %s\n", k, base64.StdEncoding.EncodeToString(v))
+			}
+			secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: %s
+data:
+%s`,
+				vpnSecret.Name,
+				cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
+				string(vpnSecret.Type),
+				secretData,
+			)
+
+			secretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", secretYAML)
+			secretOutput, secretErr := sshhelper.Run(sshClient, secretCmd)
+			if secretErr != nil {
+				return ctrl.Result{}, fmt.Errorf(
+					"creating VPN SSH credentials secret on remote cluster: %w\nOutput:\n%s",
+					secretErr,
+					secretOutput,
+				)
+			}
+			log.Info("Ensured VPN SSH credentials secret on remote cluster", "secret", vpnSecret.Name)
+		}
+
+		netConfigYAML := fmt.Sprintf(`
 apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
 kind: NodeProvisionNetConfig
 metadata:
@@ -441,10 +488,6 @@ spec:
     vpnSshCredentialsRef:
       name: %s
       namespace: %s
-status:
-  clusterJoinCommand: "%s"
-  usedIPAddresses:
-    - %s
 `,
 			cluster.Spec.ClusterName,
 			cluster.Namespace,
@@ -457,13 +500,11 @@ status:
 			cluster.Spec.VPNConfig.VPNServerPublicIP,
 			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
 			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
-			cluster.Status.JoinCommand,
-			nodeIP,
 		)
 
 		cmd := fmt.Sprintf(
 			"cat <<'EOF' | kubectl apply -f -\n%s\nEOF",
-			yaml,
+			netConfigYAML,
 		)
 
 		output, err := sshhelper.Run(sshClient, cmd)
@@ -475,9 +516,27 @@ status:
 			)
 		}
 
-		log.Info(
-			"Created NodeProvisionNetConfig remotely",
+		log.Info("Created NodeProvisionNetConfig remotely")
+
+		// kubectl apply ignores the status subresource — patch it separately.
+		joinCmdJSON, _ := json.Marshal(cluster.Status.JoinCommand)
+		statusPatchCmd := fmt.Sprintf(
+			`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status -p '{"status":{"clusterJoinCommand":%s,"usedIPAddresses":["%s"]}}'`,
+			cluster.Spec.ClusterName,
+			cluster.Namespace,
+			string(joinCmdJSON),
+			nodeIP,
 		)
+		statusOutput, statusErr := sshhelper.Run(sshClient, statusPatchCmd)
+		if statusErr != nil {
+			return ctrl.Result{}, fmt.Errorf(
+				"patching NodeProvisionNetConfig status: %w\nOutput:\n%s",
+				statusErr,
+				statusOutput,
+			)
+		}
+
+		log.Info("Patched NodeProvisionNetConfig status")
 	}
 
 	// ============================================================
