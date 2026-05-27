@@ -42,6 +42,8 @@ type VPNServerConfig struct {
 	PublicIP    string `json:"publicIP,omitempty"`
 	SSHPort     int    `json:"sshPort,omitempty"`
 	SSHUsername string `json:"sshUsername,omitempty"`
+	// VPNPort is the UDP port WireGuard listens on (default 51820).
+	VPNPort int `json:"vpnPort,omitempty"`
 
 	VPNSSHCredentialsRef VPNSSHCredentialsRef `json:"vpnSshCredentialsRef,omitempty"`
 }

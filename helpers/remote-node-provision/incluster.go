@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"os/exec"
 	"strings"
 
@@ -73,19 +72,20 @@ func NewInClusterProvisioner(
 	}
 
 	// ============================================================
-	// Load local wg template and build client config
+	// Build WireGuard client config from server info
 	// ============================================================
 
-	wgTemplate, err := loadLocalWGTemplate()
-	if err != nil {
-		return "", "", fmt.Errorf("failed loading local wg template: %w", err)
-	}
-
-	wgConfig := buildWGConfig(
-		wgTemplate,
+	wgConfig, err := buildClientWGConfig(
+		vpnServerClient,
+		vpnNodeIP,
+		*netNodeConfig.Spec.VPNRange,
+		netNodeConfig.Spec.VPNServerPublicConfig.PublicIP,
+		netNodeConfig.Spec.VPNServerPublicConfig.VPNPort,
 		privateKey,
-		fmt.Sprintf("%s/24", vpnNodeIP),
 	)
+	if err != nil {
+		return "", "", fmt.Errorf("failed building wireguard client config: %w", err)
+	}
 
 	// ============================================================
 	// Register peer on VPN server (idempotent)
@@ -337,25 +337,39 @@ func generateWireGuardKeyPair() (string, string, error) {
 	return privateKey, publicKey, nil
 }
 
-func loadLocalWGTemplate() (string, error) {
-	content, err := os.ReadFile("/etc/wireguard/wg0.conf")
+// buildClientWGConfig fetches the VPN server's WireGuard public key via SSH
+// and constructs a complete client wg0.conf without needing a local template.
+func buildClientWGConfig(
+	vpnServerClient *sshhelper.Client,
+	vpnNodeIP, vpnRange, serverPublicIP string,
+	vpnPort int,
+	privateKey string,
+) (string, error) {
+	out, err := sshhelper.Run(vpnServerClient, "sudo wg show wg0 public-key")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("reading VPN server public key: %w", err)
 	}
-	return string(content), nil
-}
+	serverPublicKey := strings.TrimSpace(out)
+	if serverPublicKey == "" {
+		return "", fmt.Errorf("empty public key returned from VPN server")
+	}
 
-func buildWGConfig(template string, privateKey string, address string) string {
-	lines := strings.Split(template, "\n")
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "PrivateKey") {
-			lines[i] = fmt.Sprintf("PrivateKey = %s", privateKey)
-		}
-		if strings.HasPrefix(strings.TrimSpace(line), "Address") {
-			lines[i] = fmt.Sprintf("Address = %s", address)
-		}
+	if vpnPort == 0 {
+		vpnPort = 51820
 	}
-	return strings.Join(lines, "\n")
+
+	cfg := fmt.Sprintf(`[Interface]
+PrivateKey = %s
+Address = %s/24
+
+[Peer]
+PublicKey = %s
+Endpoint = %s:%d
+AllowedIPs = %s
+PersistentKeepalive = 25
+`, privateKey, vpnNodeIP, serverPublicKey, serverPublicIP, vpnPort, vpnRange)
+
+	return cfg, nil
 }
 
 // getNextAvailableIP returns the next IP in vpnRange that is not in usedIPs.
