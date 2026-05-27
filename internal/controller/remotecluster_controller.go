@@ -478,10 +478,10 @@ metadata:
 spec:
   clusterName: %s
   softwareConfig:
-    kubernetesVersion: %s
-    nvidiaDriverVersion: %s
-    nvidiaContainerToolkitVersion: %s
-    k8sDevicePluginVersion: %s
+    kubernetesVersion: "%s"
+    nvidiaDriverVersion: "%s"
+    nvidiaContainerToolkitVersion: "%s"
+    k8sDevicePluginVersion: "%s"
   vpnRange: %s
   vpnServerPublicConfig:
     publicIP: %s
