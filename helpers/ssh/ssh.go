@@ -3,6 +3,7 @@ package ssh
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	cryptossh "golang.org/x/crypto/ssh"
 )
@@ -27,6 +28,11 @@ func Connect(host string, port int, user, password string) (*Client, error) {
 }
 
 func ConnectWithPrivateKey(host string, port int, user, privateKey string) (*Client, error) {
+	// Normalize line endings and surrounding whitespace that can creep in
+	// when keys are stored in Kubernetes secrets or pasted into YAML files.
+	privateKey = strings.TrimSpace(privateKey)
+	privateKey = strings.ReplaceAll(privateKey, "\r\n", "\n")
+
 	signer, err := cryptossh.ParsePrivateKey([]byte(privateKey))
 	if err != nil {
 		return nil, err
