@@ -440,7 +440,7 @@ spec:
     publicIP: %s
     vpnSshCredentialsRef:
       name: %s
-	  namespace: %s
+      namespace: %s
 status:
   clusterJoinCommand: "%s"
   usedIPAddresses:
