@@ -146,7 +146,7 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 
 		// temporary, will be removed after the controller is containerized.
 		"git clone -b r2-1 https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
-		"kubectl apply -f /tmp/remote-cluster-provisioner/config/samples",
+		"kubectl apply -f /tmp/remote-cluster-provisioner/config/crd/bases/",
 	}
 
 	for _, cmd := range steps {
