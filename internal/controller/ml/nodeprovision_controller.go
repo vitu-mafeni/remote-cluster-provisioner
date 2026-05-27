@@ -19,12 +19,14 @@ package ml
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
@@ -64,15 +66,6 @@ const (
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions/finalizers,verbs=update
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the NodeProvision object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.1/pkg/reconcile
 func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	log.Info("Reconciling NodeProvision")
@@ -102,27 +95,28 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	switch nodeProvision.Status.Phase {
 	case "", mlv1alpha1.NodeProvisionPhaseProvisioning:
-		// GET THE SECRET REFERENCED BY CREDENTIALSREF
 		secret := &corev1.Secret{}
-		if err := r.Get(ctx, client.ObjectKey{Name: nodeProvision.Spec.CredentialsRef.Name, Namespace: nodeProvision.Spec.CredentialsRef.Namespace}, secret); err != nil {
+		if err := r.Get(ctx, client.ObjectKey{
+			Name:      nodeProvision.Spec.CredentialsRef.Name,
+			Namespace: nodeProvision.Spec.CredentialsRef.Namespace,
+		}, secret); err != nil {
 			return ctrl.Result{}, fmt.Errorf("getting credentials secret: %w", err)
 		}
-
 		return r.reconcileProvisioning(ctx, nodeProvision, secret)
 	case mlv1alpha1.NodeProvisionPhaseReady:
 		log.Info("NodeProvision is ready, no action needed")
 		return ctrl.Result{}, nil
 	case mlv1alpha1.NodeProvisionPhaseFailed:
-		// Terminal state: manual intervention required to reset phase.
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	default:
 		return ctrl.Result{}, nil
 	}
-
 }
 
 // reconcileProvisioning handles the provisioning phase of the NodeProvision lifecycle.
 func (r *NodeProvisionReconciler) reconcileProvisioning(ctx context.Context, nodeProvision *mlv1alpha1.NodeProvision, secret *corev1.Secret) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
 	switch nodeProvision.Spec.Provider {
 	case mlv1alpha1.CloudProviderAWS:
 		// Handle AWS-specific provisioning logic
@@ -133,66 +127,76 @@ func (r *NodeProvisionReconciler) reconcileProvisioning(ctx context.Context, nod
 	case mlv1alpha1.CloudProviderOnPrem:
 		sshClient, err := r.getSSHClient(ctx, nodeProvision)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("getting SSH client: %w", err)
+			return ctrl.Result{}, fmt.Errorf("getting SSH client for node: %w", err)
 		}
+		defer sshClient.Conn.Close()
 
-		// get cluster join command from NodeProvisionNetConfig There will only be one NodeProvisionNetConfig per cluster, so we can list and get one only.
 		netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
 		if err := r.List(ctx, netConfigList); err != nil {
 			return ctrl.Result{}, fmt.Errorf("listing NodeProvisionNetConfigs: %w", err)
 		}
 		if len(netConfigList.Items) == 0 {
-			return ctrl.Result{}, fmt.Errorf("no NodeProvisionNetConfig found")
+			log.Info("No NodeProvisionNetConfig found yet; requeueing")
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 		netNodeConfig := &netConfigList.Items[0]
-		joinCommand := netNodeConfig.Status.ClusterJoinCommand
-		if joinCommand == "" {
-			return ctrl.Result{}, fmt.Errorf("cluster join command not found in NodeProvisionNetConfig")
+		if netNodeConfig.Status.ClusterJoinCommand == "" {
+			log.Info("Cluster join command not ready yet; requeueing")
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 
-		// ssh to the on-prem node and run provisioning commands (e.g., install kubeadm, join cluster)
-		// This is a placeholder implementation; replace with actual provisioning logic.
-		// For example, you might run a script on the remote node that performs the necessary setup and joins it to the cluster.
-
-		// Handle on-premises-specific provisioning logic
-		err = remotenodeprovision.NewInClusterProvisioner(ctx, nodeProvision, secret, sshClient, netNodeConfig)
+		vpnServerClient, err := r.getVPNServerSSHClient(ctx, netNodeConfig)
 		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("connecting to VPN server: %w", err)
+		}
+		defer vpnServerClient.Conn.Close()
+
+		vpnNodeIP, publicKey, err := remotenodeprovision.NewInClusterProvisioner(
+			ctx,
+			nodeProvision,
+			secret,
+			sshClient,
+			vpnServerClient,
+			netNodeConfig,
+		)
+		if err != nil {
+			nodeProvision.Status.Phase = mlv1alpha1.NodeProvisionPhaseFailed
+			nodeProvision.Status.Message = err.Error()
+			_ = r.Status().Update(ctx, nodeProvision)
 			return ctrl.Result{}, fmt.Errorf("provisioning on-prem node: %w", err)
 		}
 
+		if err := r.updateNetConfigStatus(ctx, netNodeConfig, vpnNodeIP, publicKey, nodeProvision.Name); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
+		}
+
 		nodeProvision.Status.Phase = mlv1alpha1.NodeProvisionPhaseJoining
+		nodeProvision.Status.IPAddress = vpnNodeIP
 		if err := r.Status().Update(ctx, nodeProvision); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating NodeProvision status: %w", err)
 		}
+
 	default:
 		return ctrl.Result{}, fmt.Errorf("unsupported cloud provider: %s", nodeProvision.Spec.Provider)
 	}
 
 	return ctrl.Result{}, nil
-
 }
 
+// getSSHClient creates an SSH client for the node being provisioned.
+// Auth type is auto-detected: PEM private key → key auth; anything else → password auth.
 func (r *NodeProvisionReconciler) getSSHClient(ctx context.Context, nodeProvision *mlv1alpha1.NodeProvision) (*ssh.Client, error) {
-	secretRef := nodeProvision.Spec.CredentialsRef
-
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{
-		Name:      secretRef.Name,
+		Name:      nodeProvision.Spec.CredentialsRef.Name,
 		Namespace: nodeProvision.Namespace,
 	}, secret); err != nil {
-		return nil, fmt.Errorf("fetching SSH credential secret %q: %w", secretRef.Name, err)
+		return nil, fmt.Errorf("fetching SSH credential secret %q: %w", nodeProvision.Spec.CredentialsRef.Name, err)
 	}
 
-	// Assuming the credential key is stored under a standard key like "password" or "key"
-	// Adjust the key name based on your CredentialsRef structure
-	var passwordBytes []byte
-	var ok bool
-
-	// Try common credential key names
-	if passwordBytes, ok = secret.Data["password"]; !ok {
-		if passwordBytes, ok = secret.Data["key"]; !ok {
-			return nil, fmt.Errorf("credential key not found in secret %q", secretRef.Name)
-		}
+	credBytes, err := resolveSecretKey(secret, nodeProvision.Spec.CredentialsRef.Key)
+	if err != nil {
+		return nil, err
 	}
 
 	var host string
@@ -202,19 +206,126 @@ func (r *NodeProvisionReconciler) getSSHClient(ctx context.Context, nodeProvisio
 		host = nodeProvision.Spec.Hostname
 	}
 
-	sshClient, err := ssh.Connect(host, nodeProvision.Spec.SSHPort, nodeProvision.Spec.SSHUsernameOverride, string(passwordBytes))
-	if err != nil {
-		return nil, fmt.Errorf("SSH connect to %s:%d: %w", host, nodeProvision.Spec.SSHPort, err)
+	return dialSSH(host, nodeProvision.Spec.SSHPort, nodeProvision.Spec.SSHUsernameOverride, string(credBytes))
+}
+
+// getVPNServerSSHClient creates an SSH client to the WireGuard VPN server using
+// credentials from the secret referenced in the NodeProvisionNetConfig.
+func (r *NodeProvisionReconciler) getVPNServerSSHClient(ctx context.Context, netConfig *mlv1alpha1.NodeProvisionNetConfig) (*ssh.Client, error) {
+	ref := netConfig.Spec.VPNServerPublicConfig.VPNSSHCredentialsRef
+	if ref.Name == "" {
+		return nil, fmt.Errorf("vpnSshCredentialsRef.name is empty in NodeProvisionNetConfig")
 	}
-	return sshClient, nil
+
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      ref.Name,
+		Namespace: ref.NameSpace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("fetching VPN server SSH secret %q: %w", ref.Name, err)
+	}
+
+	credBytes, err := resolveSecretKey(secret, ref.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := netConfig.Spec.VPNServerPublicConfig
+	username := cfg.SSHUsername
+	if username == "" {
+		username = "ubuntu"
+	}
+	port := cfg.SSHPort
+	if port == 0 {
+		port = 22
+	}
+
+	return dialSSH(cfg.PublicIP, port, username, string(credBytes))
+}
+
+// updateNetConfigStatus records the newly allocated VPN IP and peer in the
+// NodeProvisionNetConfig status.  Idempotent: duplicate entries are skipped.
+func (r *NodeProvisionReconciler) updateNetConfigStatus(
+	ctx context.Context,
+	netConfig *mlv1alpha1.NodeProvisionNetConfig,
+	vpnIP, publicKey, nodeName string,
+) error {
+	updated := false
+
+	ipExists := false
+	for _, ip := range netConfig.Status.UsedIPAddresses {
+		if ip == vpnIP {
+			ipExists = true
+			break
+		}
+	}
+	if !ipExists {
+		netConfig.Status.UsedIPAddresses = append(netConfig.Status.UsedIPAddresses, vpnIP)
+		updated = true
+	}
+
+	peerExists := false
+	for _, p := range netConfig.Status.VPNPeers {
+		if p.PublicKey == publicKey || p.VPNIP == vpnIP {
+			peerExists = true
+			break
+		}
+	}
+	if !peerExists {
+		netConfig.Status.VPNPeers = append(netConfig.Status.VPNPeers, mlv1alpha1.VPNPeerStatus{
+			NodeName:  nodeName,
+			PublicKey: publicKey,
+			VPNIP:     vpnIP,
+		})
+		updated = true
+	}
+
+	if !updated {
+		return nil
+	}
+	return r.Status().Update(ctx, netConfig)
+}
+
+// resolveSecretKey returns the credential bytes from a secret.
+// If key is specified it is used directly; otherwise well-known field names are tried in order.
+func resolveSecretKey(secret *corev1.Secret, key string) ([]byte, error) {
+	if key != "" {
+		if v, ok := secret.Data[key]; ok {
+			return v, nil
+		}
+		return nil, fmt.Errorf("key %q not found in secret %q", key, secret.Name)
+	}
+	for _, k := range []string{"privateKey", "id_rsa", "ssh-privatekey", "password", "key"} {
+		if v, ok := secret.Data[k]; ok {
+			return v, nil
+		}
+	}
+	return nil, fmt.Errorf("no usable credential key found in secret %q (tried: privateKey, id_rsa, ssh-privatekey, password, key)", secret.Name)
+}
+
+// dialSSH auto-detects the auth method from the credential value.
+// A PEM-encoded block (starts with "-----BEGIN") uses private-key auth; everything else uses password auth.
+func dialSSH(host string, port int, user, credential string) (*ssh.Client, error) {
+	if strings.HasPrefix(strings.TrimSpace(credential), "-----BEGIN") {
+		return ssh.ConnectWithPrivateKey(host, port, user, credential)
+	}
+	return ssh.Connect(host, port, user, credential)
 }
 
 func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, nodeProvision *mlv1alpha1.NodeProvision) (ctrl.Result, error) {
-	panic("unimplemented")
+	controllerutil.RemoveFinalizer(nodeProvision, nodeProvisionFinalizer)
+	if err := r.Update(ctx, nodeProvision); err != nil {
+		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
+	}
+	return ctrl.Result{}, nil
 }
 
-func ensureFinalizer(nodeProvision *mlv1alpha1.NodeProvision, nodeProvisionFinalizer string) bool {
-	panic("unimplemented")
+func ensureFinalizer(nodeProvision *mlv1alpha1.NodeProvision, finalizer string) bool {
+	if !controllerutil.ContainsFinalizer(nodeProvision, finalizer) {
+		controllerutil.AddFinalizer(nodeProvision, finalizer)
+		return true
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.
