@@ -65,6 +65,7 @@ const (
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch;update
 
 func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -103,6 +104,8 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, fmt.Errorf("getting credentials secret: %w", err)
 		}
 		return r.reconcileProvisioning(ctx, nodeProvision, secret)
+	case mlv1alpha1.NodeProvisionPhaseJoining:
+		return r.reconcileJoining(ctx, nodeProvision)
 	case mlv1alpha1.NodeProvisionPhaseReady:
 		log.Info("NodeProvision is ready, no action needed")
 		return ctrl.Result{}, nil
@@ -326,6 +329,56 @@ func ensureFinalizer(nodeProvision *mlv1alpha1.NodeProvision, finalizer string) 
 		return true
 	}
 	return false
+}
+
+// reconcileJoining polls for the node to appear (matched by VPN IP in node
+// addresses), applies the hardware-type label, then transitions to Ready.
+func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, nodeProvision *mlv1alpha1.NodeProvision) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if nodeProvision.Spec.NodeLabel == "" {
+		nodeProvision.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
+		return ctrl.Result{}, r.Status().Update(ctx, nodeProvision)
+	}
+
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList); err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing nodes: %w", err)
+	}
+
+	targetIP := nodeProvision.Status.IPAddress
+	var found *corev1.Node
+	for i := range nodeList.Items {
+		for _, addr := range nodeList.Items[i].Status.Addresses {
+			if addr.Address == targetIP {
+				found = &nodeList.Items[i]
+				break
+			}
+		}
+		if found != nil {
+			break
+		}
+	}
+
+	if found == nil {
+		log.Info("Node not yet visible in cluster, requeueing", "vpnIP", targetIP)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	patch := client.MergeFrom(found.DeepCopy())
+	if found.Labels == nil {
+		found.Labels = map[string]string{}
+	}
+	found.Labels["hardware-type"] = nodeProvision.Spec.NodeLabel
+	if err := r.Patch(ctx, found, patch); err != nil {
+		return ctrl.Result{}, fmt.Errorf("patching node label: %w", err)
+	}
+
+	log.Info("Labeled node", "node", found.Name, "hardware-type", nodeProvision.Spec.NodeLabel)
+
+	nodeProvision.Status.NodeName = found.Name
+	nodeProvision.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
+	return ctrl.Result{}, r.Status().Update(ctx, nodeProvision)
 }
 
 // SetupWithManager sets up the controller with the Manager.
