@@ -42,8 +42,8 @@ type NodeProvisionReconciler struct {
 }
 
 const (
-	nodeProvisionFinalizer = "ml.cnlab.ai/v1alpha1/nodeprovision-finalizer"
-	remoteClusterLabelKey  = "ml.cnlab.ai/v1alpha1/nodeprovision"
+	nodeProvisionFinalizer = "ml.dcn.ssu.ac.kr/nodeprovision-finalizer"
+	// nodeProvisionLabelKey  = "ml.dcn.ssu.ac.kr/nodeprovision"
 )
 
 type NodeProvisionPhase string
