@@ -42,6 +42,8 @@ spec:
               auth:
                 properties:
                   passwordSecretRef:
+                    description: PasswordSecretRef holds the secret reference for
+                      password-based SSH authentication.
                     properties:
                       key:
                         type: string
@@ -52,6 +54,9 @@ spec:
                     - name
                     type: object
                   sshPrivateKeySecretRef:
+                    description: |-
+                      SSHPrivateKeySecretRef holds the secret reference for private-key based SSH authentication.
+                      The secret value should be the raw private key data.
                     properties:
                       key:
                         type: string

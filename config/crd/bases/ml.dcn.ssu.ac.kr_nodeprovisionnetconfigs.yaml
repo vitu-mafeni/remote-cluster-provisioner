@@ -57,6 +57,18 @@ spec:
                 description: foo is an example field of NodeProvisionNetConfig. Edit
                   nodeprovisionnetconfig_types.go to remove/update
                 type: string
+              vpnServerPublicConfig:
+                properties:
+                  publicIP:
+                    type: string
+                  vpnSshCredentialsRef:
+                    properties:
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    type: object
+                type: object
             type: object
           status:
             description: status defines the observed state of NodeProvisionNetConfig
@@ -64,7 +76,9 @@ spec:
               clusterJoinCommand:
                 type: string
               usedIPAddresses:
-                description: Used IP addresses that are currently allocated by the network provisioner.
+                description: |-
+                  For Kubernetes API conventions, see:
+                  https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
                 items:
                   type: string
                 type: array
