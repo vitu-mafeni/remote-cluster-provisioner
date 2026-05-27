@@ -44,6 +44,10 @@ const (
 type CredentialsRef struct {
 	Name      string `json:"name,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
+	// Key is the data key within the secret that holds the credential.
+	// When omitted the controller tries well-known names: privateKey, id_rsa,
+	// ssh-privatekey, password, key.
+	Key string `json:"key,omitempty"`
 }
 
 // NodeProvisionSpec defines the desired state of NodeProvision.
