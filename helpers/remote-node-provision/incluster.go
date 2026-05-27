@@ -337,26 +337,38 @@ func generateWireGuardKeyPair() (string, string, error) {
 	return privateKey, publicKey, nil
 }
 
-// buildClientWGConfig fetches the VPN server's WireGuard public key via SSH
-// and constructs a complete client wg0.conf without needing a local template.
+// buildClientWGConfig fetches the VPN server's WireGuard public key and actual
+// listen port via SSH, then constructs a complete client wg0.conf.
+// vpnPort is used only as a fallback when the server's listen-port cannot be read.
 func buildClientWGConfig(
 	vpnServerClient *sshhelper.Client,
 	vpnNodeIP, vpnRange, serverPublicIP string,
 	vpnPort int,
 	privateKey string,
 ) (string, error) {
-	out, err := sshhelper.Run(vpnServerClient, "sudo wg show wg0 public-key")
+	pubKeyOut, err := sshhelper.Run(vpnServerClient, "sudo wg show wg0 public-key")
 	if err != nil {
 		return "", fmt.Errorf("reading VPN server public key: %w", err)
 	}
-	serverPublicKey := strings.TrimSpace(out)
+	serverPublicKey := strings.TrimSpace(pubKeyOut)
 	if serverPublicKey == "" {
 		return "", fmt.Errorf("empty public key returned from VPN server")
 	}
 
+	// Read the actual listen port from the running interface so the client
+	// endpoint is always correct regardless of what vpnPort is set to.
+	portOut, portErr := sshhelper.Run(vpnServerClient, "sudo wg show wg0 listen-port")
+	if portErr == nil {
+		if p := strings.TrimSpace(portOut); p != "" && p != "(none)" {
+			vpnPort = 0
+			fmt.Sscanf(p, "%d", &vpnPort)
+		}
+	}
 	if vpnPort == 0 {
 		vpnPort = 51820
 	}
+
+	log.Printf("Building WireGuard client config: server=%s port=%d", serverPublicIP, vpnPort)
 
 	cfg := fmt.Sprintf(`[Interface]
 PrivateKey = %s
