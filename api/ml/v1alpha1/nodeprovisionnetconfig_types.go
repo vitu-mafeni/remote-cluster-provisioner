@@ -39,13 +39,25 @@ type NodeProvisionNetConfigSpec struct {
 }
 
 type VPNServerConfig struct {
-	PublicIP             string               `json:"publicIP,omitempty"`
+	PublicIP    string `json:"publicIP,omitempty"`
+	SSHPort     int    `json:"sshPort,omitempty"`
+	SSHUsername string `json:"sshUsername,omitempty"`
+
 	VPNSSHCredentialsRef VPNSSHCredentialsRef `json:"vpnSshCredentialsRef,omitempty"`
 }
 
 type VPNSSHCredentialsRef struct {
 	Name      string `json:"name,omitempty"`
 	NameSpace string `json:"namespace,omitempty"`
+	// Key is the data key within the secret that holds the credential.
+	Key string `json:"key,omitempty"`
+}
+
+// VPNPeerStatus records one registered WireGuard peer.
+type VPNPeerStatus struct {
+	NodeName  string `json:"nodeName,omitempty"`
+	PublicKey string `json:"publicKey,omitempty"`
+	VPNIP     string `json:"vpnIP,omitempty"`
 }
 
 type SoftwareConfig struct {
@@ -57,14 +69,13 @@ type SoftwareConfig struct {
 
 // NodeProvisionNetConfigStatus defines the observed state of NodeProvisionNetConfig.
 type NodeProvisionNetConfigStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 	// +optional
-	UsedIPAddresses    []string `json:"usedIPAddresses,omitempty"`
-	ClusterJoinCommand string   `json:"clusterJoinCommand,omitempty"`
+	UsedIPAddresses []string `json:"usedIPAddresses,omitempty"`
+	// ClusterJoinCommand is the kubeadm join command for worker nodes.
+	ClusterJoinCommand string `json:"clusterJoinCommand,omitempty"`
+	// VPNPeers tracks every WireGuard peer registered on the VPN server.
+	// +optional
+	VPNPeers []VPNPeerStatus `json:"vpnPeers,omitempty"`
 }
 
 // +kubebuilder:object:root=true
