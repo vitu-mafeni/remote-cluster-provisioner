@@ -90,9 +90,10 @@ spec:
     # SSH connection details for the VPN server.
     # The controller uses these to register new peers via
     # "wg set wg0 peer …" and to persist the config.
-    # Defaults: sshPort=22, sshUsername=ubuntu
+    # Defaults: sshPort=22, sshUsername=ubuntu, vpnPort=51820
     sshPort: 22
     sshUsername: ubuntu
+    vpnPort: 51820
 
     # Secret on THIS cluster that holds the VPN server SSH credential.
     # key + auth auto-detection work the same as credentialsRef above.
