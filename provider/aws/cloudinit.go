@@ -1,4 +1,4 @@
-package awsnodeprovision
+package aws
 
 import (
 	"encoding/base64"
