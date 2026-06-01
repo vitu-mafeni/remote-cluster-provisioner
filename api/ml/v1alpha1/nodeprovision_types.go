@@ -24,11 +24,19 @@ type NodeProvisionPhase string
 type CloudProvider string
 
 const (
-	NodeProvisionPhasePending      NodeProvisionPhase = "Pending"
-	NodeProvisionPhaseProvisioning NodeProvisionPhase = "Provisioning"
-	NodeProvisionPhaseJoining      NodeProvisionPhase = "Joining"
-	NodeProvisionPhaseReady        NodeProvisionPhase = "Ready"
-	NodeProvisionPhaseFailed       NodeProvisionPhase = "Failed"
+	NodeProvisionPhasePending          NodeProvisionPhase = "Pending"
+	NodeProvisionPhaseValidating       NodeProvisionPhase = "Validating"
+	NodeProvisionPhaseCreatingInstance NodeProvisionPhase = "CreatingInstance"
+	NodeProvisionPhaseWaitingForInstance NodeProvisionPhase = "WaitingForInstance"
+	NodeProvisionPhaseConfiguringVPN   NodeProvisionPhase = "ConfiguringVPN"
+	NodeProvisionPhaseProvisioning     NodeProvisionPhase = "Provisioning"
+	NodeProvisionPhaseBootstrapping    NodeProvisionPhase = "Bootstrapping"
+	NodeProvisionPhaseRegisteringNode  NodeProvisionPhase = "RegisteringNode"
+	NodeProvisionPhaseJoining          NodeProvisionPhase = "Joining"
+	NodeProvisionPhaseVerifyingHealth  NodeProvisionPhase = "VerifyingHealth"
+	NodeProvisionPhaseReady            NodeProvisionPhase = "Ready"
+	NodeProvisionPhaseFailed           NodeProvisionPhase = "Failed"
+	NodeProvisionPhaseDeleting         NodeProvisionPhase = "Deleting"
 
 	CloudProviderAWS    CloudProvider = "AWS"
 	CloudProviderGCP    CloudProvider = "GCP"
@@ -48,6 +56,28 @@ type CredentialsRef struct {
 	// When omitted the controller tries well-known names: privateKey, id_rsa,
 	// ssh-privatekey, password, key.
 	Key string `json:"key,omitempty"`
+}
+
+// AWSConfig holds AWS-specific parameters for EC2 node provisioning.
+type AWSConfig struct {
+	// VPC ID where the instance will be launched.
+	VPCID string `json:"vpcId,omitempty"`
+	// Subnet ID for the instance's primary network interface.
+	SubnetID string `json:"subnetId,omitempty"`
+	// Security group IDs to attach to the instance.
+	// +optional
+	SecurityGroupIDs []string `json:"securityGroupIds,omitempty"`
+	// AMI ID to use for the instance.
+	AMI string `json:"ami,omitempty"`
+	// EC2 key pair name for SSH access (optional when using cloud-init only).
+	// +optional
+	KeyPairName string `json:"keyPairName,omitempty"`
+	// IAM instance profile name or ARN for the instance.
+	// +optional
+	IAMInstanceProfile string `json:"iamInstanceProfile,omitempty"`
+	// Additional tags to apply to created AWS resources.
+	// +optional
+	Tags map[string]string `json:"tags,omitempty"`
 }
 
 // NodeProvisionSpec defines the desired state of NodeProvision.
@@ -72,10 +102,13 @@ type NodeProvisionSpec struct {
 	SSHUsernameOverride string `json:"sshUsernameOverride,omitempty"`
 
 	CredentialsRef CredentialsRef `json:"credentialsRef,omitempty"`
+
+	// AWSConfig holds provider-specific parameters for AWS EC2 provisioning.
+	// +optional
+	AWSConfig *AWSConfig `json:"awsConfig,omitempty"`
 }
 
 // NodeProvisionStatus defines the observed state of NodeProvision.
-
 type NodeProvisionStatus struct {
 	// Current lifecycle phase.
 	Phase NodeProvisionPhase `json:"phase,omitempty"`
@@ -89,14 +122,34 @@ type NodeProvisionStatus struct {
 	// Timestamp when provisioning completed.
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 
-	// Provider-generated instance ID.
+	// Provider-generated instance ID (e.g. i-xxxxxxxxxxxxxxxxx for AWS).
 	InstanceID string `json:"instanceId,omitempty"`
 
 	// Assigned hostname.
 	Hostname string `json:"hostname,omitempty"`
 
-	// Assigned node IP.
+	// IPAddress is the VPN (WireGuard) IP assigned to the node.
 	IPAddress string `json:"ipAddress,omitempty"`
+
+	// PublicIP is the cloud-provider public IP of the instance.
+	// +optional
+	PublicIP string `json:"publicIp,omitempty"`
+
+	// PrivateIP is the cloud-provider private IP of the instance.
+	// +optional
+	PrivateIP string `json:"privateIp,omitempty"`
+
+	// VpnIP is the WireGuard VPN IP allocated for this node.
+	// +optional
+	VpnIP string `json:"vpnIp,omitempty"`
+
+	// Progress is a 0–100 percentage of provisioning completion.
+	// +optional
+	Progress int `json:"progress,omitempty"`
+
+	// LastUpdated is the timestamp of the most recent status update.
+	// +optional
+	LastUpdated *metav1.Time `json:"lastUpdated,omitempty"`
 
 	// Kubernetes node name after join.
 	NodeName string `json:"nodeName,omitempty"`
