@@ -31,9 +31,9 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
-	awsprovision "dcn.ssu.ac.kr/infra/helpers/aws-node-provision"
-	remotenodeprovision "dcn.ssu.ac.kr/infra/helpers/remote-node-provision"
-	"dcn.ssu.ac.kr/infra/helpers/ssh"
+	awsprovision "dcn.ssu.ac.kr/infra/provider/aws"
+	remotenodeprovision "dcn.ssu.ac.kr/infra/provider/onprem"
+	"dcn.ssu.ac.kr/infra/pkg/ssh"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )

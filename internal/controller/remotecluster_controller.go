@@ -40,9 +40,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
-	"dcn.ssu.ac.kr/infra/helpers/provision"
-	"dcn.ssu.ac.kr/infra/helpers/ssh"
-	sshhelper "dcn.ssu.ac.kr/infra/helpers/ssh"
+	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
+	"dcn.ssu.ac.kr/infra/pkg/ssh"
+	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
 
 // RemoteClusterReconciler reconciles a RemoteCluster object.
@@ -180,7 +180,7 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 	if cluster.Status.JoinCommand == "" {
 		log.Info("Initializing control plane via kubeadm")
 
-		joinCommand, err := provision.InitializeControlPlane(sshClient, cluster)
+		joinCommand, err := kubeadm.InitializeControlPlane(sshClient, cluster)
 		if err != nil {
 			return r.fail(ctx, cluster, "ControlPlaneInitFailed", fmt.Errorf("initializing control plane: %w", err))
 		}
@@ -281,11 +281,11 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		}
 		defer func() { _ = sshClientCP.Conn.Close() }()
 
-		// if err, nodeIP := provision.JoinWorkerNode(sshClient, sshClientCP, cluster, clusterParent.Status.JoinCommand); err != nil {
+		// if err, nodeIP := kubeadm.JoinWorkerNode(sshClient, sshClientCP, cluster, clusterParent.Status.JoinCommand); err != nil {
 		// 	return r.fail(ctx, cluster, "WorkerJoinFailed", fmt.Errorf("joining worker node to cluster: %w", err))
 		// }
 
-		err, nodeIP := provision.JoinWorkerNode(
+		err, nodeIP := kubeadm.JoinWorkerNode(
 			sshClient,
 			sshClientCP,
 			cluster,
@@ -330,7 +330,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	}
 
 	if cluster.Annotations[annotationNvidiaInstalled] != "true" {
-		if err := provision.InstallNvidiaDrivers(sshClient, cluster); err != nil {
+		if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster); err != nil {
 			return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
 		}
 
@@ -358,7 +358,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 
 	// Drivers are installed and the node has rebooted — the kernel module is now
 	// loaded, so CDI generation via NVML will succeed.
-	if err := provision.GenerateCDI(sshClient); err != nil {
+	if err := kubeadm.GenerateCDI(sshClient); err != nil {
 		return r.fail(ctx, cluster, "CDIGenerateFailed", fmt.Errorf("generating CDI spec on worker node: %w", err))
 	}
 
