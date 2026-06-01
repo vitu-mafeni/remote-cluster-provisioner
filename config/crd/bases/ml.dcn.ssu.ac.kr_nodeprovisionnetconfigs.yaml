@@ -1,0 +1,92 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: nodeprovisionnetconfigs.ml.dcn.ssu.ac.kr
+spec:
+  group: ml.dcn.ssu.ac.kr
+  names:
+    kind: NodeProvisionNetConfig
+    listKind: NodeProvisionNetConfigList
+    plural: nodeprovisionnetconfigs
+    singular: nodeprovisionnetconfig
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NodeProvisionNetConfig is the Schema for the nodeprovisionnetconfigs
+          API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of NodeProvisionNetConfig
+            properties:
+              clusterName:
+                type: string
+              softwareConfig:
+                properties:
+                  k8sDevicePluginVersion:
+                    type: string
+                  kubernetesVersion:
+                    type: string
+                  nvidiaContainerToolkitVersion:
+                    type: string
+                  nvidiaDriverVersion:
+                    type: string
+                type: object
+              vpnRange:
+                description: foo is an example field of NodeProvisionNetConfig. Edit
+                  nodeprovisionnetconfig_types.go to remove/update
+                type: string
+              vpnServerPublicConfig:
+                properties:
+                  publicIP:
+                    type: string
+                  vpnSshCredentialsRef:
+                    properties:
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    type: object
+                type: object
+            type: object
+          status:
+            description: status defines the observed state of NodeProvisionNetConfig
+            properties:
+              clusterJoinCommand:
+                type: string
+              usedIPAddresses:
+                description: |-
+                  For Kubernetes API conventions, see:
+                  https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+                items:
+                  type: string
+                type: array
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

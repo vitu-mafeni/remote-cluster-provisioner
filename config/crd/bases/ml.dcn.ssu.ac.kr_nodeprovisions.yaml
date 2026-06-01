@@ -1,0 +1,109 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: nodeprovisions.ml.dcn.ssu.ac.kr
+spec:
+  group: ml.dcn.ssu.ac.kr
+  names:
+    kind: NodeProvision
+    listKind: NodeProvisionList
+    plural: nodeprovisions
+    singular: nodeprovision
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NodeProvision is the Schema for the nodeprovisions API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of NodeProvision
+            properties:
+              credentialsRef:
+                description: |-
+                  NodeProvisionSpec defines the desired state of NodeProvision
+                  CredentialsRef references the Secret containing provider credentials.
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                type: object
+              hostname:
+                type: string
+              instanceId:
+                type: string
+              instanceType:
+                type: string
+              ipAddress:
+                type: string
+              nodeLabel:
+                type: string
+              provider:
+                type: string
+              region:
+                type: string
+              role:
+                type: string
+              sshPort:
+                type: integer
+              sshUsernameOverride:
+                type: string
+            type: object
+          status:
+            description: status defines the observed state of NodeProvision
+            properties:
+              completionTime:
+                description: Timestamp when provisioning completed.
+                format: date-time
+                type: string
+              hostname:
+                description: Assigned hostname.
+                type: string
+              instanceId:
+                description: Provider-generated instance ID.
+                type: string
+              ipAddress:
+                description: Assigned node IP.
+                type: string
+              message:
+                description: Human-readable status message.
+                type: string
+              nodeName:
+                description: Kubernetes node name after join.
+                type: string
+              phase:
+                description: Current lifecycle phase.
+                type: string
+              startTime:
+                description: Timestamp when provisioning started.
+                format: date-time
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

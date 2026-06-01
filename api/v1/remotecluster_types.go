@@ -32,14 +32,40 @@ type RemoteClusterSpec struct {
 
 	// foo is an example field of RemoteCluster. Edit remotecluster_types.go to remove/update
 	// +optional
-	ClusterName string `json:"clusterName"`
-	Host        string `json:"host"`
-	Port        int    `json:"port"`
-	User        string `json:"user"`
+	ClusterName string    `json:"clusterName"` // this has to be unique for each cluster, and will be used as the cluster name when provisioning, and also will be used as the parent cluster
+	Host        string    `json:"host"`
+	VPNConfig   VPNConfig `json:"vpnConfig,omitempty"`
+	Port        int       `json:"port"`
+	User        string    `json:"user"`
+	NodeInfo    NodeInfo  `json:"nodeInfo,omitempty"`
 
 	Auth       RemoteClusterAuth       `json:"auth"`
 	Kubernetes RemoteClusterKubernetes `json:"kubernetes"`
 	GitConfig  GitConfig               `json:"gitConfig,omitempty"`
+}
+
+type VPNConfig struct {
+	IP                   string               `json:"ip,omitempty"`
+	VPNServerPublicIP    string               `json:"vpnServerPublicIP,omitempty"`
+	VPNSSHCredentialsRef VPNSSHCredentialsRef `json:"vpnSshCredentialsRef,omitempty"`
+}
+
+type VPNSSHCredentialsRef struct {
+	Name      string `json:"name,omitempty"`
+	NameSpace string `json:"namespace,omitempty"`
+	Key       string `json:"key,omitempty"`
+}
+
+type NodeInfo struct {
+	NodeType       string         `json:"nodeType"`     // control-plane or worker
+	HardwareType   string         `json:"hardwareType"` // cpu or gpu
+	SoftwareConfig SoftwareConfig `json:"softwareConfig,omitempty"`
+}
+
+type SoftwareConfig struct {
+	NvidiaDriverVersion           string `json:"nvidiaDriverVersion,omitempty"`
+	NvidiaContainerToolkitVersion string `json:"nvidiaContainerToolkitVersion,omitempty"`
+	K8sDevicePluginVersion        string `json:"k8sDevicePluginVersion,omitempty"`
 }
 
 type GitConfig struct {
@@ -52,7 +78,14 @@ type GitConfig struct {
 }
 
 type RemoteClusterAuth struct {
-	PasswordSecretRef SecretKeyReference `json:"passwordSecretRef"`
+	// PasswordSecretRef holds the secret reference for password-based SSH authentication.
+	// +optional
+	PasswordSecretRef *SecretKeyReference `json:"passwordSecretRef,omitempty"`
+
+	// SSHPrivateKeySecretRef holds the secret reference for private-key based SSH authentication.
+	// The secret value should be the raw private key data.
+	// +optional
+	SSHPrivateKeySecretRef *SecretKeyReference `json:"sshPrivateKeySecretRef,omitempty"`
 }
 
 type RemoteClusterKubernetes struct {
@@ -72,21 +105,14 @@ type RemoteClusterStatus struct {
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
-	// conditions represent the current state of the RemoteCluster resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
-	// +listType=map
-	// +listMapKey=type
+	// conditions is an ordered list of provisioning progress entries.
+	// Each entry records one step (success or failure) as it happens, building
+	// a full audit trail rather than overwriting prior state.
 	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	Phase      string             `json:"phase,omitempty"`
-	Message    string             `json:"message,omitempty"`
+	Conditions  []metav1.Condition `json:"conditions,omitempty"`
+	Phase       string             `json:"phase,omitempty"`
+	Message     string             `json:"message,omitempty"`
+	JoinCommand string             `json:"joinCommand,omitempty"`
 }
 
 // +kubebuilder:object:root=true
