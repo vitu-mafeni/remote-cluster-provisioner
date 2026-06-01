@@ -14,8 +14,10 @@ type CloudInitParams struct {
 	VpnIP string
 	// kubeadm join command (without leading "sudo").
 	JoinCommand string
-	// Kubernetes version, e.g. "1.34.2" (no leading "v").
+	// Kubernetes full version, e.g. "1.34.2" (no leading "v"). Used for package pin.
 	KubernetesVersion string
+	// Kubernetes minor version, e.g. "1.34". Used for the apt repo URL.
+	KubernetesMinorVersion string
 	// CRI-O minor version, e.g. "1.34".
 	CRIOVersion string
 	// NodeName to set as hostname (optional).
@@ -41,15 +43,29 @@ func renderBootstrapScript(p CloudInitParams) string {
 	wgConf := strings.ReplaceAll(p.WGConfig, `\`, `\\`)
 
 	return fmt.Sprintf(`#!/bin/bash
-set -uo pipefail
-LOG=/var/log/node-bootstrap.log
-exec > >(tee -a "$LOG") 2>&1
+set -eEuo pipefail
 
+LOG=/var/log/node-bootstrap.log
 STATUS_FILE=/var/lib/node-bootstrap-status
 
-report() { echo "[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] $*"; echo "$*" > "$STATUS_FILE"; }
-trap 'report "FAILED at line $LINENO: $BASH_COMMAND (exit $?)"' ERR
-set -e
+# Write directly to log file from the ERR trap to avoid tee buffering on exit.
+err_trap() {
+  local code=$? line=$1 cmd=$2
+  echo "[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] FAILED at line $line: $cmd (exit $code)" \
+    | tee -a "$LOG" >&2
+  echo "FAILED" > "$STATUS_FILE"
+  sync
+}
+trap 'err_trap "$LINENO" "$BASH_COMMAND"' ERR
+
+exec > >(tee -a "$LOG") 2>&1
+
+report() {
+  local msg="[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] $*"
+  echo "$msg"
+  echo "$*" > "$STATUS_FILE"
+  sync
+}
 
 report "Bootstrap started"
 
@@ -59,42 +75,35 @@ if [ -f /var/lib/node-bootstrap-complete ]; then
   exit 0
 fi
 
-# ── Kill unattended-upgrades before touching apt ─────────────────────────────
-report "Stopping unattended-upgrades"
-systemctl stop unattended-upgrades 2>/dev/null || true
-systemctl disable unattended-upgrades 2>/dev/null || true
-systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+# ── Kill anything holding apt/dpkg locks ────────────────────────────────────
+report "Disabling unattended-upgrades"
+systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+systemctl disable unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+# Give the services a moment to release locks
+sleep 3
+# Force-kill any remaining apt/dpkg processes
+pkill -9 -x unattended-upgrades 2>/dev/null || true
+pkill -9 -f "apt-get" 2>/dev/null || true
+sleep 2
 
-# Wait for any in-progress dpkg/apt lock to be released (up to 5 minutes)
-wait_apt() {
-  local timeout=300 elapsed=0
-  while flock -n /var/lib/dpkg/lock-frontend true 2>/dev/null; do
-    # lock is free — proceed
-    return 0
-  done
-  report "Waiting for apt lock to be released..."
-  while ! flock -n /var/lib/dpkg/lock-frontend true 2>/dev/null; do
-    sleep 5
-    elapsed=$((elapsed + 5))
-    if [ "$elapsed" -ge "$timeout" ]; then
-      report "Killing processes holding apt lock"
-      lsof /var/lib/dpkg/lock-frontend 2>/dev/null | awk 'NR>1 {print $2}' | xargs -r kill -9 || true
-      sleep 2
-      return 0
-    fi
-  done
-}
-wait_apt
+# Repair any interrupted dpkg state from prior runs
+dpkg --configure -a 2>/dev/null || true
+
+# Remove stale lock files (safe on a fresh instance that just booted)
+rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
 
 export DEBIAN_FRONTEND=noninteractive
-APT="apt-get -y -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confnew"
+APT="apt-get -y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confnew"
 
-# ── OS update & base packages ────────────────────────────────────────────────
-report "Installing base packages"
+# ── OS base packages ─────────────────────────────────────────────────────────
+report "Running apt-get update"
 $APT update
-$APT install -y ca-certificates curl gnupg apt-transport-https \
-  wireguard wireguard-tools iputils-ping lsof
+
+report "Installing base packages"
+$APT install -y ca-certificates curl gnupg apt-transport-https lsof
+
+report "Installing WireGuard"
+$APT install -y wireguard wireguard-tools iputils-ping
 
 # ── Kernel modules & sysctl ─────────────────────────────────────────────────
 report "Configuring kernel"
@@ -117,7 +126,7 @@ swapoff -a
 sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
 # ── WireGuard VPN ────────────────────────────────────────────────────────────
-report "Configuring VPN"
+report "Configuring WireGuard VPN"
 mkdir -p /etc/wireguard
 cat > /etc/wireguard/wg0.conf <<'WGEOF'
 %s
@@ -128,11 +137,20 @@ systemctl restart wg-quick@wg0
 
 # Wait for VPN tunnel to come up (up to 60s)
 report "Waiting for WireGuard tunnel"
+vpn_up=false
 for i in $(seq 1 12); do
-  ip addr show wg0 2>/dev/null | grep -q 'inet ' && break || true
+  if ip addr show wg0 2>/dev/null | grep -q 'inet '; then
+    vpn_up=true
+    break
+  fi
   sleep 5
 done
-ip addr show wg0 | grep -q 'inet ' || { report "ERROR: WireGuard tunnel failed to start"; exit 1; }
+if [ "$vpn_up" != "true" ]; then
+  report "ERROR: WireGuard tunnel failed to start"
+  wg show wg0 2>&1 || true
+  ip link show wg0 2>&1 || true
+  exit 1
+fi
 report "VPN tunnel established"
 
 # ── CRI-O ────────────────────────────────────────────────────────────────────
@@ -145,7 +163,6 @@ if ! which crio > /dev/null 2>&1; then
   echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
 https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
     > /etc/apt/sources.list.d/cri-o.list
-  wait_apt
   $APT update
   $APT install -y cri-o
 fi
@@ -162,7 +179,6 @@ curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key \
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
 https://pkgs.k8s.io/core:/stable:/v%s/deb/ /" \
   > /etc/apt/sources.list.d/kubernetes.list
-wait_apt
 $APT update
 $APT install -y \
   kubelet=%s-* kubeadm=%s-* kubectl=%s-* \
@@ -194,7 +210,7 @@ done
 touch /var/lib/node-bootstrap-complete
 report "Bootstrap complete"
 `, wgConf, p.CRIOVersion, p.CRIOVersion,
-		p.KubernetesVersion, p.KubernetesVersion,
+		p.KubernetesMinorVersion, p.KubernetesMinorVersion,
 		p.KubernetesVersion, p.KubernetesVersion, p.KubernetesVersion,
 		p.VpnIP,
 		p.JoinCommand,
