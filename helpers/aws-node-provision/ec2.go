@@ -183,13 +183,14 @@ func ProvisionEC2Node(
 	}
 
 	userDataB64 := BuildUserData(CloudInitParams{
-		WGConfig:          wgConfig,
-		VpnIP:             vpnIP,
-		JoinCommand:       netNodeConfig.Status.ClusterJoinCommand,
-		KubernetesVersion: clean,
-		CRIOVersion:       crioVersion,
-		NodeName:          name,
-		Labels:            labels,
+		WGConfig:               wgConfig,
+		VpnIP:                  vpnIP,
+		JoinCommand:            netNodeConfig.Status.ClusterJoinCommand,
+		KubernetesVersion:      clean,
+		KubernetesMinorVersion: crioVersion,
+		CRIOVersion:            crioVersion,
+		NodeName:               name,
+		Labels:                 labels,
 	})
 
 	// ── Create EC2 instance ────────────────────────────────────────────────
