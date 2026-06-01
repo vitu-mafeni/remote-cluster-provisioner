@@ -35,6 +35,7 @@ import (
 	remotenodeprovision "dcn.ssu.ac.kr/infra/helpers/remote-node-provision"
 	"dcn.ssu.ac.kr/infra/helpers/ssh"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // NodeProvisionReconciler reconciles a NodeProvision object
@@ -60,7 +61,7 @@ const (
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisionnetconfigs,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisionnetconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch;update;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 
 func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -171,13 +172,38 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	log := logf.FromContext(ctx)
 	name := np.Name
 
-	// ── Resolve network config when awsConfig is absent or incomplete ───────
-	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseValidating, "Validating AWS configuration", 5)
-	if sErr := r.Status().Update(ctx, np); sErr != nil {
-		log.Error(sErr, "updating status")
+	// ── Idempotency guard ────────────────────────────────────────────────────
+	// If an EC2 instance was already created (InstanceID persisted in status)
+	// skip creation entirely and move straight to WaitingForInstance.
+	// This prevents a duplicate launch when a prior reconcile created the
+	// instance but failed to persist the status update.
+	if np.Status.InstanceID != "" {
+		log.Info("EC2 instance already exists, skipping creation", "instanceId", np.Status.InstanceID)
+		if np.Status.Phase != mlv1alpha1.NodeProvisionPhaseWaitingForInstance {
+			now := metav1.Now()
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseWaitingForInstance
+			np.Status.LastUpdated = &now
+			if err := r.Status().Update(ctx, np); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
-	if err := r.resolveAWSDefaults(ctx, np, secret); err != nil {
+
+	// ── Resolve defaults (instanceType, AMI, network) ────────────────────────
+	// resolveAWSDefaults patches the spec when fields are missing.  After a
+	// patch the object's ResourceVersion changes; returning here lets the
+	// watch event trigger a fresh reconcile with the up-to-date object so that
+	// all subsequent status updates use the correct ResourceVersion.
+	patched, err := r.resolveAWSDefaults(ctx, np, secret)
+	if err != nil {
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving AWS defaults: %v", err))
+	}
+	if patched {
+		// A fresh reconcile will be queued by the spec-change watch event.
+		// Return without error so the work queue uses its normal interval
+		// instead of exponential backoff.
+		return ctrl.Result{}, nil
 	}
 
 	// ── Validate ────────────────────────────────────────────────────────────
@@ -185,6 +211,15 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("AWS validation failed: %v", err))
 	}
 	log.Info("AWS validation successful")
+
+	// ── Set Validating status (non-critical; ignore conflict on the first run) ─
+	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseValidating, "Validating AWS configuration", 5)
+	if sErr := r.Status().Update(ctx, np); sErr != nil {
+		// Re-fetch so subsequent updates use the current ResourceVersion.
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// ── Fetch NodeProvisionNetConfig ────────────────────────────────────────
 	netConfig, err := r.requireNetConfig(ctx, np)
@@ -195,7 +230,9 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	// ── Connect to VPN server ───────────────────────────────────────────────
 	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseConfiguringVPN, "Configuring VPN client", 15)
 	if sErr := r.Status().Update(ctx, np); sErr != nil {
-		log.Error(sErr, "updating status")
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	vpnServerClient, err := r.getVPNServerSSHClient(ctx, netConfig)
@@ -207,7 +244,9 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	// ── Launch EC2 instance with cloud-init ─────────────────────────────────
 	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseCreatingInstance, "Creating EC2 instance", 25)
 	if sErr := r.Status().Update(ctx, np); sErr != nil {
-		log.Error(sErr, "updating status")
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	log.Info("Creating EC2 instance")
 
@@ -215,29 +254,36 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	if err != nil {
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("EC2 provisioning failed: %v", err))
 	}
-
 	log.Info("EC2 instance created", "instanceId", result.InstanceID)
 
-	// Persist VPN IP and peer in NetConfig status before updating NodeProvision,
-	// so a crash between the two updates doesn't lose the peer registration.
+	// Persist VPN peer in NetConfig before writing InstanceID into NodeProvision
+	// status.  If the NodeProvision update fails we can still recover the VPN
+	// allocation on the next reconcile via the NetConfig peer list.
 	if err := r.updateNetConfigStatus(ctx, netConfig, result.VpnIP, result.PublicKey, name); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
 	}
 
-	// Transition to WaitingForInstance.
+	// Re-fetch to ensure we have the latest ResourceVersion before writing
+	// the critical InstanceID field.  This is necessary because the
+	// setPhaseStatus+Update calls above may have been skipped (conflict) and
+	// we fell back to r.Get, which updated np in place.
+	if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-fetching NodeProvision before status update: %w", err)
+	}
+
 	now := metav1.Now()
 	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseWaitingForInstance
 	np.Status.Message = "Waiting for instance to become running"
 	np.Status.InstanceID = result.InstanceID
 	np.Status.VpnIP = result.VpnIP
-	np.Status.IPAddress = result.VpnIP // kept for backward-compat with reconcileJoining
+	np.Status.IPAddress = result.VpnIP
 	np.Status.Progress = 30
 	np.Status.LastUpdated = &now
 	if np.Status.StartTime == nil {
 		np.Status.StartTime = &now
 	}
 	if err := r.Status().Update(ctx, np); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating NodeProvision status: %w", err)
+		return ctrl.Result{}, fmt.Errorf("updating NodeProvision status with InstanceID: %w", err)
 	}
 	log.Info("EC2 instance created, waiting for it to become running", "instanceId", result.InstanceID)
 	return ctrl.Result{RequeueAfter: requeueShort}, nil
@@ -251,11 +297,77 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 //
 // All resolved values are written back via a Patch so they are persisted in the
 // CRD and visible to operators.  Fields already set by the user are never overwritten.
+// resolveAWSKeyPair ensures an EC2 key pair exists for this node and that the
+// private key is stored in a Kubernetes Secret named "<npName>-ssh-key".
+//
+// If the Secret already exists the stored private key is used to (re-)import
+// the public half into EC2, making the function idempotent.
+// If the Secret does not exist a fresh RSA key is generated, the private key
+// is written to a new Secret, and the public key is imported into EC2.
+//
+// Returns the EC2 key pair name so the caller can set it in spec.awsConfig.
+func (r *NodeProvisionReconciler) resolveAWSKeyPair(
+	ctx context.Context,
+	np *mlv1alpha1.NodeProvision,
+	creds awsprovision.AWSCredentials,
+) (keyPairName string, err error) {
+	log := logf.FromContext(ctx)
+
+	secretName := np.Name + "-ssh-key"
+	secretKey := types.NamespacedName{Name: secretName, Namespace: np.Namespace}
+
+	// Check whether the SSH-key Secret already exists.
+	existing := &corev1.Secret{}
+	var existingPrivKey string
+	if err := r.Get(ctx, secretKey, existing); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("looking up SSH key secret %q: %w", secretName, err)
+		}
+		// Secret does not exist — will be created below.
+	} else {
+		existingPrivKey = strings.TrimSpace(string(existing.Data["ssh-privatekey"]))
+	}
+
+	result, err := awsprovision.ResolveOrCreateKeyPair(ctx, np.Spec.Region, creds, np.Name, existingPrivKey)
+	if err != nil {
+		return "", err
+	}
+
+	// Persist the private key in a Secret when a new key was generated.
+	if result.PrivateKeyPEM != "" {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: np.Namespace,
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "node-provision-controller",
+					"ml.dcn.ssu.ac.kr/node":        np.Name,
+				},
+			},
+			Type: corev1.SecretTypeSSHAuth,
+			Data: map[string][]byte{
+				"ssh-privatekey": []byte(result.PrivateKeyPEM),
+			},
+		}
+		if err := r.Create(ctx, secret); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return "", fmt.Errorf("creating SSH key secret %q: %w", secretName, err)
+			}
+		}
+		log.Info("SSH key secret created", "secret", secretName)
+	}
+
+	log.Info("EC2 key pair ready", "keyPairName", result.KeyPairName, "secret", result.SecretName)
+	return result.KeyPairName, nil
+}
+
+// resolveAWSDefaults returns (true, nil) when it patched the spec so the caller
+// can return immediately and let the watch event trigger a fresh reconcile.
 func (r *NodeProvisionReconciler) resolveAWSDefaults(
 	ctx context.Context,
 	np *mlv1alpha1.NodeProvision,
 	secret *corev1.Secret,
-) error {
+) (patched bool, err error) {
 	log := logf.FromContext(ctx)
 
 	needsNetwork := np.Spec.AWSConfig == nil ||
@@ -263,9 +375,10 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		len(np.Spec.AWSConfig.SecurityGroupIDs) == 0
 	needsAMI := np.Spec.AWSConfig == nil || np.Spec.AWSConfig.AMI == ""
 	needsInstanceType := np.Spec.InstanceType == ""
+	needsKeyPair := np.Spec.AWSConfig == nil || np.Spec.AWSConfig.KeyPairName == ""
 
-	if !needsNetwork && !needsAMI && !needsInstanceType {
-		return nil // nothing to resolve
+	if !needsNetwork && !needsAMI && !needsInstanceType && !needsKeyPair {
+		return false, nil // nothing to resolve
 	}
 
 	creds := awsprovision.ResolveAWSCredentials(secret)
@@ -278,7 +391,7 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 	if needsInstanceType {
 		it := awsprovision.DefaultInstanceTypeForLabel(np.Spec.NodeLabel)
 		if it == "" {
-			return fmt.Errorf("spec.instanceType is required: no default instance type defined for nodeLabel %q", np.Spec.NodeLabel)
+			return false, fmt.Errorf("spec.instanceType is required: no default instance type defined for nodeLabel %q", np.Spec.NodeLabel)
 		}
 		np.Spec.InstanceType = it
 		log.Info("Resolved instance type from nodeLabel", "nodeLabel", np.Spec.NodeLabel, "instanceType", it)
@@ -289,7 +402,7 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		log.Info("Resolving latest Ubuntu 22.04 AMI", "region", np.Spec.Region)
 		amiID, err := awsprovision.ResolveUbuntu22AMI(ctx, np.Spec.Region, creds)
 		if err != nil {
-			return fmt.Errorf("resolving Ubuntu 22.04 AMI: %w", err)
+			return false, fmt.Errorf("resolving Ubuntu 22.04 AMI: %w", err)
 		}
 		np.Spec.AWSConfig.AMI = amiID
 		log.Info("Resolved AMI", "ami", amiID)
@@ -300,7 +413,7 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		log.Info("Resolving default network config", "region", np.Spec.Region)
 		netCfg, err := awsprovision.ResolveOrCreateNetworkConfig(ctx, np.Spec.Region, creds)
 		if err != nil {
-			return fmt.Errorf("resolving AWS network config: %w", err)
+			return false, fmt.Errorf("resolving AWS network config: %w", err)
 		}
 		if np.Spec.AWSConfig.VPCID == "" {
 			np.Spec.AWSConfig.VPCID = netCfg.VPCID
@@ -318,11 +431,21 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		)
 	}
 
+	// ── Key pair: generate or reuse ─────────────────────────────────────────
+	if needsKeyPair {
+		kpName, err := r.resolveAWSKeyPair(ctx, np, creds)
+		if err != nil {
+			return false, fmt.Errorf("resolving EC2 key pair: %w", err)
+		}
+		np.Spec.AWSConfig.KeyPairName = kpName
+		log.Info("Resolved EC2 key pair", "keyPairName", kpName)
+	}
+
 	if err := r.Patch(ctx, np, client.MergeFrom(base)); err != nil {
-		return fmt.Errorf("patching NodeProvision spec with resolved defaults: %w", err)
+		return false, fmt.Errorf("patching NodeProvision spec with resolved defaults: %w", err)
 	}
 	log.Info("Patched NodeProvision spec with resolved AWS defaults")
-	return nil
+	return true, nil
 }
 
 // reconcileWaitingForInstance polls EC2 until the instance is running, then
