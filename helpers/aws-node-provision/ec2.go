@@ -8,6 +8,10 @@ package awsnodeprovision
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"sort"
@@ -19,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"golang.org/x/crypto/ssh"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
 	remotenodeprovision "dcn.ssu.ac.kr/infra/helpers/remote-node-provision"
@@ -411,6 +416,147 @@ func resolveDefaultSecurityGroup(ctx context.Context, client *ec2.Client, vpcID 
 		return "", fmt.Errorf("no default security group found in VPC %s", vpcID)
 	}
 	return aws.ToString(out.SecurityGroups[0].GroupId), nil
+}
+
+// KeyPairResult is returned by ResolveOrCreateKeyPair.
+type KeyPairResult struct {
+	// KeyPairName is the EC2 key pair name, ready to pass to RunInstances.
+	KeyPairName string
+	// PrivateKeyPEM is the PKCS#1 PEM-encoded RSA private key.
+	// Non-empty only when a new key pair was generated in this call;
+	// empty when an existing key pair was reused.
+	PrivateKeyPEM string
+	// SecretName is the Kubernetes Secret that stores the private key.
+	SecretName string
+}
+
+// ResolveOrCreateKeyPair ensures an EC2 key pair exists for the node and that
+// the corresponding private key is available.  The strategy:
+//
+//  1. If a K8s Secret named "<npName>-ssh-key" already exists and contains a
+//     private key, derive the public key from it and import (or re-import) the
+//     key pair into EC2 under the name "nodeprovision-<npName>".
+//  2. Otherwise generate a fresh 4096-bit RSA key pair, return the private key
+//     PEM so the caller can store it in a Secret, and import the public half
+//     into EC2.
+//
+// The function is idempotent: calling it multiple times for the same node
+// results in the same key pair name and the same Secret.
+func ResolveOrCreateKeyPair(
+	ctx context.Context,
+	region string,
+	creds AWSCredentials,
+	npName string,
+	existingPrivKeyPEM string, // non-empty if Secret already exists
+) (*KeyPairResult, error) {
+
+	ec2Client, err := newEC2Client(ctx, region, creds)
+	if err != nil {
+		return nil, fmt.Errorf("creating EC2 client: %w", err)
+	}
+
+	keyPairName := "nodeprovision-" + npName
+	secretName := npName + "-ssh-key"
+
+	var privKeyPEM string
+	var pubKeyBytes []byte // OpenSSH authorized-keys format
+
+	if existingPrivKeyPEM != "" {
+		// Derive public key from the stored private key.
+		pub, err := publicKeyFromPEM(existingPrivKeyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("parsing existing private key from secret %q: %w", secretName, err)
+		}
+		pubKeyBytes = pub
+		privKeyPEM = "" // already stored; don't overwrite
+	} else {
+		// Generate a new RSA key pair.
+		priv, pub, err := generateRSAKeyPair()
+		if err != nil {
+			return nil, fmt.Errorf("generating RSA key pair: %w", err)
+		}
+		privKeyPEM = priv
+		pubKeyBytes = pub
+	}
+
+	// Import (upsert) the public key into EC2.  If the key pair already exists
+	// with the same public material this is a no-op; if the material changed
+	// (e.g. key was regenerated) the old pair is deleted first.
+	if err := importKeyPair(ctx, ec2Client, keyPairName, pubKeyBytes); err != nil {
+		return nil, err
+	}
+
+	log.Printf("[INFO] Key pair resolution: key pair %q ready in %s (secret=%s)", keyPairName, region, secretName)
+	return &KeyPairResult{
+		KeyPairName:   keyPairName,
+		PrivateKeyPEM: privKeyPEM,
+		SecretName:    secretName,
+	}, nil
+}
+
+// importKeyPair imports the public key into EC2 under keyPairName.
+// If a key pair with that name already exists it is first deleted so the
+// import is always up to date with the stored private key.
+func importKeyPair(ctx context.Context, client *ec2.Client, keyPairName string, publicKeyMaterial []byte) error {
+	// Check whether the key pair already exists.
+	existing, err := client.DescribeKeyPairs(ctx, &ec2.DescribeKeyPairsInput{
+		KeyNames: []string{keyPairName},
+	})
+	if err != nil && !strings.Contains(err.Error(), "InvalidKeyPair.NotFound") {
+		return fmt.Errorf("describing key pair %q: %w", keyPairName, err)
+	}
+	if existing != nil && len(existing.KeyPairs) > 0 {
+		// Key pair exists — nothing to do; the public material is already there.
+		return nil
+	}
+
+	_, err = client.ImportKeyPair(ctx, &ec2.ImportKeyPairInput{
+		KeyName:           aws.String(keyPairName),
+		PublicKeyMaterial: publicKeyMaterial,
+	})
+	if err != nil {
+		return fmt.Errorf("importing key pair %q: %w", keyPairName, err)
+	}
+	return nil
+}
+
+// generateRSAKeyPair creates a 4096-bit RSA key and returns
+// (PKCS#1-PEM private key, OpenSSH-format public key bytes).
+func generateRSAKeyPair() (privPEM string, pubAuthorizedKey []byte, err error) {
+	privKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return "", nil, fmt.Errorf("generating RSA key: %w", err)
+	}
+
+	privBytes := x509.MarshalPKCS1PrivateKey(privKey)
+	privPEM = string(pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: privBytes,
+	}))
+
+	pubKey, err := ssh.NewPublicKey(&privKey.PublicKey)
+	if err != nil {
+		return "", nil, fmt.Errorf("deriving SSH public key: %w", err)
+	}
+	return privPEM, ssh.MarshalAuthorizedKey(pubKey), nil
+}
+
+// publicKeyFromPEM derives the OpenSSH authorized-keys public key from a
+// PKCS#1 PEM-encoded RSA private key.
+func publicKeyFromPEM(privPEM string) ([]byte, error) {
+	block, _ := pem.Decode([]byte(privPEM))
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM block")
+	}
+	privKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parsing PKCS1 private key: %w", err)
+	}
+	pubKey, err := ssh.NewPublicKey(&privKey.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("deriving SSH public key: %w", err)
+	}
+	return ssh.MarshalAuthorizedKey(pubKey), nil
 }
 
 // ResolveUbuntu22AMI finds the latest Ubuntu 22.04 LTS HVM x86_64 AMI published
