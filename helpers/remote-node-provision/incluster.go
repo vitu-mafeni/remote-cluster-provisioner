@@ -269,6 +269,11 @@ fi`, repoVersion, repoVersion),
 // running config the wg set command still succeeds (it is an upsert).
 // The peer block is also appended to /etc/wireguard/wg0.conf for persistence
 // across reboots, but only if it is not already present.
+// RegisterVPNPeer is the exported form used by cloud-provider provisioners.
+func RegisterVPNPeer(vpnServerClient *sshhelper.Client, publicKey, vpnNodeIP string) error {
+	return registerVPNPeer(vpnServerClient, publicKey, vpnNodeIP)
+}
+
 func registerVPNPeer(vpnServerClient *sshhelper.Client, publicKey, vpnNodeIP string) error {
 	// Update running WireGuard config (idempotent upsert).
 	addCmd := fmt.Sprintf(
@@ -306,6 +311,9 @@ func verifyVPNConnectivity(vpnServerClient *sshhelper.Client, vpnNodeIP string) 
 	}
 }
 
+// GenerateWireGuardKeyPair is the exported form used by cloud-provider provisioners.
+func GenerateWireGuardKeyPair() (string, string, error) { return generateWireGuardKeyPair() }
+
 func generateWireGuardKeyPair() (string, string, error) {
 
 	privateCmd := exec.Command("wg", "genkey")
@@ -335,6 +343,11 @@ func generateWireGuardKeyPair() (string, string, error) {
 	publicKey := strings.TrimSpace(publicOut.String())
 
 	return privateKey, publicKey, nil
+}
+
+// BuildClientWGConfig is the exported form used by cloud-provider provisioners.
+func BuildClientWGConfig(vpnServerClient *sshhelper.Client, vpnNodeIP, vpnRange, serverPublicIP string, vpnPort int, privateKey string) (string, error) {
+	return buildClientWGConfig(vpnServerClient, vpnNodeIP, vpnRange, serverPublicIP, vpnPort, privateKey)
 }
 
 // buildClientWGConfig fetches the VPN server's WireGuard public key and actual
@@ -382,6 +395,11 @@ PersistentKeepalive = 25
 `, privateKey, vpnNodeIP, serverPublicKey, serverPublicIP, vpnPort, vpnRange)
 
 	return cfg, nil
+}
+
+// GetNextAvailableIP is the exported form used by cloud-provider provisioners.
+func GetNextAvailableIP(vpnRange string, usedIPs []string) (string, error) {
+	return getNextAvailableIP(vpnRange, usedIPs)
 }
 
 // getNextAvailableIP returns the next IP in vpnRange that is not in usedIPs.
