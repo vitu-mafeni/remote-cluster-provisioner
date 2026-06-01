@@ -202,3 +202,9 @@ cat /var/log/openvpn-static-ip.log
 ```
 
 
+#### Get AWS user keypair
+```bash
+kubectl get secret aws-node-001-ssh-key -o jsonpath='{.data.ssh-privatekey}' | base64 -d > aws-node-001.pem
+chmod 600 aws-node-001.pem
+ssh -i aws-node-001.pem ubuntu@<public-ip>
+```
