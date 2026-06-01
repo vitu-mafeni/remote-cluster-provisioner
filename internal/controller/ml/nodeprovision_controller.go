@@ -92,8 +92,6 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	switch np.Status.Phase {
 	case "", mlv1alpha1.NodeProvisionPhasePending,
 		mlv1alpha1.NodeProvisionPhaseValidating,
-		mlv1alpha1.NodeProvisionPhaseCreatingInstance,
-		mlv1alpha1.NodeProvisionPhaseConfiguringVPN,
 		mlv1alpha1.NodeProvisionPhaseProvisioning:
 
 		log.Info("Request received, starting provisioning")
@@ -102,6 +100,28 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, fmt.Errorf("getting credentials secret: %w", err)
 		}
 		return r.reconcileProvisioning(ctx, np, secret)
+
+	case mlv1alpha1.NodeProvisionPhaseCreatingInstance,
+		mlv1alpha1.NodeProvisionPhaseConfiguringVPN:
+		// These phases are written as progress markers while a reconcile is
+		// actively creating the instance. A watch event on that write can
+		// trigger a new reconcile before the creating reconcile has persisted
+		// the InstanceID, causing the informer cache to return stale state.
+		//
+		// Never re-enter provisioning from these phases. If InstanceID has
+		// landed (cache caught up), advance to WaitingForInstance. Otherwise
+		// requeue briefly so the in-flight reconcile (or a controller restart
+		// recovery) can complete.
+		if np.Status.InstanceID != "" {
+			log.Info("InstanceID found, advancing to WaitingForInstance", "instanceId", np.Status.InstanceID)
+			now := metav1.Now()
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseWaitingForInstance
+			np.Status.LastUpdated = &now
+			_ = r.Status().Update(ctx, np)
+			return ctrl.Result{RequeueAfter: requeueShort}, nil
+		}
+		log.Info("Instance creation in progress, requeueing")
+		return ctrl.Result{RequeueAfter: requeueShort}, nil
 
 	case mlv1alpha1.NodeProvisionPhaseWaitingForInstance:
 		secret, err := r.getSecret(ctx, np)
