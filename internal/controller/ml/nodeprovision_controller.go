@@ -397,6 +397,11 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		log.Info("Resolved instance type from nodeLabel", "nodeLabel", np.Spec.NodeLabel, "instanceType", it)
 	}
 
+	// ── Validate instance type is available in the region ────────────────────
+	if err := awsprovision.ValidateInstanceTypeAvailability(ctx, np.Spec.Region, np.Spec.InstanceType, creds); err != nil {
+		return false, err
+	}
+
 	// ── AMI: latest Ubuntu 22.04 for the region ───────────────────────────────
 	if needsAMI {
 		log.Info("Resolving latest Ubuntu 22.04 AMI", "region", np.Spec.Region)
@@ -482,7 +487,7 @@ func (r *NodeProvisionReconciler) reconcileWaitingForInstance(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// On-Prem provisioning (unchanged logic, extracted for clarity)
+// On-Prem provisioning
 // ────────────────────────────────────────────────────────────────────────────
 
 func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
@@ -492,9 +497,33 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// ── Idempotency guard ────────────────────────────────────────────────────
+	// If VpnIP is already allocated the VPN peer was registered in a prior
+	// reconcile. Skip straight to Joining so we don't re-run provisioning.
+	if np.Status.VpnIP != "" {
+		log.Info("On-prem node already provisioned, advancing to Joining", "vpnIP", np.Status.VpnIP)
+		if np.Status.Phase != mlv1alpha1.NodeProvisionPhaseJoining &&
+			np.Status.Phase != mlv1alpha1.NodeProvisionPhaseBootstrapping &&
+			np.Status.Phase != mlv1alpha1.NodeProvisionPhaseRegisteringNode {
+			now := metav1.Now()
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseJoining
+			np.Status.LastUpdated = &now
+			_ = r.Status().Update(ctx, np)
+		}
+		return r.reconcileJoining(ctx, np)
+	}
+
+	// ── Phase: Validating ────────────────────────────────────────────────────
+	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseValidating, "Validating SSH connectivity", 5)
+	if err := r.Status().Update(ctx, np); err != nil {
+		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
+			return ctrl.Result{}, ferr
+		}
+	}
+
 	sshClient, err := r.getSSHClient(ctx, np)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("getting SSH client for node: %w", err)
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("SSH connectivity check failed: %v", err))
 	}
 	defer sshClient.Conn.Close()
 
@@ -503,12 +532,29 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 		log.Info("No NodeProvisionNetConfig ready yet; requeueing")
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
+	log.Info("Validation successful")
+
+	// ── Phase: Configuring VPN ───────────────────────────────────────────────
+	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseConfiguringVPN, "Configuring WireGuard VPN", 15)
+	if err := r.Status().Update(ctx, np); err != nil {
+		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
+			return ctrl.Result{}, ferr
+		}
+	}
 
 	vpnServerClient, err := r.getVPNServerSSHClient(ctx, netConfig)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("connecting to VPN server: %w", err)
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("connecting to VPN server: %v", err))
 	}
 	defer vpnServerClient.Conn.Close()
+
+	// ── Phase: Bootstrapping ─────────────────────────────────────────────────
+	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseBootstrapping, "Installing packages and joining cluster", 25)
+	if err := r.Status().Update(ctx, np); err != nil {
+		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
+			return ctrl.Result{}, ferr
+		}
+	}
 
 	vpnNodeIP, publicKey, err := remotenodeprovision.NewInClusterProvisioner(
 		ctx,
@@ -519,26 +565,31 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 		netConfig,
 	)
 	if err != nil {
-		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseFailed
-		np.Status.Message = err.Error()
-		_ = r.Status().Update(ctx, np)
-		return ctrl.Result{}, fmt.Errorf("provisioning on-prem node: %w", err)
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("on-prem provisioning failed: %v", err))
 	}
+	log.Info("On-prem node bootstrapped", "vpnIP", vpnNodeIP)
 
 	if err := r.updateNetConfigStatus(ctx, netConfig, vpnNodeIP, publicKey, np.Name); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
 	}
 
+	// Re-fetch before writing VpnIP so ResourceVersion is current.
+	if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	now := metav1.Now()
 	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseJoining
+	np.Status.Message = "Node bootstrapped; waiting for cluster registration"
 	np.Status.IPAddress = vpnNodeIP
 	np.Status.VpnIP = vpnNodeIP
+	np.Status.Progress = 60
 	np.Status.LastUpdated = &now
 	if err := r.Status().Update(ctx, np); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating NodeProvision status: %w", err)
 	}
 	log.Info("On-prem node provisioned, waiting for cluster join", "vpnIP", vpnNodeIP)
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueJoining}, nil
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -638,16 +689,21 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 		log.Error(err, "cleaning up VPN peer (continuing)")
 	}
 
-	// ── Terminate EC2 instance ──────────────────────────────────────────────
-	if np.Spec.Provider == mlv1alpha1.CloudProviderAWS && np.Status.InstanceID != "" {
-		secret, err := r.getSecret(ctx, np)
-		if err != nil {
-			log.Error(err, "getting credentials for EC2 termination (continuing)")
-		} else {
-			if err := awsprovision.TerminateInstance(ctx, np, secret, np.Status.InstanceID); err != nil {
+	// ── Provider-specific cleanup ────────────────────────────────────────────
+	switch np.Spec.Provider {
+	case mlv1alpha1.CloudProviderAWS:
+		if np.Status.InstanceID != "" {
+			secret, err := r.getSecret(ctx, np)
+			if err != nil {
+				log.Error(err, "getting credentials for EC2 termination (continuing)")
+			} else if err := awsprovision.TerminateInstance(ctx, np, secret, np.Status.InstanceID); err != nil {
 				log.Error(err, "terminating EC2 instance", "instanceId", np.Status.InstanceID)
+			} else {
+				log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
 			}
 		}
+	case mlv1alpha1.CloudProviderOnPrem:
+		r.cleanupOnPremNode(ctx, np)
 	}
 
 	controllerutil.RemoveFinalizer(np, nodeProvisionFinalizer)
@@ -723,6 +779,34 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 		log.Info("Removed VPN peer", "publicKey", peerPublicKey, "vpnIP", vpnIP)
 	}
 	return nil
+}
+
+// cleanupOnPremNode SSHes into the physical node (best-effort) and reverses
+// the provisioning: resets kubeadm, stops WireGuard, and removes its config.
+// Failures are logged but never block the finalizer removal.
+func (r *NodeProvisionReconciler) cleanupOnPremNode(ctx context.Context, np *mlv1alpha1.NodeProvision) {
+	log := logf.FromContext(ctx)
+
+	sshClient, err := r.getSSHClient(ctx, np)
+	if err != nil {
+		log.Error(err, "SSH to on-prem node failed during cleanup (continuing)")
+		return
+	}
+	defer sshClient.Conn.Close()
+
+	cmds := []string{
+		"sudo kubeadm reset -f 2>/dev/null || true",
+		"sudo systemctl stop wg-quick@wg0 2>/dev/null || true",
+		"sudo systemctl disable wg-quick@wg0 2>/dev/null || true",
+		"sudo rm -f /etc/wireguard/wg0.conf",
+		"sudo apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true",
+	}
+	for _, cmd := range cmds {
+		if _, err := ssh.Run(sshClient, cmd); err != nil {
+			log.Error(err, "cleanup command failed on on-prem node (continuing)", "cmd", cmd)
+		}
+	}
+	log.Info("On-prem node reset complete")
 }
 
 // ────────────────────────────────────────────────────────────────────────────

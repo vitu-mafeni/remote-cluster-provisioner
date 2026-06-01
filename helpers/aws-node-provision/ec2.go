@@ -608,6 +608,30 @@ func DefaultInstanceTypeForLabel(nodeLabel string) string {
 	return nodeLabelInstanceTypes[strings.ToLower(nodeLabel)]
 }
 
+// ValidateInstanceTypeAvailability returns an error if the given instance type
+// is not offered in any AZ of the region.  Call this before attempting to launch
+// so the NodeProvision phase shows a clear message rather than an AWS error.
+func ValidateInstanceTypeAvailability(ctx context.Context, region, instanceType string, creds AWSCredentials) error {
+	client, err := newEC2Client(ctx, region, creds)
+	if err != nil {
+		return fmt.Errorf("creating EC2 client: %w", err)
+	}
+	out, err := client.DescribeInstanceTypeOfferings(ctx, &ec2.DescribeInstanceTypeOfferingsInput{
+		LocationType: types.LocationTypeRegion,
+		Filters: []types.Filter{
+			{Name: aws.String("instance-type"), Values: []string{instanceType}},
+			{Name: aws.String("location"), Values: []string{region}},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("describing instance type offerings: %w", err)
+	}
+	if len(out.InstanceTypeOfferings) == 0 {
+		return fmt.Errorf("instance type %s is not available in region %s", instanceType, region)
+	}
+	return nil
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // helpers
 // ────────────────────────────────────────────────────────────────────────────
