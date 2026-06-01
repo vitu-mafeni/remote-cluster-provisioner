@@ -24,7 +24,7 @@ spec:
   role: worker
   nodeLabel: cpu          # "cpu" → t3.xlarge  |  "gpu" → p3.2xlarge
   region: ap-northeast-2  # AMI + network resolved per-region automatically
-  instanceType: p3.2xlarge # If spec.instanceType is set, resolveAWSDefaults skips the DefaultInstanceTypeForLabel lookup and uses your value directly.
+  # instanceType: p3.2xlarge # If spec.instanceType is set, resolveAWSDefaults skips the DefaultInstanceTypeForLabel lookup and uses your value directly.
   credentialsRef:
     name: aws-node-credentials
     namespace: default
