@@ -3,6 +3,8 @@
 # It should be run by config/default
 resources:
 - bases/infra.dcn.ssu.ac.kr_remoteclusters.yaml
+- bases/ml.dcn.ssu.ac.kr_nodeprovisions.yaml
+- bases/ml.dcn.ssu.ac.kr_nodeprovisionnetconfigs.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

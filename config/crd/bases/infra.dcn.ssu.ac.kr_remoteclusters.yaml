@@ -42,6 +42,8 @@ spec:
               auth:
                 properties:
                   passwordSecretRef:
+                    description: PasswordSecretRef holds the secret reference for
+                      password-based SSH authentication.
                     properties:
                       key:
                         type: string
@@ -51,8 +53,19 @@ spec:
                     - key
                     - name
                     type: object
-                required:
-                - passwordSecretRef
+                  sshPrivateKeySecretRef:
+                    description: |-
+                      SSHPrivateKeySecretRef holds the secret reference for private-key based SSH authentication.
+                      The secret value should be the raw private key data.
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
                 type: object
               clusterName:
                 description: foo is an example field of RemoteCluster. Edit remotecluster_types.go
@@ -88,10 +101,45 @@ spec:
                 required:
                 - version
                 type: object
+              nodeInfo:
+                properties:
+                  hardwareType:
+                    type: string
+                  nodeType:
+                    type: string
+                  softwareConfig:
+                    properties:
+                      k8sDevicePluginVersion:
+                        type: string
+                      nvidiaContainerToolkitVersion:
+                        type: string
+                      nvidiaDriverVersion:
+                        type: string
+                    type: object
+                required:
+                - hardwareType
+                - nodeType
+                type: object
               port:
                 type: integer
               user:
                 type: string
+              vpnConfig:
+                properties:
+                  ip:
+                    type: string
+                  vpnServerPublicIP:
+                    type: string
+                  vpnSshCredentialsRef:
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    type: object
+                type: object
             required:
             - auth
             - host
@@ -104,15 +152,9 @@ spec:
             properties:
               conditions:
                 description: |-
-                  conditions represent the current state of the RemoteCluster resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                  conditions is an ordered list of provisioning progress entries.
+                  Each entry records one step (success or failure) as it happens, building
+                  a full audit trail rather than overwriting prior state.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -168,9 +210,8 @@ spec:
                   - type
                   type: object
                 type: array
-                x-kubernetes-list-map-keys:
-                - type
-                x-kubernetes-list-type: map
+              joinCommand:
+                type: string
               message:
                 type: string
               phase:

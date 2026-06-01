@@ -22,6 +22,12 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the remote-cluster-provisioner itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- ml_nodeprovisionnetconfig_admin_role.yaml
+- ml_nodeprovisionnetconfig_editor_role.yaml
+- ml_nodeprovisionnetconfig_viewer_role.yaml
+- ml_nodeprovision_admin_role.yaml
+- ml_nodeprovision_editor_role.yaml
+- ml_nodeprovision_viewer_role.yaml
 - remotecluster_admin_role.yaml
 - remotecluster_editor_role.yaml
 - remotecluster_viewer_role.yaml

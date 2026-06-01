@@ -1,4 +1,6 @@
 ## Append samples of your project ##
 resources:
 - infra_v1_remotecluster.yaml
+- ml_v1alpha1_nodeprovision.yaml
+- ml_v1alpha1_nodeprovisionnetconfig.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples
