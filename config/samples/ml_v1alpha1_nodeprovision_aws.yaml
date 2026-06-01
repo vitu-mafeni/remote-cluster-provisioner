@@ -1,0 +1,40 @@
+---
+# AWS credentials secret — use awsAccessKeyId/awsSecretAccessKey for static creds,
+# or omit both and rely on an IAM instance profile on the controller pod.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-node-credentials
+  namespace: default
+type: Opaque
+stringData:
+  # Optional: omit these keys to use the controller's IAM role instead.
+  awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE"
+  awsSecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+---
+# Minimal spec: only region + nodeLabel are required.
+# The controller resolves instanceType, AMI, VPC, subnet, and security group automatically.
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: aws-node-001
+  namespace: default
+spec:
+  provider: AWS
+  role: worker
+  nodeLabel: cpu          # "cpu" → t3.xlarge  |  "gpu" → p3.2xlarge
+  region: ap-northeast-2  # AMI + network resolved per-region automatically
+  credentialsRef:
+    name: aws-node-credentials
+    namespace: default
+  # awsConfig is optional — all fields below are auto-populated when absent.
+  # Uncomment to override any individual value:
+  # awsConfig:
+  #   ami: ami-0c9c942bd7bf113a2
+  #   subnetId: subnet-0123456789abcdef0
+  #   securityGroupIds:
+  #     - sg-0123456789abcdef0
+  #   keyPairName: my-keypair
+  #   iamInstanceProfile: my-profile
+  #   tags:
+  #     environment: production
