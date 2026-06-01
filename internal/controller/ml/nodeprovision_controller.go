@@ -606,7 +606,11 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	go func() {
 		defer sshClient.Conn.Close()
 		defer vpnServerClient.Conn.Close()
-		defer r.onPremJobs.Delete(key)
+		// Do NOT delete from onPremJobs here. The map entry must remain
+		// until pollOnPremBootstrap reads the result from the channel.
+		// Deleting here creates a window where the goroutine has finished
+		// but the result hasn't been consumed yet: the next poll would see
+		// no map entry, no VpnIP in status, and falsely restart provisioning.
 
 		vpnNodeIP, publicKey, err := remotenodeprovision.NewInClusterProvisioner(
 			context.Background(),
@@ -650,7 +654,11 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 	ch := v.(<-chan onPremJobResult)
 	select {
 	case res := <-ch:
-		// Goroutine finished.
+		// Goroutine finished — consume the result and remove the map entry.
+		// The entry is only removed here (not in the goroutine) so there is
+		// no window between "goroutine done" and "result consumed" that would
+		// cause the next poll to falsely treat this as a controller restart.
+		r.onPremJobs.Delete(key)
 		if res.err != nil {
 			return r.failNodeProvision(ctx, np, fmt.Sprintf("on-prem provisioning failed: %v", res.err))
 		}
