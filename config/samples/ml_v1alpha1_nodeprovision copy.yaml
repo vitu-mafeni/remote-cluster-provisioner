@@ -1,0 +1,123 @@
+# ============================================================
+# NodeProvision — provisions an on-premises node and joins it
+# to the cluster whose join command is stored in the
+# NodeProvisionNetConfig on this (remote) cluster.
+# ============================================================
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: worker-node1
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # Cloud / infrastructure provider.
+  # OnPrem = SSH-based provisioning via incluster.go
+  provider: OnPrem
+
+  # Role this node plays in the cluster.
+  role: worker
+
+  # Optional Kubernetes node label applied after the node joins.
+  nodeLabel: cpu
+
+  # ── Node SSH access ──────────────────────────────────────────
+  # LAN IP or hostname of the node to provision.
+  # If both ipAddress and hostname are set, ipAddress takes priority.
+  ipAddress: "192.168.28.132"
+  hostname: "worker-node1"
+  sshPort: 22
+  sshUsernameOverride: ubuntu
+
+  # ── SSH credentials ──────────────────────────────────────────
+  # Secret holding the SSH credential for the node.
+  # Set key to the data field that contains the credential.
+  # Auth type is auto-detected:
+  #   • value starts with "-----BEGIN" → private-key auth
+  #   • anything else                  → password auth
+  # If key is omitted the controller tries: privateKey, id_rsa,
+  # ssh-privatekey, password, key — in that order.
+  credentialsRef:
+    name: worker-node1-01-ssh-secret
+    namespace: default
+    key: id_rsa
+
+---
+# SSH credential for the node being provisioned.
+# Use stringData so you can paste the raw key / password without
+# manually base64-encoding it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: worker-node1-01-ssh-secret
+  namespace: default
+type: Opaque
+stringData:
+  # Private-key example (auto-detected as key auth):
+  id_rsa: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    <paste private key here>
+    -----END OPENSSH PRIVATE KEY-----
+  # Password example (uncomment and remove id_rsa above to use):
+  # password: "s3cr3tpassword"
+
+---
+# ============================================================
+# NodeProvisionNetConfig — cluster-wide config consumed by the
+# NodeProvision controller.  Normally created automatically by
+# the management cluster's RemoteCluster controller, but you
+# can apply it manually for testing.
+# ============================================================
+# apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+# kind: NodeProvisionNetConfig
+# metadata:
+#   name: my-cluster-netconfig
+#   namespace: default
+#   labels:
+#     app.kubernetes.io/name: remote-cluster-provisioner
+#     app.kubernetes.io/managed-by: kustomize
+# spec:
+#   clusterName: my-cluster
+
+#   # CIDR range from which each node receives a unique WireGuard IP.
+#   vpnRange: "10.9.0.0/24"
+
+#   vpnServerPublicConfig:
+#     # Public IP (or hostname) of the WireGuard VPN server.
+#     publicIP: "13.215.206.108"
+
+#     # SSH connection details for the VPN server.
+#     # The controller uses these to register new peers via
+#     # "wg set wg0 peer …" and to persist the config.
+#     # Defaults: sshPort=22, sshUsername=ubuntu
+#     sshPort: 22
+#     sshUsername: ubuntu
+
+#     # Secret on THIS cluster that holds the VPN server SSH credential.
+#     # key + auth auto-detection work the same as credentialsRef above.
+#     vpnSshCredentialsRef:
+#       name: vpn-server-secret
+#       namespace: default
+#       key: id_rsa
+
+#   softwareConfig:
+#     kubernetesVersion: "v1.34.2"
+#     nvidiaDriverVersion: "550"
+#     nvidiaContainerToolkitVersion: "1.17.3-1"
+#     k8sDevicePluginVersion: "v0.17.1"
+
+# ---
+# # SSH credential for the WireGuard VPN server.
+# # The controller SSHes into this host to run "wg set wg0 peer …".
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: vpn-server-secret
+#   namespace: default
+# type: Opaque
+# stringData:
+#   id_rsa: |
+#     -----BEGIN OPENSSH PRIVATE KEY-----
+#     <paste VPN server private key here>
+#     -----END OPENSSH PRIVATE KEY-----
