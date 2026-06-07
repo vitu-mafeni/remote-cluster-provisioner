@@ -404,7 +404,7 @@ sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
 		// =========================
 		// Install toolkit (pinned version)
 		// =========================
-		fmt.Sprintf(`sudo apt-get install -y \
+		fmt.Sprintf(`sudo apt-get install  --allow-downgrades -y \
 nvidia-container-toolkit=%s \
 nvidia-container-toolkit-base=%s \
 libnvidia-container-tools=%s \
@@ -470,7 +470,7 @@ sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
 		// =========================
 		// Install container toolkit (pinned version)
 		// =========================
-		fmt.Sprintf(`sudo apt-get install -y \
+		fmt.Sprintf(`sudo apt-get install  --allow-downgrades -y \
 nvidia-container-toolkit=%s \
 nvidia-container-toolkit-base=%s \
 libnvidia-container-tools=%s \

@@ -32,11 +32,11 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
+	"dcn.ssu.ac.kr/infra/pkg/ssh"
 	awsprovision "dcn.ssu.ac.kr/infra/provider/aws"
 	remotenodeprovision "dcn.ssu.ac.kr/infra/provider/onprem"
-	"dcn.ssu.ac.kr/infra/pkg/ssh"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // onPremJobResult carries the outcome of a background on-prem provisioning run.
@@ -56,7 +56,22 @@ type NodeProvisionReconciler struct {
 }
 
 const (
+	// nodeProvisionFinalizer is placed on the NodeProvision CR itself.
 	nodeProvisionFinalizer = "ml.dcn.ssu.ac.kr/nodeprovision-finalizer"
+
+	// nodeProvisionNodeFinalizer is placed on the Kubernetes Node object so that
+	// the node cannot be deleted independently of the NodeProvision lifecycle.
+	nodeProvisionNodeFinalizer = "ml.dcn.ssu.ac.kr/nodeprovision-node-finalizer"
+
+	// Ownership labels stamped onto the Kubernetes Node when it joins the cluster.
+	// They let any observer (kubectl, dashboard, scripts) find the parent NodeProvision CR.
+	nodeProvisionNameLabel      = "ml.dcn.ssu.ac.kr/node-provision"
+	nodeProvisionNsLabel        = "ml.dcn.ssu.ac.kr/node-provision-namespace"
+	nodeProvisionProviderLabel  = "ml.dcn.ssu.ac.kr/provider"
+	// nodeProvisionUIDLabel holds the UID of the owning NodeProvision CR.
+	// Unlike the name, the UID is globally unique and survives CR rename/recreate,
+	// so it is the definitive key for matching a Node back to its exact CR.
+	nodeProvisionUIDLabel       = "ml.dcn.ssu.ac.kr/node-provision-uid"
 
 	// requeueShort is used when waiting for external state (instance running, VPN).
 	requeueShort = 30 * time.Second
@@ -735,17 +750,39 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	log.Info("Node registered with control plane", "node", found.Name)
 	log.Info("Node join progress: verifying health")
 
-	// Apply hardware-type label if requested.
-	if np.Spec.NodeLabel != "" {
+	// Stamp ownership labels + hardware-type label + management finalizer onto
+	// the Kubernetes Node object in a single patch.  We always do this so that
+	// even nodes whose NodeProvision has no NodeLabel still carry the ownership
+	// metadata and are protected against accidental kubectl-delete.
+	{
 		patch := client.MergeFrom(found.DeepCopy())
 		if found.Labels == nil {
 			found.Labels = map[string]string{}
 		}
-		found.Labels["hardware-type"] = np.Spec.NodeLabel
-		if err := r.Patch(ctx, found, patch); err != nil {
-			return ctrl.Result{}, fmt.Errorf("patching node label: %w", err)
+		// Ownership labels — let anyone find the parent NodeProvision CR.
+		found.Labels[nodeProvisionNameLabel]     = np.Name
+		found.Labels[nodeProvisionNsLabel]       = np.Namespace
+		found.Labels[nodeProvisionProviderLabel] = string(np.Spec.Provider)
+		// UID is the definitive unique identifier: immutable, cluster-scoped,
+		// survives a CR delete+recreate with the same name.
+		found.Labels[nodeProvisionUIDLabel] = string(np.UID)
+		// Optional user-supplied hardware class label.
+		if np.Spec.NodeLabel != "" {
+			found.Labels["hardware-type"] = np.Spec.NodeLabel
 		}
-		log.Info("Applied node label", "node", found.Name, "hardware-type", np.Spec.NodeLabel)
+		// Finalizer on the Node prevents `kubectl delete node` from bypassing
+		// controller-managed cleanup (VPN peer removal, EC2 termination, etc.).
+		controllerutil.AddFinalizer(found, nodeProvisionNodeFinalizer)
+		if err := r.Patch(ctx, found, patch); err != nil {
+			return ctrl.Result{}, fmt.Errorf("patching node ownership labels/finalizer: %w", err)
+		}
+		log.Info("Stamped ownership metadata on node",
+			"node", found.Name,
+			nodeProvisionNameLabel, np.Name,
+			nodeProvisionNsLabel, np.Namespace,
+			nodeProvisionProviderLabel, string(np.Spec.Provider),
+			nodeProvisionUIDLabel, string(np.UID),
+		)
 	}
 
 	now := metav1.Now()
@@ -779,6 +816,19 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	if np.Status.NodeName != "" {
 		node := &corev1.Node{}
 		if err := r.Get(ctx, types.NamespacedName{Name: np.Status.NodeName}, node); err == nil {
+			// Remove our management finalizer first so the Delete call is honoured
+			// immediately.  Without this the API server would only set
+			// DeletionTimestamp and wait for us to remove the finalizer — which we
+			// never would (the NodeProvision is already being torn down).
+			if controllerutil.ContainsFinalizer(node, nodeProvisionNodeFinalizer) {
+				patch := client.MergeFrom(node.DeepCopy())
+				controllerutil.RemoveFinalizer(node, nodeProvisionNodeFinalizer)
+				if err := r.Patch(ctx, node, patch); err != nil {
+					log.Error(err, "removing node finalizer (continuing)", "node", np.Status.NodeName)
+				} else {
+					log.Info("Removed management finalizer from node", "node", np.Status.NodeName)
+				}
+			}
 			if err := r.Delete(ctx, node); err != nil {
 				log.Error(err, "deleting node from cluster", "node", np.Status.NodeName)
 			} else {

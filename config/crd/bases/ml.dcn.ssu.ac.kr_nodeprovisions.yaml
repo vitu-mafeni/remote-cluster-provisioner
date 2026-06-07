@@ -39,11 +39,48 @@ spec:
           spec:
             description: spec defines the desired state of NodeProvision
             properties:
+              awsConfig:
+                description: AWSConfig holds provider-specific parameters for AWS
+                  EC2 provisioning.
+                properties:
+                  ami:
+                    description: AMI ID to use for the instance.
+                    type: string
+                  iamInstanceProfile:
+                    description: IAM instance profile name or ARN for the instance.
+                    type: string
+                  keyPairName:
+                    description: EC2 key pair name for SSH access (optional when using
+                      cloud-init only).
+                    type: string
+                  securityGroupIds:
+                    description: Security group IDs to attach to the instance.
+                    items:
+                      type: string
+                    type: array
+                  subnetId:
+                    description: Subnet ID for the instance's primary network interface.
+                    type: string
+                  tags:
+                    additionalProperties:
+                      type: string
+                    description: Additional tags to apply to created AWS resources.
+                    type: object
+                  vpcId:
+                    description: VPC ID where the instance will be launched.
+                    type: string
+                type: object
               credentialsRef:
                 description: |-
                   NodeProvisionSpec defines the desired state of NodeProvision
                   CredentialsRef references the Secret containing provider credentials.
                 properties:
+                  key:
+                    description: |-
+                      Key is the data key within the secret that holds the credential.
+                      When omitted the controller tries well-known names: privateKey, id_rsa,
+                      ssh-privatekey, password, key.
+                    type: string
                   name:
                     type: string
                   namespace:
@@ -81,10 +118,16 @@ spec:
                 description: Assigned hostname.
                 type: string
               instanceId:
-                description: Provider-generated instance ID.
+                description: Provider-generated instance ID (e.g. i-xxxxxxxxxxxxxxxxx
+                  for AWS).
                 type: string
               ipAddress:
-                description: Assigned node IP.
+                description: IPAddress is the VPN (WireGuard) IP assigned to the node.
+                type: string
+              lastUpdated:
+                description: LastUpdated is the timestamp of the most recent status
+                  update.
+                format: date-time
                 type: string
               message:
                 description: Human-readable status message.
@@ -95,9 +138,21 @@ spec:
               phase:
                 description: Current lifecycle phase.
                 type: string
+              privateIp:
+                description: PrivateIP is the cloud-provider private IP of the instance.
+                type: string
+              progress:
+                description: Progress is a 0–100 percentage of provisioning completion.
+                type: integer
+              publicIp:
+                description: PublicIP is the cloud-provider public IP of the instance.
+                type: string
               startTime:
                 description: Timestamp when provisioning started.
                 format: date-time
+                type: string
+              vpnIp:
+                description: VpnIP is the WireGuard VPN IP allocated for this node.
                 type: string
             type: object
         required:
