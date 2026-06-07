@@ -117,7 +117,12 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("adding finalizer: %w", err)
 		}
-		return ctrl.Result{}, nil
+		// Requeue immediately rather than waiting for a watch event.
+		// GenerationChangedPredicate filters the Update event that adding a
+		// finalizer produces (metadata-only changes do not increment generation),
+		// so without an explicit requeue the controller would never reach
+		// reconcileProvisioning after a brand-new resource is created.
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	switch cluster.Status.Phase {
