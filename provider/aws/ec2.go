@@ -132,7 +132,11 @@ func ProvisionEC2Node(
 	log.Printf("[INFO] NodeProvision/%s: AWS validation successful", name)
 
 	// ── Allocate VPN IP ────────────────────────────────────────────────────
-	vpnIP, err := onprem.GetNextAvailableIP(
+	// AllocateVPNIP cross-checks both the CR's UsedIPAddresses and the live
+	// WireGuard peer list on the server, so the chosen IP is guaranteed free
+	// in both sources even if they have drifted.
+	vpnIP, err := onprem.AllocateVPNIP(
+		vpnServerClient,
 		*netNodeConfig.Spec.VPNRange,
 		netNodeConfig.Status.UsedIPAddresses,
 	)
