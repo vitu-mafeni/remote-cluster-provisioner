@@ -65,9 +65,9 @@ const (
 
 	// Ownership labels stamped onto the Kubernetes Node when it joins the cluster.
 	// They let any observer (kubectl, dashboard, scripts) find the parent NodeProvision CR.
-	nodeProvisionNameLabel      = "ml.dcn.ssu.ac.kr/node-provision"
-	nodeProvisionNsLabel        = "ml.dcn.ssu.ac.kr/node-provision-namespace"
-	nodeProvisionProviderLabel  = "ml.dcn.ssu.ac.kr/provider"
+	nodeProvisionNameLabel     = "ml.dcn.ssu.ac.kr/node-provision"
+	nodeProvisionNsLabel       = "ml.dcn.ssu.ac.kr/node-provision-namespace"
+	nodeProvisionProviderLabel = "ml.dcn.ssu.ac.kr/provider"
 	// nodeProvisionUIDLabel holds the UID of the owning NodeProvision CR.
 	// Unlike the name, the UID is globally unique and survives CR rename/recreate,
 	// so it is the definitive key for matching a Node back to its exact CR.
@@ -779,8 +779,8 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 			found.Labels = map[string]string{}
 		}
 		// Ownership labels — let anyone find the parent NodeProvision CR.
-		found.Labels[nodeProvisionNameLabel]     = np.Name
-		found.Labels[nodeProvisionNsLabel]       = np.Namespace
+		found.Labels[nodeProvisionNameLabel] = np.Name
+		found.Labels[nodeProvisionNsLabel] = np.Namespace
 		found.Labels[nodeProvisionProviderLabel] = string(np.Spec.Provider)
 		// UID is the definitive unique identifier: immutable, cluster-scoped,
 		// survives a CR delete+recreate with the same name.
