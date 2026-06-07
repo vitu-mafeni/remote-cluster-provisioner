@@ -71,7 +71,14 @@ const (
 	// nodeProvisionUIDLabel holds the UID of the owning NodeProvision CR.
 	// Unlike the name, the UID is globally unique and survives CR rename/recreate,
 	// so it is the definitive key for matching a Node back to its exact CR.
-	nodeProvisionUIDLabel       = "ml.dcn.ssu.ac.kr/node-provision-uid"
+	nodeProvisionUIDLabel = "ml.dcn.ssu.ac.kr/node-provision-uid"
+
+	// controllerCredsSuffix is appended to the NodeProvision name to form the
+	// name of the controller-owned credential copy.  This copy carries an owner
+	// reference so it cannot be deleted while the NodeProvision CR exists; it is
+	// GC'd automatically after the CR is fully removed.  During teardown the
+	// controller falls back to this copy when the user-managed secret is gone.
+	controllerCredsSuffix = "-controller-creds"
 
 	// requeueShort is used when waiting for external state (instance running, VPN).
 	requeueShort = 30 * time.Second
@@ -113,6 +120,18 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, fmt.Errorf("adding finalizer: %w", err)
 		}
 		return ctrl.Result{}, nil
+	}
+
+	// For AWS nodes, keep a controller-owned copy of the credentials secret up-to-date.
+	// The user-supplied secret can be deleted at any time; during teardown the
+	// controller falls back to this owned copy to terminate the EC2 instance.
+	// On-prem nodes use SSH keys embedded in the same secret so we copy it there too.
+	if np.Spec.CredentialsRef.Name != "" {
+		if userSecret, err := r.getSecret(ctx, np); err == nil {
+			if err := r.ensureControllerCredsSecret(ctx, np, userSecret); err != nil {
+				log.Error(err, "Failed to persist credential copy (non-fatal)")
+			}
+		}
 	}
 
 	switch np.Status.Phase {
@@ -805,6 +824,16 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 
 func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alpha1.NodeProvision) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+
+	// Guard: if our finalizer is already gone a previous reconcile completed
+	// cleanup successfully.  A stale watch event can re-deliver the delete
+	// notification after the CR is already gone; skip to avoid double-work and
+	// a spurious "not found" error on the final Update.
+	if !controllerutil.ContainsFinalizer(np, nodeProvisionFinalizer) {
+		log.Info("Finalizer already removed — cleanup previously completed, skipping")
+		return ctrl.Result{}, nil
+	}
+
 	log.Info("Deprovisioning node")
 
 	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseDeleting
@@ -816,10 +845,12 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	if np.Status.NodeName != "" {
 		node := &corev1.Node{}
 		if err := r.Get(ctx, types.NamespacedName{Name: np.Status.NodeName}, node); err == nil {
-			// Remove our management finalizer first so the Delete call is honoured
-			// immediately.  Without this the API server would only set
-			// DeletionTimestamp and wait for us to remove the finalizer — which we
-			// never would (the NodeProvision is already being torn down).
+			// Strip our management finalizer first.  This is necessary because if
+			// the node already has a DeletionTimestamp (e.g. from a previous
+			// controller run that called Delete before crashing, or from a manual
+			// `kubectl delete node`), removing the last finalizer causes the API
+			// server to GC the node immediately — so the subsequent Delete call
+			// would hit "not found".  We handle that below with IgnoreNotFound.
 			if controllerutil.ContainsFinalizer(node, nodeProvisionNodeFinalizer) {
 				patch := client.MergeFrom(node.DeepCopy())
 				controllerutil.RemoveFinalizer(node, nodeProvisionNodeFinalizer)
@@ -829,10 +860,18 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 					log.Info("Removed management finalizer from node", "node", np.Status.NodeName)
 				}
 			}
-			if err := r.Delete(ctx, node); err != nil {
-				log.Error(err, "deleting node from cluster", "node", np.Status.NodeName)
+			// If DeletionTimestamp is already set the API server will delete the
+			// node as soon as all finalizers are gone (handled above).  Calling
+			// Delete again is harmless but produces a confusing "not found" log
+			// line, so skip it in that case.
+			if node.DeletionTimestamp.IsZero() {
+				if err := r.Delete(ctx, node); client.IgnoreNotFound(err) != nil {
+					log.Error(err, "deleting node from cluster", "node", np.Status.NodeName)
+				} else if err == nil {
+					log.Info("Removed node from cluster", "node", np.Status.NodeName)
+				}
 			} else {
-				log.Info("Removed node from cluster", "node", np.Status.NodeName)
+				log.Info("Node already terminating — finalizer removal will complete deletion", "node", np.Status.NodeName)
 			}
 		}
 	}
@@ -846,13 +885,29 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	switch np.Spec.Provider {
 	case mlv1alpha1.CloudProviderAWS:
 		if np.Status.InstanceID != "" {
+			// Prefer the user-supplied secret; fall back to the controller-owned copy
+			// in case the user deleted their secret before deleting the NodeProvision.
 			secret, err := r.getSecret(ctx, np)
 			if err != nil {
-				log.Error(err, "getting credentials for EC2 termination (continuing)")
-			} else if err := awsprovision.TerminateInstance(ctx, np, secret, np.Status.InstanceID); err != nil {
-				log.Error(err, "terminating EC2 instance", "instanceId", np.Status.InstanceID)
-			} else {
-				log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
+				if !apierrors.IsNotFound(err) {
+					log.Error(err, "getting credentials for EC2 termination, trying controller copy")
+				} else {
+					log.Info("User credentials secret not found, falling back to controller copy",
+						"userSecret", np.Spec.CredentialsRef.Name)
+				}
+				secret, err = r.getControllerCredsSecret(ctx, np)
+				if err != nil {
+					log.Error(err, "getting controller credential copy for EC2 termination (skipping)",
+						"instanceId", np.Status.InstanceID,
+						"hint", "manually terminate this EC2 instance")
+				}
+			}
+			if secret != nil {
+				if err := awsprovision.TerminateInstance(ctx, np, secret, np.Status.InstanceID); err != nil {
+					log.Error(err, "terminating EC2 instance", "instanceId", np.Status.InstanceID)
+				} else {
+					log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
+				}
 			}
 		}
 	case mlv1alpha1.CloudProviderOnPrem:
@@ -860,7 +915,7 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	}
 
 	controllerutil.RemoveFinalizer(np, nodeProvisionFinalizer)
-	if err := r.Update(ctx, np); err != nil {
+	if err := r.Update(ctx, np); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
 	}
 	log.Info("Cleanup complete")
@@ -993,6 +1048,65 @@ func (r *NodeProvisionReconciler) getSecret(ctx context.Context, np *mlv1alpha1.
 		return nil, fmt.Errorf("getting credentials secret: %w", err)
 	}
 	return secret, nil
+}
+
+// getControllerCredsSecret retrieves the controller-owned copy of the credentials
+// secret (name = <np.Name> + controllerCredsSuffix).  This copy is created and
+// kept up-to-date by ensureControllerCredsSecret so that teardown can proceed
+// even when the user-managed secret has been deleted.
+func (r *NodeProvisionReconciler) getControllerCredsSecret(ctx context.Context, np *mlv1alpha1.NodeProvision) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      np.Name + controllerCredsSuffix,
+		Namespace: np.Namespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("getting controller credential copy: %w", err)
+	}
+	return secret, nil
+}
+
+// ensureControllerCredsSecret creates (or updates) a controller-owned copy of
+// the user-supplied credentials secret.  The copy carries an owner reference to
+// the NodeProvision CR so Kubernetes will GC it once the CR is fully deleted.
+// As long as the NodeProvision exists (even in terminating state with our
+// finalizer present), the copy is available for EC2 termination.
+func (r *NodeProvisionReconciler) ensureControllerCredsSecret(ctx context.Context, np *mlv1alpha1.NodeProvision, userSecret *corev1.Secret) error {
+	trueVal := true
+	copyName := np.Name + controllerCredsSuffix
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, client.ObjectKey{Name: copyName, Namespace: np.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		desired := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      copyName,
+				Namespace: np.Namespace,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         mlv1alpha1.GroupVersion.String(),
+						Kind:               "NodeProvision",
+						Name:               np.Name,
+						UID:                np.UID,
+						Controller:         &trueVal,
+						BlockOwnerDeletion: &trueVal,
+					},
+				},
+				Labels: map[string]string{
+					nodeProvisionNameLabel: np.Name,
+					nodeProvisionUIDLabel:  string(np.UID),
+				},
+			},
+			Type: userSecret.Type,
+			Data: userSecret.Data,
+		}
+		return r.Create(ctx, desired)
+	} else if err != nil {
+		return fmt.Errorf("checking for controller credential copy: %w", err)
+	}
+	// Already exists — sync data in case the user rotated the source secret.
+	patch := client.MergeFrom(existing.DeepCopy())
+	existing.Data = userSecret.Data
+	existing.Type = userSecret.Type
+	return r.Patch(ctx, existing, patch)
 }
 
 // getSSHClient creates an SSH client for the node being provisioned.
