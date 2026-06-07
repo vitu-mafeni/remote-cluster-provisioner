@@ -1,4 +1,4 @@
-package remotenodeprovision
+package onprem
 
 /*
 Copyright 2024.
@@ -25,8 +25,8 @@ import (
 	"strings"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
-	"dcn.ssu.ac.kr/infra/helpers/provision"
-	sshhelper "dcn.ssu.ac.kr/infra/helpers/ssh"
+	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
+	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -219,7 +219,7 @@ fi`, repoVersion, repoVersion),
 	// Get actual wg0 IP AFTER tunnel starts
 	// ============================================================
 
-	nodeIP, err := provision.GetTunIP(sshclient)
+	nodeIP, err := kubeadm.GetTunIP(sshclient)
 	if err != nil {
 		return "", "", fmt.Errorf("failed getting wg0 IP: %w", err)
 	}
