@@ -61,8 +61,20 @@ spec:
                 properties:
                   publicIP:
                     type: string
+                  sshPort:
+                    type: integer
+                  sshUsername:
+                    type: string
+                  vpnPort:
+                    description: VPNPort is the UDP port WireGuard listens on (default
+                      51820).
+                    type: integer
                   vpnSshCredentialsRef:
                     properties:
+                      key:
+                        description: Key is the data key within the secret that holds
+                          the credential.
+                        type: string
                       name:
                         type: string
                       namespace:
@@ -74,13 +86,26 @@ spec:
             description: status defines the observed state of NodeProvisionNetConfig
             properties:
               clusterJoinCommand:
+                description: ClusterJoinCommand is the kubeadm join command for worker
+                  nodes.
                 type: string
               usedIPAddresses:
-                description: |-
-                  For Kubernetes API conventions, see:
-                  https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
                 items:
                   type: string
+                type: array
+              vpnPeers:
+                description: VPNPeers tracks every WireGuard peer registered on the
+                  VPN server.
+                items:
+                  description: VPNPeerStatus records one registered WireGuard peer.
+                  properties:
+                    nodeName:
+                      type: string
+                    publicKey:
+                      type: string
+                    vpnIP:
+                      type: string
+                  type: object
                 type: array
             type: object
         required:

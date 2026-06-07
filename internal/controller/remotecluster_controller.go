@@ -33,9 +33,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -131,8 +133,7 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{}, nil
 	case phaseFailed:
-		// Terminal state: manual intervention required to reset phase.
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
+		return r.reconcileProvisioning(ctx, cluster)
 	default:
 		return ctrl.Result{}, nil
 	}
@@ -659,11 +660,8 @@ func (r *RemoteClusterReconciler) findControlPlane(ctx context.Context, cluster 
 
 func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *infrav1.RemoteCluster) (*ssh.Client, error) {
 	var secretRef *infrav1.SecretKeyReference
-	usePrivateKey := false
-
 	if cluster.Spec.Auth.SSHPrivateKeySecretRef != nil {
 		secretRef = cluster.Spec.Auth.SSHPrivateKeySecretRef
-		usePrivateKey = true
 	} else if cluster.Spec.Auth.PasswordSecretRef != nil {
 		secretRef = cluster.Spec.Auth.PasswordSecretRef
 	} else {
@@ -695,12 +693,13 @@ func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *inf
 		// TODO: implement VPN-aware SSH connectivity (e.g., start tunnel) when needed.
 	}
 
+	credential := string(credentialBytes)
 	var sshClient *ssh.Client
 	var err error
-	if usePrivateKey {
-		sshClient, err = ssh.ConnectWithPrivateKey(host, cluster.Spec.Port, cluster.Spec.User, string(credentialBytes))
+	if strings.HasPrefix(strings.TrimSpace(credential), "-----BEGIN") {
+		sshClient, err = ssh.ConnectWithPrivateKey(host, cluster.Spec.Port, cluster.Spec.User, credential)
 	} else {
-		sshClient, err = ssh.Connect(host, cluster.Spec.Port, cluster.Spec.User, string(credentialBytes))
+		sshClient, err = ssh.Connect(host, cluster.Spec.Port, cluster.Spec.User, credential)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("SSH connect to %s:%d: %w", host, cluster.Spec.Port, err)
@@ -1106,7 +1105,7 @@ func (r *RemoteClusterReconciler) upsertPackageVariants(ctx context.Context, clu
 // SetupWithManager sets up the controller with the Manager.
 func (r *RemoteClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&infrav1.RemoteCluster{}).
+		For(&infrav1.RemoteCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("remotecluster").
 		Complete(r)
 }
