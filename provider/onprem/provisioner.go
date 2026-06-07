@@ -51,10 +51,12 @@ func NewInClusterProvisioner(
 	log.Printf("Provisioning node %s", nodeProvision.Name)
 
 	// ============================================================
-	// Allocate VPN IP
+	// Allocate VPN IP — cross-checked against both CR state and
+	// the live WireGuard peer list on the VPN server so that a
+	// drift between the two sources never causes an IP collision.
 	// ============================================================
 
-	vpnNodeIP, err = getNextAvailableIP(
+	vpnNodeIP, err = allocateVPNIP(vpnServerClient,
 		*netNodeConfig.Spec.VPNRange,
 		netNodeConfig.Status.UsedIPAddresses,
 	)
@@ -151,19 +153,42 @@ net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
 
 		// ========================================================
 		// WireGuard client config
+		//
+		// We handle three cases:
+		//   A. wg0 is already up with the CORRECT IP (retry after a
+		//      later step failed) → skip teardown and re-write; just
+		//      verify the interface is healthy.
+		//   B. wg0 is up with a DIFFERENT IP (stale from a previous
+		//      failed attempt) → bring it down cleanly, then install
+		//      the new config.
+		//   C. wg0 does not exist → fresh install.
 		// ========================================================
 
 		"sudo mkdir -p /etc/wireguard",
 
-		fmt.Sprintf(
-			"cat <<'EOF' | sudo tee /etc/wireguard/wg0.conf\n%s\nEOF",
-			wgConfig,
-		),
+		// Bring down any existing wg0 interface gracefully before
+		// writing a new config.  If the interface is already gone this
+		// is a no-op thanks to the '|| true' guards.
+		fmt.Sprintf(`
+CURRENT_IP=$(sudo wg show wg0 allowed-ips 2>/dev/null | awk '{print $2}' | cut -d/ -f1 | head -1)
+if [ "$CURRENT_IP" = "%s" ]; then
+  # Case A: already up with the correct IP — nothing to do here.
+  echo "wg0 already running with correct IP %s, skipping tunnel setup"
+else
+  # Case B / C: tear down whatever is running (if anything) and rebuild.
+  sudo systemctl stop wg-quick@wg0 2>/dev/null || true
+  sudo wg-quick down wg0 2>/dev/null || true
+  sudo ip link delete wg0 2>/dev/null || true
 
-		"sudo chmod 600 /etc/wireguard/wg0.conf",
-		"sudo systemctl enable wg-quick@wg0",
-		"sudo systemctl restart wg-quick@wg0",
-		"sleep 5",
+  # Write fresh config and bring the tunnel up.
+  cat <<'WGEOF' | sudo tee /etc/wireguard/wg0.conf
+%s
+WGEOF
+  sudo chmod 600 /etc/wireguard/wg0.conf
+  sudo systemctl enable wg-quick@wg0
+  sudo systemctl start wg-quick@wg0
+  sleep 5
+fi`, vpnNodeIP, vpnNodeIP, wgConfig),
 
 		// ========================================================
 		// CRI-O
@@ -264,18 +289,140 @@ fi`, repoVersion, repoVersion),
 	return nodeIP, publicKey, nil
 }
 
-// registerVPNPeer adds (or updates) the WireGuard peer on the VPN server.
-// The operation is idempotent: if the public key already appears in the
-// running config the wg set command still succeeds (it is an upsert).
-// The peer block is also appended to /etc/wireguard/wg0.conf for persistence
-// across reboots, but only if it is not already present.
+// ReadVPNServerPeers is the exported form of readVPNServerPeers, used by the
+// controller during cleanup to look up a peer's public key by IP when the CR
+// status no longer holds it (e.g. partial provisioning failure).
+func ReadVPNServerPeers(vpnServerClient *sshhelper.Client) (map[string]string, error) {
+	return readVPNServerPeers(vpnServerClient)
+}
+
+// readVPNServerPeers SSHes to the VPN server and parses "wg show wg0 dump"
+// into a map of plainIP → publicKey for every registered peer.
+// The first line of the dump is the interface line and is skipped.
+// A parse error on an individual line is silently skipped (best-effort).
+func readVPNServerPeers(vpnServerClient *sshhelper.Client) (map[string]string, error) {
+	out, err := sshhelper.Run(vpnServerClient, "sudo wg show wg0 dump 2>/dev/null || true")
+	if err != nil {
+		return nil, fmt.Errorf("reading VPN server peers: %w", err)
+	}
+	peers := make(map[string]string) // plainIP → pubkey
+	for i, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if i == 0 || line == "" {
+			continue // skip interface header line and blank lines
+		}
+		// Fields: pubkey preshared-key endpoint allowed-ips last-handshake rx tx keepalive
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		pubkey := fields[0]
+		// allowed-ips may be a comma-separated list of CIDRs; iterate all.
+		for _, cidr := range strings.Split(fields[3], ",") {
+			cidr = strings.TrimSpace(cidr)
+			if cidr == "" || cidr == "(none)" {
+				continue
+			}
+			ip, _, parseErr := net.ParseCIDR(cidr)
+			if parseErr != nil {
+				ip = net.ParseIP(cidr)
+			}
+			if ip != nil {
+				peers[ip.String()] = pubkey
+			}
+		}
+	}
+	return peers, nil
+}
+
+// allocateVPNIP picks the next free IP in vpnRange that is not used according
+// to EITHER crUsedIPs (NodeProvisionNetConfig status) OR the live WireGuard
+// peer table on the VPN server.  Using both sources prevents collisions when
+// the CR and the server have drifted — e.g. after a controller crash, a manual
+// wg peer add, or a partial cleanup.
+func allocateVPNIP(vpnServerClient *sshhelper.Client, vpnRange string, crUsedIPs []string) (string, error) {
+	serverPeers, err := readVPNServerPeers(vpnServerClient)
+	if err != nil {
+		// Non-fatal: fall back to CR-only allocation and log the warning.
+		log.Printf("Warning: could not read live VPN peer list; falling back to CR state only: %v", err)
+		serverPeers = map[string]string{}
+	}
+
+	// Build the union of all known-used IPs from both sources.
+	usedSet := make(map[string]bool, len(crUsedIPs)+len(serverPeers))
+	for _, ip := range crUsedIPs {
+		usedSet[ip] = true
+	}
+	for ip := range serverPeers {
+		usedSet[ip] = true
+	}
+	allUsed := make([]string, 0, len(usedSet))
+	for ip := range usedSet {
+		allUsed = append(allUsed, ip)
+	}
+
+	chosen, err := getNextAvailableIP(vpnRange, allUsed)
+	if err != nil {
+		return "", err
+	}
+
+	// Final sanity-check: if there's a TOCTOU race and the server already has
+	// this IP, surface a clear error so the caller can retry.
+	if ownerKey, conflict := serverPeers[chosen]; conflict {
+		return "", fmt.Errorf(
+			"allocated IP %s is already registered on VPN server by peer %s (possible race — will retry)",
+			chosen, ownerKey,
+		)
+	}
+	return chosen, nil
+}
+
+// AllocateVPNIP is the exported form of allocateVPNIP used by cloud-provider provisioners.
+func AllocateVPNIP(vpnServerClient *sshhelper.Client, vpnRange string, crUsedIPs []string) (string, error) {
+	return allocateVPNIP(vpnServerClient, vpnRange, crUsedIPs)
+}
+
 // RegisterVPNPeer is the exported form used by cloud-provider provisioners.
 func RegisterVPNPeer(vpnServerClient *sshhelper.Client, publicKey, vpnNodeIP string) error {
 	return registerVPNPeer(vpnServerClient, publicKey, vpnNodeIP)
 }
 
+// registerVPNPeer adds the WireGuard peer to the VPN server's running config
+// and persists it to /etc/wireguard/wg0.conf.
+//
+// Conflict detection (before any write):
+//   - If the server already has our exact (publicKey, vpnNodeIP) pair → skip
+//     the wg set call (already registered, idempotent).
+//   - If the server has our vpnNodeIP assigned to a DIFFERENT public key →
+//     return an error so the caller can allocate a different IP rather than
+//     silently creating a routing conflict.
+//
+// Conf-file persistence is IP-aware:
+//   - Any stale peer block that claims vpnNodeIP with a different key is
+//     removed before the new block is appended.
+//   - The append is skipped if our public key is already present.
 func registerVPNPeer(vpnServerClient *sshhelper.Client, publicKey, vpnNodeIP string) error {
-	// Update running WireGuard config (idempotent upsert).
+	// ── 1. Read live server state ──────────────────────────────────────────
+	serverPeers, readErr := readVPNServerPeers(vpnServerClient)
+	if readErr != nil {
+		log.Printf("Warning: could not verify peer conflicts before registration: %v", readErr)
+		serverPeers = map[string]string{}
+	}
+
+	// ── 2. Conflict / idempotency check ────────────────────────────────────
+	if existingKey, taken := serverPeers[vpnNodeIP]; taken {
+		if existingKey == publicKey {
+			log.Printf("Peer %s already registered with IP %s (idempotent) — skipping wg set", publicKey, vpnNodeIP)
+			// Still sync the conf file below in case it was missed previously.
+		} else {
+			return fmt.Errorf(
+				"IP %s is already assigned to a different peer (%s) on the VPN server; "+
+					"allocate a new IP instead of overwriting an active peer",
+				vpnNodeIP, existingKey,
+			)
+		}
+	}
+
+	// ── 3. Update running WireGuard config (upsert by public key) ──────────
 	addCmd := fmt.Sprintf(
 		"sudo wg set wg0 peer %s allowed-ips %s/32 persistent-keepalive 25",
 		publicKey, vpnNodeIP,
@@ -284,12 +431,53 @@ func registerVPNPeer(vpnServerClient *sshhelper.Client, publicKey, vpnNodeIP str
 		return fmt.Errorf("wg set peer: %w\nOutput:\n%s", err, output)
 	}
 
-	// Persist peer to config file so it survives a server reboot.
-	// Uses grep to avoid duplicating the block on repeated reconciles.
+	// ── 4. Persist to /etc/wireguard/wg0.conf (IP-aware, idempotent) ───────
+	//
+	// Step A: Remove any peer block that contains AllowedIPs = <vpnNodeIP>/32
+	//         but does NOT contain PublicKey = <publicKey>.  This cleans up
+	//         stale entries from a previous node that used the same IP.
+	//
+	// The awk script buffers each [Peer] block and decides whether to emit or
+	// discard it after reading the blank line that terminates the block.
+	//
+	// Step B: Append our peer block only if our public key is absent.
 	persistCmd := fmt.Sprintf(`
-if ! sudo grep -qF '%s' /etc/wireguard/wg0.conf 2>/dev/null; then
-  printf '\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n' | sudo tee -a /etc/wireguard/wg0.conf > /dev/null
-fi`, publicKey, publicKey, vpnNodeIP)
+set -e
+WG_CONF=/etc/wireguard/wg0.conf
+
+# Step A — strip any peer block that claims our IP with a different key.
+if sudo test -f "$WG_CONF"; then
+  sudo awk -v target_ip="%s/32" -v our_key="%s" '
+    /^\[Peer\]/ {
+      in_peer=1; buf=$0"\n"; has_ip=0; has_key=0; next
+    }
+    in_peer {
+      buf=buf $0 "\n"
+      if ($0 ~ "AllowedIPs" && index($0, target_ip)) has_ip=1
+      if ($0 ~ "PublicKey"  && index($0, our_key))   has_key=1
+      if (/^[[:space:]]*$/ || /^\[/) {
+        # End of block — emit unless it is the stale conflicting entry
+        if (!(has_ip && !has_key)) printf "%%s", buf
+        if (/^\[/) { in_peer=0; buf=$0"\n"; has_ip=0; has_key=0 } else { in_peer=0; buf="" }
+        next
+      }
+      next
+    }
+    { print }
+    END { if (in_peer && !(has_ip && !has_key)) printf "%%s", buf }
+  ' "$WG_CONF" | sudo tee "${WG_CONF}.tmp" > /dev/null
+  sudo mv "${WG_CONF}.tmp" "$WG_CONF"
+fi
+
+# Step B — append our peer block if not already present.
+if ! sudo grep -qF 'PublicKey = %s' "$WG_CONF" 2>/dev/null; then
+  printf '\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n' \
+    | sudo tee -a "$WG_CONF" > /dev/null
+fi`,
+		vpnNodeIP, publicKey, // awk -v args (Step A)
+		publicKey,            // grep check (Step B)
+		publicKey, vpnNodeIP, // printf args (Step B)
+	)
 
 	if output, err := sshhelper.Run(vpnServerClient, persistCmd); err != nil {
 		return fmt.Errorf("persisting peer to wg0.conf: %w\nOutput:\n%s", err, output)

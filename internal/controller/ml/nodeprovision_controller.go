@@ -922,8 +922,17 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	return ctrl.Result{}, nil
 }
 
-// cleanupVPNPeer removes the peer from the VPN server and releases the IP
-// allocation from the NodeProvisionNetConfig status.
+// cleanupVPNPeer removes the peer from the VPN server's running config and
+// persisted wg0.conf, then releases the IP from the NodeProvisionNetConfig status.
+//
+// Public-key resolution order (most specific → most defensive):
+//  1. CR status (VPNPeers list) — fast path, always tried first.
+//  2. Live VPN server (wg show wg0 dump keyed by VPN IP) — fallback when the
+//     CR status was never written or has drifted, e.g. provisioning crashed
+//     before updateNetConfigStatus completed.
+//
+// The VPN server connection is always opened so the fallback can be attempted
+// even when the CR has no record of this peer.
 func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1alpha1.NodeProvision) error {
 	log := logf.FromContext(ctx)
 
@@ -933,7 +942,7 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 	}
 	netConfig := &netConfigList.Items[0]
 
-	// Find the peer entry for this node.
+	// ── 1. Resolve public key from CR status ─────────────────────────────────
 	var peerPublicKey string
 	newPeers := make([]mlv1alpha1.VPNPeerStatus, 0, len(netConfig.Status.VPNPeers))
 	for _, p := range netConfig.Status.VPNPeers {
@@ -944,48 +953,86 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 		}
 	}
 
-	// Remove VPN IP from used list.
+	// Release IP from used list regardless of whether we find the key.
 	newIPs := make([]string, 0, len(netConfig.Status.UsedIPAddresses))
 	for _, ip := range netConfig.Status.UsedIPAddresses {
 		if ip != np.Status.VpnIP && ip != np.Status.IPAddress {
 			newIPs = append(newIPs, ip)
 		}
 	}
-
 	netConfig.Status.VPNPeers = newPeers
 	netConfig.Status.UsedIPAddresses = newIPs
 	if err := r.Status().Update(ctx, netConfig); err != nil {
 		return fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
 	}
 
-	// Remove peer from VPN server if we have credentials.
-	if peerPublicKey != "" {
-		vpnClient, err := r.getVPNServerSSHClient(ctx, netConfig)
-		if err != nil {
-			log.Error(err, "connecting to VPN server for peer removal")
-			return nil
-		}
-		defer vpnClient.Conn.Close()
-
-		removeCmd := fmt.Sprintf("sudo wg set wg0 peer %s remove", peerPublicKey)
-		if _, err := ssh.Run(vpnClient, removeCmd); err != nil {
-			log.Error(err, "removing WireGuard peer from server")
-		}
-
-		// Remove from persisted wg0.conf.
-		vpnIP := np.Status.VpnIP
-		if vpnIP == "" {
-			vpnIP = np.Status.IPAddress
-		}
-		cleanCmd := fmt.Sprintf(
-			`sudo sed -i '/^\\[Peer\\]/{N;/PublicKey = %s/,/^$/d}' /etc/wireguard/wg0.conf 2>/dev/null || true`,
-			peerPublicKey,
-		)
-		if _, err := ssh.Run(vpnClient, cleanCmd); err != nil {
-			log.Error(err, "cleaning wg0.conf on VPN server")
-		}
-		log.Info("Removed VPN peer", "publicKey", peerPublicKey, "vpnIP", vpnIP)
+	// ── 2. Connect to VPN server — always, so we can use the live fallback ───
+	vpnClient, err := r.getVPNServerSSHClient(ctx, netConfig)
+	if err != nil {
+		log.Error(err, "connecting to VPN server for peer removal — peer may remain on server")
+		return nil
 	}
+	defer vpnClient.Conn.Close()
+
+	// ── 3. Fallback: look up public key from live server when CR has no record ─
+	vpnIP := np.Status.VpnIP
+	if vpnIP == "" {
+		vpnIP = np.Status.IPAddress
+	}
+	if peerPublicKey == "" && vpnIP != "" {
+		serverPeers, lookupErr := remotenodeprovision.ReadVPNServerPeers(vpnClient)
+		if lookupErr != nil {
+			log.Error(lookupErr, "reading live VPN peer list for fallback lookup")
+		} else if key, ok := serverPeers[vpnIP]; ok {
+			peerPublicKey = key
+			log.Info("Resolved peer public key from live VPN server (CR status was missing)",
+				"vpnIP", vpnIP, "publicKey", peerPublicKey)
+		}
+	}
+
+	if peerPublicKey == "" {
+		if vpnIP != "" {
+			log.Info("No peer found in CR status or on VPN server for this node — nothing to remove",
+				"vpnIP", vpnIP)
+		}
+		return nil
+	}
+
+	// ── 4. Remove from running WireGuard config ───────────────────────────────
+	removeCmd := fmt.Sprintf("sudo wg set wg0 peer %s remove", peerPublicKey)
+	if _, err := ssh.Run(vpnClient, removeCmd); err != nil {
+		log.Error(err, "removing WireGuard peer from running config", "publicKey", peerPublicKey)
+	}
+
+	// ── 5. Remove block from persisted wg0.conf ───────────────────────────────
+	// Uses the same awk buffering as registerVPNPeer so the removal is correct
+	// regardless of the field order within the [Peer] block.
+	cleanCmd := fmt.Sprintf(`
+sudo awk -v our_key="%s" '
+  /^\[Peer\]/ {
+    in_peer=1; buf=$0"\n"; has_key=0; next
+  }
+  in_peer {
+    buf=buf $0 "\n"
+    if ($0 ~ "PublicKey" && index($0, our_key)) has_key=1
+    if (/^[[:space:]]*$/ || /^\[/) {
+      if (!has_key) printf "%%s", buf
+      if (/^\[/) { in_peer=0; buf=$0"\n"; has_key=0 } else { in_peer=0; buf="" }
+      next
+    }
+    next
+  }
+  { print }
+  END { if (in_peer && !has_key) printf "%%s", buf }
+' /etc/wireguard/wg0.conf 2>/dev/null | sudo tee /etc/wireguard/wg0.conf.tmp > /dev/null &&
+sudo mv /etc/wireguard/wg0.conf.tmp /etc/wireguard/wg0.conf 2>/dev/null || true`,
+		peerPublicKey,
+	)
+	if _, err := ssh.Run(vpnClient, cleanCmd); err != nil {
+		log.Error(err, "removing peer block from wg0.conf on VPN server")
+	}
+
+	log.Info("Removed VPN peer", "publicKey", peerPublicKey, "vpnIP", vpnIP)
 	return nil
 }
 
