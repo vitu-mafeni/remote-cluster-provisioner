@@ -1,10 +1,10 @@
-package provision
+package argocd
 
 import (
 	"fmt"
 
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
-	sshhelper "dcn.ssu.ac.kr/infra/helpers/ssh"
+	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
 
 func ConfigureArgoCD(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error {

@@ -1,4 +1,4 @@
-package provision
+package kubeadm
 
 import (
 	"fmt"
@@ -6,7 +6,8 @@ import (
 	"strings"
 
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1" // Add the correct import path for infrav1
-	sshhelper "dcn.ssu.ac.kr/infra/helpers/ssh"
+	"dcn.ssu.ac.kr/infra/pkg/argocd"
+	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
 
 func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (string, error) {
@@ -157,7 +158,7 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		}
 	}
 
-	if err := ConfigureArgoCD(client, cluster); err != nil {
+	if err := argocd.ConfigureArgoCD(client, cluster); err != nil {
 		return "", fmt.Errorf("ArgoCD configuration failed: %w", err)
 	}
 

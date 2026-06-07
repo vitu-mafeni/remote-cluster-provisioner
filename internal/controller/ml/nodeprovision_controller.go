@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -31,17 +32,27 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
-	awsprovision "dcn.ssu.ac.kr/infra/helpers/aws-node-provision"
-	remotenodeprovision "dcn.ssu.ac.kr/infra/helpers/remote-node-provision"
-	"dcn.ssu.ac.kr/infra/helpers/ssh"
+	awsprovision "dcn.ssu.ac.kr/infra/provider/aws"
+	remotenodeprovision "dcn.ssu.ac.kr/infra/provider/onprem"
+	"dcn.ssu.ac.kr/infra/pkg/ssh"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
+
+// onPremJobResult carries the outcome of a background on-prem provisioning run.
+type onPremJobResult struct {
+	vpnIP     string
+	publicKey string
+	err       error
+}
 
 // NodeProvisionReconciler reconciles a NodeProvision object
 type NodeProvisionReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// onPremJobs holds in-flight on-prem provisioning goroutines.
+	// Key: "<namespace>/<name>", Value: <-chan onPremJobResult
+	onPremJobs sync.Map
 }
 
 const (
@@ -92,8 +103,6 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	switch np.Status.Phase {
 	case "", mlv1alpha1.NodeProvisionPhasePending,
 		mlv1alpha1.NodeProvisionPhaseValidating,
-		mlv1alpha1.NodeProvisionPhaseCreatingInstance,
-		mlv1alpha1.NodeProvisionPhaseConfiguringVPN,
 		mlv1alpha1.NodeProvisionPhaseProvisioning:
 
 		log.Info("Request received, starting provisioning")
@@ -103,6 +112,28 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return r.reconcileProvisioning(ctx, np, secret)
 
+	case mlv1alpha1.NodeProvisionPhaseCreatingInstance,
+		mlv1alpha1.NodeProvisionPhaseConfiguringVPN:
+		// These phases are written as progress markers while a reconcile is
+		// actively creating the instance. A watch event on that write can
+		// trigger a new reconcile before the creating reconcile has persisted
+		// the InstanceID, causing the informer cache to return stale state.
+		//
+		// Never re-enter provisioning from these phases. If InstanceID has
+		// landed (cache caught up), advance to WaitingForInstance. Otherwise
+		// requeue briefly so the in-flight reconcile (or a controller restart
+		// recovery) can complete.
+		if np.Status.InstanceID != "" {
+			log.Info("InstanceID found, advancing to WaitingForInstance", "instanceId", np.Status.InstanceID)
+			now := metav1.Now()
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseWaitingForInstance
+			np.Status.LastUpdated = &now
+			_ = r.Status().Update(ctx, np)
+			return ctrl.Result{RequeueAfter: requeueShort}, nil
+		}
+		log.Info("Instance creation in progress, requeueing")
+		return ctrl.Result{RequeueAfter: requeueShort}, nil
+
 	case mlv1alpha1.NodeProvisionPhaseWaitingForInstance:
 		secret, err := r.getSecret(ctx, np)
 		if err != nil {
@@ -110,8 +141,19 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return r.reconcileWaitingForInstance(ctx, np, secret)
 
+	case mlv1alpha1.NodeProvisionPhaseBootstrapping:
+		// On-prem: poll the background SSH provisioning goroutine.
+		// AWS: cloud-init is running on the instance; just wait for the node to appear.
+		if np.Spec.Provider == mlv1alpha1.CloudProviderOnPrem {
+			secret, err := r.getSecret(ctx, np)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("getting credentials secret: %w", err)
+			}
+			return r.pollOnPremBootstrap(ctx, np, secret)
+		}
+		return r.reconcileJoining(ctx, np)
+
 	case mlv1alpha1.NodeProvisionPhaseJoining,
-		mlv1alpha1.NodeProvisionPhaseBootstrapping,
 		mlv1alpha1.NodeProvisionPhaseRegisteringNode,
 		mlv1alpha1.NodeProvisionPhaseVerifyingHealth:
 		return r.reconcileJoining(ctx, np)
@@ -490,27 +532,21 @@ func (r *NodeProvisionReconciler) reconcileWaitingForInstance(
 // On-Prem provisioning
 // ────────────────────────────────────────────────────────────────────────────
 
+// reconcileOnPremProvisioning validates SSH/VPN connectivity then starts a
+// background goroutine for the long-running SSH provisioning work.  It returns
+// immediately so the reconcile loop is not blocked.
 func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	ctx context.Context,
 	np *mlv1alpha1.NodeProvision,
 	secret *corev1.Secret,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+	key := np.Namespace + "/" + np.Name
 
-	// ── Idempotency guard ────────────────────────────────────────────────────
-	// If VpnIP is already allocated the VPN peer was registered in a prior
-	// reconcile. Skip straight to Joining so we don't re-run provisioning.
-	if np.Status.VpnIP != "" {
-		log.Info("On-prem node already provisioned, advancing to Joining", "vpnIP", np.Status.VpnIP)
-		if np.Status.Phase != mlv1alpha1.NodeProvisionPhaseJoining &&
-			np.Status.Phase != mlv1alpha1.NodeProvisionPhaseBootstrapping &&
-			np.Status.Phase != mlv1alpha1.NodeProvisionPhaseRegisteringNode {
-			now := metav1.Now()
-			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseJoining
-			np.Status.LastUpdated = &now
-			_ = r.Status().Update(ctx, np)
-		}
-		return r.reconcileJoining(ctx, np)
+	// If a goroutine is already running for this node, just requeue to poll it.
+	if _, running := r.onPremJobs.Load(key); running {
+		log.Info("On-prem bootstrap goroutine already running, requeueing")
+		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
 
 	// ── Phase: Validating ────────────────────────────────────────────────────
@@ -525,10 +561,10 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	if err != nil {
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("SSH connectivity check failed: %v", err))
 	}
-	defer sshClient.Conn.Close()
 
 	netConfig, err := r.requireNetConfig(ctx, np)
 	if err != nil {
+		sshClient.Conn.Close()
 		log.Info("No NodeProvisionNetConfig ready yet; requeueing")
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
@@ -538,58 +574,125 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseConfiguringVPN, "Configuring WireGuard VPN", 15)
 	if err := r.Status().Update(ctx, np); err != nil {
 		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
+			sshClient.Conn.Close()
 			return ctrl.Result{}, ferr
 		}
 	}
 
 	vpnServerClient, err := r.getVPNServerSSHClient(ctx, netConfig)
 	if err != nil {
+		sshClient.Conn.Close()
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("connecting to VPN server: %v", err))
 	}
-	defer vpnServerClient.Conn.Close()
 
-	// ── Phase: Bootstrapping ─────────────────────────────────────────────────
-	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseBootstrapping, "Installing packages and joining cluster", 25)
+	// ── Phase: Bootstrapping — launch background goroutine ───────────────────
+	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseBootstrapping, "Installing packages and joining cluster (background)", 25)
 	if err := r.Status().Update(ctx, np); err != nil {
 		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
+			sshClient.Conn.Close()
+			vpnServerClient.Conn.Close()
 			return ctrl.Result{}, ferr
 		}
 	}
 
-	vpnNodeIP, publicKey, err := remotenodeprovision.NewInClusterProvisioner(
-		ctx,
-		np,
-		secret,
-		sshClient,
-		vpnServerClient,
-		netConfig,
-	)
-	if err != nil {
-		return r.failNodeProvision(ctx, np, fmt.Sprintf("on-prem provisioning failed: %v", err))
-	}
-	log.Info("On-prem node bootstrapped", "vpnIP", vpnNodeIP)
+	// Snapshot values needed by the goroutine before returning.
+	npCopy := np.DeepCopy()
+	secretCopy := secret.DeepCopy()
+	netConfigCopy := netConfig.DeepCopy()
 
-	if err := r.updateNetConfigStatus(ctx, netConfig, vpnNodeIP, publicKey, np.Name); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
+	ch := make(chan onPremJobResult, 1)
+	r.onPremJobs.Store(key, (<-chan onPremJobResult)(ch))
+
+	go func() {
+		defer sshClient.Conn.Close()
+		defer vpnServerClient.Conn.Close()
+		// Do NOT delete from onPremJobs here. The map entry must remain
+		// until pollOnPremBootstrap reads the result from the channel.
+		// Deleting here creates a window where the goroutine has finished
+		// but the result hasn't been consumed yet: the next poll would see
+		// no map entry, no VpnIP in status, and falsely restart provisioning.
+
+		vpnNodeIP, publicKey, err := remotenodeprovision.NewInClusterProvisioner(
+			context.Background(),
+			npCopy,
+			secretCopy,
+			sshClient,
+			vpnServerClient,
+			netConfigCopy,
+		)
+		ch <- onPremJobResult{vpnIP: vpnNodeIP, publicKey: publicKey, err: err}
+	}()
+
+	log.Info("On-prem bootstrap goroutine started")
+	return ctrl.Result{RequeueAfter: requeueShort}, nil
+}
+
+// pollOnPremBootstrap is called when phase == Bootstrapping for an on-prem node.
+// It checks whether the background goroutine has finished and handles the result.
+func (r *NodeProvisionReconciler) pollOnPremBootstrap(
+	ctx context.Context,
+	np *mlv1alpha1.NodeProvision,
+	secret *corev1.Secret,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	key := np.Namespace + "/" + np.Name
+
+	// If VpnIP is already persisted the goroutine completed in a prior reconcile
+	// (or the controller restarted after completion). Advance to Joining.
+	if np.Status.VpnIP != "" {
+		return r.reconcileJoining(ctx, np)
 	}
 
-	// Re-fetch before writing VpnIP so ResourceVersion is current.
-	if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
-		return ctrl.Result{}, err
+	v, running := r.onPremJobs.Load(key)
+	if !running {
+		// No goroutine in memory — controller likely restarted mid-provisioning.
+		// Re-enter provisioning to restart the SSH session.
+		log.Info("No in-flight bootstrap goroutine found (possible restart), restarting provisioning")
+		return r.reconcileOnPremProvisioning(ctx, np, secret)
 	}
 
-	now := metav1.Now()
-	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseJoining
-	np.Status.Message = "Node bootstrapped; waiting for cluster registration"
-	np.Status.IPAddress = vpnNodeIP
-	np.Status.VpnIP = vpnNodeIP
-	np.Status.Progress = 60
-	np.Status.LastUpdated = &now
-	if err := r.Status().Update(ctx, np); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating NodeProvision status: %w", err)
+	ch := v.(<-chan onPremJobResult)
+	select {
+	case res := <-ch:
+		// Goroutine finished — consume the result and remove the map entry.
+		// The entry is only removed here (not in the goroutine) so there is
+		// no window between "goroutine done" and "result consumed" that would
+		// cause the next poll to falsely treat this as a controller restart.
+		r.onPremJobs.Delete(key)
+		if res.err != nil {
+			return r.failNodeProvision(ctx, np, fmt.Sprintf("on-prem provisioning failed: %v", res.err))
+		}
+		log.Info("On-prem bootstrap completed", "vpnIP", res.vpnIP)
+
+		netConfig, err := r.requireNetConfig(ctx, np)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("getting NetConfig after bootstrap: %w", err)
+		}
+		if err := r.updateNetConfigStatus(ctx, netConfig, res.vpnIP, res.publicKey, np.Name); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
+		}
+
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+			return ctrl.Result{}, err
+		}
+		now := metav1.Now()
+		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseJoining
+		np.Status.Message = "Node bootstrapped; waiting for cluster registration"
+		np.Status.IPAddress = res.vpnIP
+		np.Status.VpnIP = res.vpnIP
+		np.Status.Progress = 60
+		np.Status.LastUpdated = &now
+		if err := r.Status().Update(ctx, np); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating NodeProvision status: %w", err)
+		}
+		log.Info("On-prem node provisioned, waiting for cluster join", "vpnIP", res.vpnIP)
+		return ctrl.Result{RequeueAfter: requeueJoining}, nil
+
+	default:
+		// Still running.
+		log.Info("On-prem bootstrap in progress, requeueing")
+		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
-	log.Info("On-prem node provisioned, waiting for cluster join", "vpnIP", vpnNodeIP)
-	return ctrl.Result{RequeueAfter: requeueJoining}, nil
 }
 
 // ────────────────────────────────────────────────────────────────────────────
