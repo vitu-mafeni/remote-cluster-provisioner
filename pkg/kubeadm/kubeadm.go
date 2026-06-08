@@ -157,6 +157,9 @@ EOF`,
 		"rm -rf /tmp/remote-cluster-provisioner",
 		"git clone -b r2-1 https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
 		"kubectl apply -f /tmp/remote-cluster-provisioner/config/crd/bases/",
+
+		"kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.36/deploy/local-path-storage.yaml",
+		"kubectl patch storageclass local-path -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'",
 	}
 
 	for _, cmd := range steps {
