@@ -982,6 +982,22 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		// 		"approval.nephio.org/policy": "initial",
 		// 	},
 		// },
+
+		{
+			name: "keycloak-variant",
+			upstream: packageRef{
+				pkg:      "keycloak",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "keycloak",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
 		{
 			name: "nfs-provisioner-variant",
 			upstream: packageRef{
@@ -1040,6 +1056,39 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				"approval.nephio.org/policy": "initial",
 			},
 		},
+
+		{
+			name: "enterprise-gateway-variant",
+			upstream: packageRef{
+				pkg:      "enterprise-gateway",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "enterprise-gateway",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
+
+		{
+			name: "jupyter-hub-variant",
+			upstream: packageRef{
+				pkg:      "jupyter-hub",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "jupyter-hub",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
+
 		// Commented-out variants (re-enable as needed):
 		// minio-variant, enterprise-gateway-variant, gpu-operator-variant,
 		// harbor-variant, kai-scheduler-variant, keycloak-variant,
