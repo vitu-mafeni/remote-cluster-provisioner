@@ -178,6 +178,27 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 			return r.reconcilePackageVariants(ctx, cluster)
 		}
+		// GPU worker: join sets phase=Ready before CDI generation and image
+		// pre-pull are complete.  The reconcile that fires after the post-reboot
+		// wait lands here, so we must run those steps.
+		//
+		// We open SSH and call reconcileWorker directly rather than going through
+		// reconcileProvisioning: that function resets phase→Provisioning before
+		// calling reconcileWorker, which is unnecessary status churn for a worker
+		// that is already in Ready state and only needs GPU post-processing.
+		if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") &&
+			(cluster.Annotations[annotationCDIGenerated] != "true" ||
+				cluster.Annotations[annotationImagesPrepulled] != "true") {
+			sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+			defer cancel()
+			sshClient, err := r.getSSHClient(sshCtx, cluster)
+			if err != nil {
+				return r.fail(ctx, cluster, "SSHConnectionFailed",
+					fmt.Errorf("connecting for GPU post-processing: %w", err))
+			}
+			defer func() { _ = sshClient.Conn.Close() }()
+			return r.reconcileWorker(sshCtx, cluster, sshClient)
+		}
 		return ctrl.Result{}, nil
 	case phaseFailed:
 		return r.reconcileProvisioning(ctx, cluster)
@@ -312,7 +333,7 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 			return ctrl.Result{}, fmt.Errorf("updating status to Ready: %w", err)
 		}
 
-		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, sshClient, cluster.Spec.VPNConfig.IP, "create"); err != nil {
+		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, cluster, sshClient, cluster.Spec.VPNConfig.IP, "create"); err != nil {
 			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed",
 				fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
 		}
@@ -432,7 +453,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		}
 		log.Info("Worker node joined to cluster")
 
-		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, sshClientCP, nodeIP, "update"); err != nil {
+		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, clusterParent, sshClientCP, nodeIP, "update"); err != nil {
 			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed", fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
 		}
 
@@ -457,12 +478,13 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 
 			log.Info("NVIDIA drivers installed; rebooting node — will reconnect after postRebootWait",
 				"wait", postRebootWait)
-			// Reboot is best-effort; the SSH connection drops before the response arrives.
-			if _, err := ssh.Run(sshClient, "sudo reboot"); err != nil {
-				log.Info("Reboot command returned an error (expected — connection closes on reboot)", "err", err)
-			}
-			// Requeue after the reboot window so the controller reconnects to the
-			// freshly booted node and continues with CDI generation + image prepull.
+			// Fire the reboot in a goroutine so we do NOT block waiting for the
+			// SSH session to drop.  A synchronous ssh.Run("sudo reboot") hangs for
+			// several minutes until TCP times out — postRebootWait would only start
+			// counting after that hang, making the total dead time far too long.
+			// The command is already on the wire; closing the connection after we
+			// return is harmless — the kernel will execute the reboot regardless.
+			go func() { _, _ = ssh.Run(sshClient, "sudo reboot") }()
 			return ctrl.Result{RequeueAfter: postRebootWait}, nil
 		}
 
@@ -490,7 +512,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		// Large GPU images (PyTorch, TensorFlow, etc.) are pulled in a background
 		// goroutine so the reconcile loop is not blocked for the download duration.
 		if cluster.Annotations[annotationImagesPrepulled] != "true" {
-			return r.reconcileImagePrepull(ctx, cluster)
+			return r.reconcileImagePrepull(ctx, cluster, clusterParent)
 		}
 	}
 
@@ -511,18 +533,43 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 func (r *RemoteClusterReconciler) reconcileImagePrepull(
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
+	parentCluster *infrav1.RemoteCluster,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	key := cluster.Namespace + "/" + cluster.Name
-	images := cluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls
+	images := parentCluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls
 
 	// Nothing to pull — mark done immediately.
 	if len(images) == 0 {
+		log.Info("No images configured for pre-pull — skipping (add images to spec.nodeInfo.softwareConfig.imagePrepulls to enable)")
 		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
 			return ctrl.Result{}, err
 		}
 		ensureAnnotations(cluster)[annotationImagesPrepulled] = "true"
 		return ctrl.Result{}, r.Update(ctx, cluster)
+	}
+
+	// Resolve registry credentials if a pull secret is referenced.
+	// The secret must have "username" and "password" keys; the credentials are
+	// passed to `crictl pull --creds user:pass` for private registries.
+	var pullCreds string
+	if ref := parentCluster.Spec.NodeInfo.SoftwareConfig.ImagePullSecretRef; ref != nil {
+		credSecret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      ref.Name,
+			Namespace: cluster.Namespace,
+		}, credSecret); err != nil {
+			return r.fail(ctx, cluster, "ImagePullSecretNotFound",
+				fmt.Errorf("fetching image pull secret %q: %w", ref.Name, err))
+		}
+		username := strings.TrimSpace(string(credSecret.Data["username"]))
+		password := strings.TrimSpace(string(credSecret.Data["password"]))
+		if username == "" || password == "" {
+			return r.fail(ctx, cluster, "ImagePullSecretInvalid",
+				fmt.Errorf("image pull secret %q must have non-empty \"username\" and \"password\" keys", ref.Name))
+		}
+		pullCreds = username + ":" + password
+		log.Info("Using registry credentials for image pre-pull", "secret", ref.Name, "user", username)
 	}
 
 	v, running := r.prepullJobs.Load(key)
@@ -536,10 +583,11 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 				fmt.Errorf("opening SSH connection for image pre-pull: %w", err))
 		}
 
-		// Capture the logger and image list before returning from this goroutine.
+		// Capture the logger, image list, and credentials before spawning.
 		glog := log.WithValues("cluster", cluster.Name)
 		imagesCopy := make([]string, len(images))
 		copy(imagesCopy, images)
+		credsCopy := pullCreds // immutable string — safe to close over
 
 		ch := make(chan prepullJobResult, 1)
 		// Store as receive-only so the poll branch cannot accidentally send.
@@ -552,12 +600,39 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 			// before the next poll consumes the channel result, causing the poll to
 			// see no running job and restart unnecessarily.  Only the consumer
 			// (the poll branch below) deletes the entry.
+
+			// When no explicit credentials are configured, clear any stale registry
+			// auth files that may exist on the node (e.g. from a previous docker login
+			// or a cloud image that ships with credentials baked in).  If those stale
+			// entries are for the same registry as a public image, the runtime sends
+			// them automatically and Docker Hub / other registries reject them with
+			// 401 even though the image is public.  Removing the files is safe: crictl
+			// will simply perform an anonymous pull.
+			if credsCopy == "" {
+				authFiles := []string{
+					"/root/.docker/config.json",
+					"/run/containers/0/auth.json",
+					"/etc/containers/auth.json",
+				}
+				for _, f := range authFiles {
+					// Ignore errors — the file may not exist.
+					_, _ = ssh.Run(sshClient, fmt.Sprintf("sudo rm -f %s", f))
+				}
+				glog.Info("Cleared any stale registry auth files before anonymous pull")
+			}
+
 			for _, img := range imagesCopy {
 				img = strings.TrimSpace(img)
 				if img == "" {
 					continue
 				}
-				output, pullErr := ssh.Run(sshClient, fmt.Sprintf("sudo crictl pull %s", img))
+				var cmd string
+				if credsCopy != "" {
+					cmd = fmt.Sprintf("sudo crictl pull --creds %s %s", credsCopy, img)
+				} else {
+					cmd = fmt.Sprintf("sudo crictl pull %s", img)
+				}
+				output, pullErr := ssh.Run(sshClient, cmd)
 				if pullErr != nil {
 					ch <- prepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
 					return
@@ -567,7 +642,7 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 			ch <- prepullJobResult{err: nil}
 		}()
 
-		log.Info("Image pre-pull goroutine started", "images", len(imagesCopy))
+		log.Info("Image pre-pull goroutine started", "images", len(imagesCopy), "authenticated", pullCreds != "")
 		return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
 	}
 
@@ -601,6 +676,7 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig(
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
+	clusterParent *infrav1.RemoteCluster,
 	sshClient *ssh.Client,
 	nodeIP,
 	action string,
@@ -693,13 +769,16 @@ data:
 			log.Info("Ensured VPN SSH credentials secret on remote cluster", "secret", vpnSecret.Name)
 		}
 
-		// Build the imagePrepulls YAML block (indented to match softwareConfig children).
+		// Build optional softwareConfig fields (indented to match sibling keys).
 		var imagePrepullsYAML string
-		if len(cluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls) > 0 {
+		if len(clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePrepulls) > 0 {
 			imagePrepullsYAML = "    imagePrepulls:\n"
-			for _, img := range cluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls {
+			for _, img := range clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePrepulls {
 				imagePrepullsYAML += fmt.Sprintf("    - \"%s\"\n", img)
 			}
+		}
+		if ref := clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePullSecretRef; ref != nil {
+			imagePrepullsYAML += fmt.Sprintf("    imagePullSecretRef:\n      name: \"%s\"\n", ref.Name)
 		}
 
 		netConfigYAML := fmt.Sprintf(`
@@ -725,10 +804,10 @@ spec:
 			cluster.Spec.ClusterName,
 			cluster.Namespace,
 			cluster.Spec.ClusterName,
-			cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion,
-			cluster.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion,
-			cluster.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion,
-			cluster.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion,
+			clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion,
+			clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion,
+			clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion,
+			clusterParent.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion,
 			imagePrepullsYAML,
 			vpnCIDR,
 			cluster.Spec.VPNConfig.VPNServerPublicIP,

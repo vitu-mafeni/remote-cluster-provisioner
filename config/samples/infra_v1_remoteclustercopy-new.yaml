@@ -36,8 +36,10 @@ spec:
       k8sDevicePluginVersion: "v0.17.1"
       kubernetesVersion: "v1.34.2"
       imagePrepulls:
-        - "vitu1/kernel-tf-gpu:3.2.3-cu121"
-        - "vitu1/kernel-tf-gpu:3.2.3-cu121"
+        - "docker.io/vitu1/kernel-pytorch-gpu:3.2.3-cu121"
+        - "docker.io/vitu1/kernel-tf-gpu:3.2.3-cu121"
+      imagePullSecretRef:
+        name: dockerhub-creds
 
   # VPN configuration
   vpnConfig:
@@ -104,5 +106,16 @@ type: Opaque
 stringData:
   id_rsa: |
     -----BEGIN RSA PRIVATE KEY-----
-    CHANGE ME
+    CHANGE 
     -----END RSA PRIVATE KEY-----
+
+# Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dockerhub-creds
+  namespace: default
+type: Opaque
+stringData:
+  username: vitu1
+  password: KEY
