@@ -50,7 +50,6 @@ spec:
                       name:
                         type: string
                     required:
-                    - key
                     - name
                     type: object
                   sshPrivateKeySecretRef:
@@ -63,7 +62,6 @@ spec:
                       name:
                         type: string
                     required:
-                    - key
                     - name
                     type: object
                 type: object
@@ -117,7 +115,6 @@ spec:
                           name:
                             type: string
                         required:
-                        - key
                         - name
                         type: object
                       k8sDevicePluginVersion:
