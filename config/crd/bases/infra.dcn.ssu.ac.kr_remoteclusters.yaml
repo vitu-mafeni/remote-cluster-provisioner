@@ -106,6 +106,20 @@ spec:
                         items:
                           type: string
                         type: array
+                      imagePullSecretRef:
+                        description: |-
+                          ImagePullSecretRef optionally references a Secret containing registry
+                          credentials used when pre-pulling private images listed in ImagePrepulls.
+                          The Secret must have "username" and "password" keys.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
                       k8sDevicePluginVersion:
                         type: string
                       kubernetesVersion:

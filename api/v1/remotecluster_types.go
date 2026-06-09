@@ -67,6 +67,12 @@ type SoftwareConfig struct {
 	K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
 	KubernetesVersion             string   `json:"kubernetesVersion,omitempty"` // e.g., "v1.34.2"
 	ImagePrepulls                 []string `json:"imagePrepulls,omitempty"`     // list of container images to be prepulled on the node, e.g., ["nginx:latest", "redis:6.2"]
+
+	// ImagePullSecretRef optionally references a Secret containing registry
+	// credentials used when pre-pulling private images listed in ImagePrepulls.
+	// The Secret must have "username" and "password" keys.
+	// +optional
+	ImagePullSecretRef *SecretKeyReference `json:"imagePullSecretRef,omitempty"`
 }
 
 type GitConfig struct {

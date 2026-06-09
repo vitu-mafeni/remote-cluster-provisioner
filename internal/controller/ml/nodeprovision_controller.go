@@ -894,6 +894,29 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 			return ctrl.Result{}, r.Status().Update(ctx, np)
 		}
 
+		// Resolve registry credentials before spawning the goroutine.
+		// The controller has API access; the goroutine only has SSH.
+		var pullCreds string
+		if ref := netConfig.Spec.SoftwareConfig.ImagePullSecretRef; ref != nil {
+			credSecret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      ref.Name,
+				Namespace: np.Namespace,
+			}, credSecret); err != nil {
+				return r.failNodeProvision(ctx, np,
+					fmt.Sprintf("fetching image pull secret %q: %v", ref.Name, err))
+			}
+			username := strings.TrimSpace(string(credSecret.Data["username"]))
+			password := strings.TrimSpace(string(credSecret.Data["password"]))
+			if username == "" || password == "" {
+				return r.failNodeProvision(ctx, np,
+					fmt.Sprintf("image pull secret %q must have non-empty \"username\" and \"password\" keys", ref.Name))
+			}
+			pullCreds = username + ":" + password
+			log.Info("Using registry credentials for image pre-pull",
+				"secret", ref.Name, "user", username)
+		}
+
 		// Open a dedicated SSH connection for the goroutine.  After the node
 		// has joined the cluster the most reliable address is its VPN IP since
 		// the controller is also in-cluster on the same VPN mesh.
@@ -905,6 +928,7 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 
 		imagesCopy := make([]string, len(images))
 		copy(imagesCopy, images)
+		credsCopy := pullCreds // immutable string — safe to close over
 		glog := log.WithValues("node", np.Status.NodeName)
 
 		ch := make(chan npPrepullJobResult, 1)
@@ -912,12 +936,33 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 
 		go func() {
 			defer sshClient.Conn.Close()
+			// Clear stale registry auth files when no explicit credentials are
+			// configured.  Stale docker.io entries cause 401 errors even for
+			// public images because the runtime always sends stored credentials.
+			if credsCopy == "" {
+				authFiles := []string{
+					"/root/.docker/config.json",
+					"/run/containers/0/auth.json",
+					"/etc/containers/auth.json",
+				}
+				for _, f := range authFiles {
+					_, _ = ssh.Run(sshClient, fmt.Sprintf("sudo rm -f %s", f))
+				}
+				glog.Info("Cleared any stale registry auth files before anonymous pull")
+			}
+
 			for _, img := range imagesCopy {
 				img = strings.TrimSpace(img)
 				if img == "" {
 					continue
 				}
-				output, pullErr := ssh.Run(sshClient, fmt.Sprintf("sudo crictl pull %s", img))
+				var cmd string
+				if credsCopy != "" {
+					cmd = fmt.Sprintf("sudo crictl pull --creds %s %s", credsCopy, img)
+				} else {
+					cmd = fmt.Sprintf("sudo crictl pull %s", img)
+				}
+				output, pullErr := ssh.Run(sshClient, cmd)
 				if pullErr != nil {
 					ch <- npPrepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
 					return
@@ -928,7 +973,8 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 		}()
 
 		log.Info("GPU image pre-pull goroutine started",
-			"node", np.Status.NodeName, "images", len(imagesCopy))
+			"node", np.Status.NodeName, "images", len(imagesCopy),
+			"authenticated", pullCreds != "")
 		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 	}
 
