@@ -46,6 +46,11 @@ type onPremJobResult struct {
 	err       error
 }
 
+// npPrepullJobResult carries the outcome of a background image pre-pull run.
+type npPrepullJobResult struct {
+	err error
+}
+
 // NodeProvisionReconciler reconciles a NodeProvision object
 type NodeProvisionReconciler struct {
 	client.Client
@@ -53,6 +58,9 @@ type NodeProvisionReconciler struct {
 	// onPremJobs holds in-flight on-prem provisioning goroutines.
 	// Key: "<namespace>/<name>", Value: <-chan onPremJobResult
 	onPremJobs sync.Map
+	// npPrepullJobs holds in-flight GPU image pre-pull goroutines.
+	// Key: "<namespace>/<name>", Value: <-chan npPrepullJobResult
+	npPrepullJobs sync.Map
 }
 
 const (
@@ -86,6 +94,8 @@ const (
 	requeueJoining = 15 * time.Second
 	// requeueFailed is used to allow manual remediation before retrying.
 	requeueFailed = time.Minute
+	// npPrepullPollInterval is the requeue interval while GPU images are pre-pulling.
+	npPrepullPollInterval = 30 * time.Second
 )
 
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions,verbs=get;list;watch;create;update;patch;delete
@@ -191,6 +201,9 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		mlv1alpha1.NodeProvisionPhaseRegisteringNode,
 		mlv1alpha1.NodeProvisionPhaseVerifyingHealth:
 		return r.reconcileJoining(ctx, np)
+
+	case mlv1alpha1.NodeProvisionPhasePrePullingImages:
+		return r.reconcileNPImagePrepull(ctx, np)
 
 	case mlv1alpha1.NodeProvisionPhaseReady:
 		log.Info("NodeProvision is ready, no action needed")
@@ -806,16 +819,175 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 
 	now := metav1.Now()
 	np.Status.NodeName = found.Name
+	np.Status.LastUpdated = &now
+
+	// GPU nodes with images to pre-pull get an intermediate phase so the
+	// background goroutine can run without blocking further reconciles.
+	// Image list comes from NodeProvisionNetConfig.Spec.SoftwareConfig.ImagePrepulls.
+	if strings.Contains(np.Spec.NodeLabel, "gpu") {
+		netConfig, err := r.requireNetConfig(ctx, np)
+		if err == nil && len(netConfig.Spec.SoftwareConfig.ImagePrepulls) > 0 {
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhasePrePullingImages
+			np.Status.Message = "Node joined; pre-pulling GPU images in background"
+			np.Status.Progress = 90
+			if err := r.Status().Update(ctx, np); err != nil {
+				return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to PrePullingImages: %w", err)
+			}
+			log.Info("GPU node joined — starting image pre-pull",
+				"node", found.Name, "images", len(netConfig.Spec.SoftwareConfig.ImagePrepulls))
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
 	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
 	np.Status.Message = "Node successfully joined cluster"
 	np.Status.Progress = 100
 	np.Status.CompletionTime = &now
-	np.Status.LastUpdated = &now
 	if err := r.Status().Update(ctx, np); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to Ready: %w", err)
 	}
 	log.Info("Node reached Ready state", "node", found.Name)
 	return ctrl.Result{}, nil
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// reconcileNPImagePrepull – background GPU image pre-pull for NodeProvision
+// ────────────────────────────────────────────────────────────────────────────
+
+// reconcileNPImagePrepull manages the background goroutine that pre-pulls GPU
+// images on the node via crictl.  It follows the same pattern as
+// reconcileOnPremProvisioning / pollOnPremBootstrap:
+//
+//   - First call: opens a dedicated SSH connection, spawns the goroutine,
+//     stores a receive-only result channel in npPrepullJobs, returns RequeueAfter.
+//   - Subsequent calls: non-blocking poll of the channel; if done, stamp Ready;
+//     if still running, requeue again.
+//
+// Only the poll branch deletes from npPrepullJobs — not the goroutine — to
+// avoid the TOCTOU race described in reconcileOnPremProvisioning.
+func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
+	ctx context.Context,
+	np *mlv1alpha1.NodeProvision,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	key := np.Namespace + "/" + np.Name
+
+	v, running := r.npPrepullJobs.Load(key)
+	if !running {
+		// Fetch the image list from NodeProvisionNetConfig.
+		netConfig, err := r.requireNetConfig(ctx, np)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+		}
+		images := netConfig.Spec.SoftwareConfig.ImagePrepulls
+		if len(images) == 0 {
+			// Nothing to pull — go straight to Ready.
+			if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+				return ctrl.Result{}, err
+			}
+			now := metav1.Now()
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
+			np.Status.Message = "Node successfully joined cluster"
+			np.Status.Progress = 100
+			np.Status.CompletionTime = &now
+			np.Status.LastUpdated = &now
+			return ctrl.Result{}, r.Status().Update(ctx, np)
+		}
+
+		// Open a dedicated SSH connection for the goroutine.  After the node
+		// has joined the cluster the most reliable address is its VPN IP since
+		// the controller is also in-cluster on the same VPN mesh.
+		sshClient, err := r.getSSHClientPostJoin(ctx, np)
+		if err != nil {
+			return r.failNodeProvision(ctx, np,
+				fmt.Sprintf("opening SSH connection for image pre-pull: %v", err))
+		}
+
+		imagesCopy := make([]string, len(images))
+		copy(imagesCopy, images)
+		glog := log.WithValues("node", np.Status.NodeName)
+
+		ch := make(chan npPrepullJobResult, 1)
+		r.npPrepullJobs.Store(key, (<-chan npPrepullJobResult)(ch))
+
+		go func() {
+			defer sshClient.Conn.Close()
+			for _, img := range imagesCopy {
+				img = strings.TrimSpace(img)
+				if img == "" {
+					continue
+				}
+				output, pullErr := ssh.Run(sshClient, fmt.Sprintf("sudo crictl pull %s", img))
+				if pullErr != nil {
+					ch <- npPrepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
+					return
+				}
+				glog.Info("Pre-pulled image", "image", img)
+			}
+			ch <- npPrepullJobResult{err: nil}
+		}()
+
+		log.Info("GPU image pre-pull goroutine started",
+			"node", np.Status.NodeName, "images", len(imagesCopy))
+		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+	}
+
+	// Poll the result channel (non-blocking).
+	ch := v.(<-chan npPrepullJobResult)
+	select {
+	case res := <-ch:
+		r.npPrepullJobs.Delete(key)
+		if res.err != nil {
+			return r.failNodeProvision(ctx, np,
+				fmt.Sprintf("image pre-pull failed: %v", res.err))
+		}
+		log.Info("All GPU images pre-pulled successfully", "node", np.Status.NodeName)
+
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+			return ctrl.Result{}, fmt.Errorf("refreshing NodeProvision after pre-pull: %w", err)
+		}
+		now := metav1.Now()
+		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
+		np.Status.Message = "Node successfully joined cluster"
+		np.Status.Progress = 100
+		np.Status.CompletionTime = &now
+		np.Status.LastUpdated = &now
+		if err := r.Status().Update(ctx, np); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to Ready: %w", err)
+		}
+		return ctrl.Result{}, nil
+
+	default:
+		log.Info("GPU image pre-pull in progress, requeueing")
+		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+	}
+}
+
+// getSSHClientPostJoin opens an SSH connection to the node using its VPN IP
+// (np.Status.VpnIP), which is reachable from the controller once the node has
+// joined the cluster.  Falls back to the spec IP/hostname if VPN IP is empty.
+func (r *NodeProvisionReconciler) getSSHClientPostJoin(ctx context.Context, np *mlv1alpha1.NodeProvision) (*ssh.Client, error) {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      np.Spec.CredentialsRef.Name,
+		Namespace: np.Namespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("fetching SSH credential secret %q: %w", np.Spec.CredentialsRef.Name, err)
+	}
+
+	credBytes, err := resolveSecretKey(secret, np.Spec.CredentialsRef.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	host := np.Status.VpnIP
+	if host == "" {
+		host = np.Spec.IPAddress
+	}
+	if host == "" {
+		host = np.Spec.Hostname
+	}
+	return dialSSH(host, np.Spec.SSHPort, np.Spec.SSHUsernameOverride, string(credBytes))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
