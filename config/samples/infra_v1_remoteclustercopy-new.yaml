@@ -26,7 +26,6 @@ spec:
 
     # cpu or gpu
     hardwareType: "cpu"
-
     softwareConfig:
       # GPU-related fields are optional.
       # Only required when hardwareType=gpu
