@@ -1105,7 +1105,62 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 
 	// No active variants; pending re-enablement:
 	// platform-overlays-variant, post-install-config-variant
-	return r.upsertPackageVariants(ctx, cluster, nil)
+	variantsOverlays := []packageVariantSpec{
+		// {
+		// 	name: "k8s-dra-driver-gpu-variant",
+		// 	upstream: packageRef{
+		// 		pkg:      "k8s-dra-driver-gpu",
+		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+		// 		revision: cluster.Spec.GitConfig.PackageRevision,
+		// 	},
+		// 	downstream: packageRef{
+		// 		pkg:  "k8s-dra-driver-gpu",
+		// 		repo: cluster.Spec.ClusterName,
+		// 	},
+		// 	annotations: map[string]interface{}{
+		// 		"approval.nephio.org/policy": "initial",
+		// 	},
+		// },
+		// {
+		// 	name: "gpu-operator-variant",
+		// 	upstream: packageRef{
+		// 		pkg:      "gpu-operator",
+		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+		// 		revision: cluster.Spec.GitConfig.PackageRevision,
+		// 	},
+		// 	downstream: packageRef{
+		// 		pkg:  "gpu-operator",
+		// 		repo: cluster.Spec.ClusterName,
+		// 	},
+		// 	annotations: map[string]interface{}{
+		// 		"approval.nephio.org/policy": "initial",
+		// 	},
+		// },
+
+		{
+			name: "services-overlays-variant",
+			upstream: packageRef{
+				pkg:      "services-overlays",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "services-overlays",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
+
+		// Commented-out variants (re-enable as needed):
+		// minio-variant, enterprise-gateway-variant, gpu-operator-variant,
+		// harbor-variant, kai-scheduler-variant, keycloak-variant,
+		// kubeflow-variant, kueue-variant, kyverno-variant, prometheus-stack-variant,
+		// ml-platform-admin
+	}
+
+	return r.upsertPackageVariants(ctx, cluster, variantsOverlays)
 }
 
 // upsertPackageVariants creates or updates each PackageVariant in the default namespace.
