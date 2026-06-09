@@ -97,7 +97,8 @@ type RemoteClusterAuth struct {
 
 type SecretKeyReference struct {
 	Name string `json:"name"`
-	Key  string `json:"key"`
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 // RemoteClusterStatus defines the observed state of RemoteCluster.
