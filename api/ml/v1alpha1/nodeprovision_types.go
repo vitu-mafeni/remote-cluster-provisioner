@@ -37,6 +37,7 @@ const (
 	NodeProvisionPhaseReady              NodeProvisionPhase = "Ready"
 	NodeProvisionPhaseFailed             NodeProvisionPhase = "Failed"
 	NodeProvisionPhaseDeleting           NodeProvisionPhase = "Deleting"
+	NodeProvisionPhasePrePullingImages   NodeProvisionPhase = "PrePullingImages"
 
 	CloudProviderAWS    CloudProvider = "AWS"
 	CloudProviderGCP    CloudProvider = "GCP"

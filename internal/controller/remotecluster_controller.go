@@ -18,12 +18,14 @@ package controller
 
 import (
 	"context"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,6 +37,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -47,10 +50,32 @@ import (
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
 
+//go:embed assets/ml.dcn.ssu.ac.kr_nodeprovisionnetconfigs.yaml
+var nodeprovisionnetconfigCRD string
+
+// prepullJobResult carries the outcome of a background image pre-pull goroutine.
+type prepullJobResult struct {
+	err error
+}
+
+// controlPlaneJobResult carries the outcome of a background control-plane init goroutine.
+type controlPlaneJobResult struct {
+	joinCommand string
+	err         error
+}
+
 // RemoteClusterReconciler reconciles a RemoteCluster object.
 type RemoteClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// prepullJobs holds in-flight image pre-pull goroutines.
+	// Key: "namespace/name", Value: <-chan prepullJobResult
+	prepullJobs sync.Map
+
+	// controlPlaneJobs holds in-flight control-plane init goroutines.
+	// Key: "namespace/name", Value: <-chan controlPlaneJobResult
+	controlPlaneJobs sync.Map
 }
 
 const (
@@ -66,6 +91,9 @@ const (
 	annotationNvidiaInstalled = "infra.dcn.ssu.ac.kr/nvidia-installed"
 	// annotationCDIGenerated marks that the CDI spec has been generated after the post-driver reboot.
 	annotationCDIGenerated = "infra.dcn.ssu.ac.kr/nvidia-cdi-generated"
+	// annotationImagesPrepulled marks that all images in spec.nodeInfo.softwareConfig.imagePrepulls
+	// have been successfully pulled on the worker node.
+	annotationImagesPrepulled = "infra.dcn.ssu.ac.kr/images-prepulled"
 
 	phaseProvisioning = "Provisioning"
 	phaseReady        = "Ready"
@@ -81,6 +109,20 @@ const (
 
 	// sshOperationTimeout caps total time spent on SSH-heavy provisioning steps.
 	sshOperationTimeout = 30 * time.Minute
+
+	// postRebootWait is how long to wait after issuing a reboot before attempting
+	// to SSH back into the node.  Kernel + driver initialisation typically takes
+	// 60–90 s; 3 minutes gives comfortable headroom.
+	postRebootWait = 3 * time.Minute
+
+	// prepullPollInterval is how often the controller checks whether the
+	// background image pre-pull goroutine has finished.
+	prepullPollInterval = 30 * time.Second
+
+	// controlPlanePollInterval is how often the controller polls the background
+	// control-plane init goroutine.  kubeadm init + CNI setup typically takes
+	// 5-15 minutes, so 30 s gives reasonable responsiveness without hammering.
+	controlPlanePollInterval = 30 * time.Second
 )
 
 // packageVariantGVK is the GVK for Porch PackageVariant resources.
@@ -156,66 +198,133 @@ func (r *RemoteClusterReconciler) reconcileProvisioning(ctx context.Context, clu
 		log.Error(err, "Failed to update status to Provisioning — continuing")
 	}
 
-	// Cap total time for SSH-heavy operations so the reconcile loop doesn't hang indefinitely.
-	sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
-	defer cancel()
-
-	sshClient, err := r.getSSHClient(sshCtx, cluster)
-	if err != nil {
-		return r.fail(ctx, cluster, "SSHConnectionFailed", fmt.Errorf("connecting via SSH to %s: %w", cluster.Spec.Host, err))
-	}
-	defer func() { _ = sshClient.Conn.Close() }()
-
 	switch cluster.Spec.NodeInfo.NodeType {
 	case "control-plane":
-		return r.reconcileControlPlane(sshCtx, cluster, sshClient)
+		// Control-plane init is long-running SSH work (kubeadm init, CNI, etc.).
+		// reconcileControlPlane manages its own SSH connection inside a background
+		// goroutine so this reconcile call returns immediately.
+		return r.reconcileControlPlane(ctx, cluster)
 	case "worker":
+		// Worker provisioning also does long-running SSH work; open a connection
+		// here with a timeout and pass it down.
+		sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+		defer cancel()
+
+		sshClient, err := r.getSSHClient(sshCtx, cluster)
+		if err != nil {
+			return r.fail(ctx, cluster, "SSHConnectionFailed", fmt.Errorf("connecting via SSH to %s: %w", cluster.Spec.Host, err))
+		}
+		defer func() { _ = sshClient.Conn.Close() }()
+
 		return r.reconcileWorker(sshCtx, cluster, sshClient)
 	default:
 		return r.fail(ctx, cluster, "UnknownNodeType", fmt.Errorf("unknown nodeType %q", cluster.Spec.NodeInfo.NodeType))
 	}
 }
 
+// reconcileControlPlane manages background control-plane initialisation.
+//
+// kubeadm init + CNI setup is long-running SSH work (5–15 min).  Running it
+// synchronously inside Reconcile would hold the single reconcile worker for
+// the entire duration, blocking every other RemoteCluster resource.
+//
+// Instead this follows the same goroutine-per-resource pattern as
+// reconcileOnPremProvisioning:
+//
+//   - If JoinCommand is already persisted the init already finished; skip
+//     straight to PackageVariant creation.
+//   - If no goroutine is in-flight: open a dedicated SSH connection, spawn
+//     the goroutine, return RequeueAfter so the reconcile loop is free.
+//   - If a goroutine is in-flight: non-blocking poll; requeue until done.
+//
+// The caller (reconcileProvisioning) must NOT pass an sshClient — the
+// goroutine opens and owns its own connection.
 func (r *RemoteClusterReconciler) reconcileControlPlane(
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
-	sshClient *ssh.Client,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx).WithValues("cluster", cluster.Name, "clusterName", cluster.Spec.ClusterName)
 
-	if cluster.Status.JoinCommand == "" {
-		log.Info("Initializing control plane via kubeadm")
+	// Already done — nothing to init, move on.
+	if cluster.Status.JoinCommand != "" {
+		log.Info("Control plane already initialised; skipping kubeadm init")
+		return ctrl.Result{RequeueAfter: repoReadyWait}, nil
+	}
 
-		joinCommand, err := kubeadm.InitializeControlPlane(sshClient, cluster)
+	key := cluster.Namespace + "/" + cluster.Name
+
+	v, running := r.controlPlaneJobs.Load(key)
+	if !running {
+		// Spawn a fresh goroutine.  Open a dedicated SSH connection that the
+		// goroutine owns for its entire lifetime.
+		sshClient, err := r.getSSHClient(ctx, cluster)
 		if err != nil {
-			return r.fail(ctx, cluster, "ControlPlaneInitFailed", fmt.Errorf("initializing control plane: %w", err))
+			return r.fail(ctx, cluster, "SSHConnectionFailed",
+				fmt.Errorf("connecting via SSH to %s: %w", cluster.Spec.Host, err))
 		}
 
+		clusterCopy := cluster.DeepCopy()
+
+		ch := make(chan controlPlaneJobResult, 1)
+		r.controlPlaneJobs.Store(key, (<-chan controlPlaneJobResult)(ch))
+
+		go func() {
+			defer sshClient.Conn.Close()
+			joinCommand, err := kubeadm.InitializeControlPlane(sshClient, clusterCopy)
+			ch <- controlPlaneJobResult{joinCommand: joinCommand, err: err}
+		}()
+
+		log.Info("Control plane init goroutine started")
+		return ctrl.Result{RequeueAfter: controlPlanePollInterval}, nil
+	}
+
+	// Poll the result channel (non-blocking).
+	ch := v.(<-chan controlPlaneJobResult)
+	select {
+	case res := <-ch:
+		r.controlPlaneJobs.Delete(key)
+		if res.err != nil {
+			return r.fail(ctx, cluster, "ControlPlaneInitFailed",
+				fmt.Errorf("initializing control plane: %w", res.err))
+		}
+		log.Info("Control plane init completed", "joinCommand", res.joinCommand != "")
+
+		// Open a short-lived SSH connection for post-init steps (repo creation,
+		// NodeProvisionNetConfig).  These are quick compared to init itself.
+		sshClient, err := r.getSSHClient(ctx, cluster)
+		if err != nil {
+			return r.fail(ctx, cluster, "SSHConnectionFailed",
+				fmt.Errorf("post-init SSH connection to %s: %w", cluster.Spec.Host, err))
+		}
+		defer sshClient.Conn.Close()
+
 		if err := r.createClusterRepo(ctx, cluster); err != nil {
-			return r.fail(ctx, cluster, "ClusterRepoFailed", fmt.Errorf("creating cluster repo: %w", err))
+			return r.fail(ctx, cluster, "ClusterRepoFailed",
+				fmt.Errorf("creating cluster repo: %w", err))
 		}
 
 		// Refresh to avoid resource-version conflicts before the status write.
 		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("refreshing cluster before status update: %w", err)
 		}
-		cluster.Status.JoinCommand = joinCommand
+		cluster.Status.JoinCommand = res.joinCommand
 		if err := r.setStatus(ctx, cluster, phaseReady, "Provisioned", "Cluster provisioned successfully", false); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating status to Ready: %w", err)
 		}
 
 		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, sshClient, cluster.Spec.VPNConfig.IP, "create"); err != nil {
-			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed", fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
+			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed",
+				fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
 		}
 
 		log.Info("Control plane provisioned; waiting for cluster repo before creating PackageVariants",
 			"requeueAfter", repoReadyWait)
-	} else {
-		log.Info("Control plane already initialised; skipping kubeadm init")
+		return ctrl.Result{RequeueAfter: repoReadyWait}, nil
 
+	default:
+		log.Info("Control plane init in progress, requeueing")
+		return ctrl.Result{RequeueAfter: controlPlanePollInterval}, nil
 	}
-
-	return ctrl.Result{RequeueAfter: repoReadyWait}, nil
 }
 
 func VPNRangeToCIDR(s string) string {
@@ -264,12 +373,12 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	sshClient *ssh.Client,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx).WithValues("cluster", cluster.Name, "clusterName", cluster.Spec.ClusterName)
-
+	clusterParent, err := r.findControlPlane(ctx, cluster)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing RemoteClusters: %w", err)
+	}
 	if cluster.Annotations[annotationWorkerJoined] != "true" {
-		clusterParent, err := r.findControlPlane(ctx, cluster)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("listing RemoteClusters: %w", err)
-		}
+
 		if clusterParent == nil {
 			log.Info("Control-plane not found yet; requeueing")
 			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
@@ -296,6 +405,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			sshClientCP,
 			cluster,
 			clusterParent.Status.JoinCommand,
+			clusterParent,
 		)
 		if err != nil {
 			return r.fail(
@@ -330,54 +440,162 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		log.Info("Worker already joined; skipping join step")
 	}
 
-	if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
-		log.Info("Skipping NVIDIA driver install — node is not a GPU node")
-		return ctrl.Result{}, nil
-	}
+	// ── GPU: driver installation → reboot → CDI generation ──────────────────
+	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+		if cluster.Annotations[annotationNvidiaInstalled] != "true" {
+			if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster, clusterParent); err != nil {
+				return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
+			}
 
-	if cluster.Annotations[annotationNvidiaInstalled] != "true" {
-		if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster); err != nil {
-			return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
+			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking NVIDIA installed: %w", err)
+			}
+			ensureAnnotations(cluster)[annotationNvidiaInstalled] = "true"
+			if err := r.Update(ctx, cluster); err != nil {
+				return ctrl.Result{}, fmt.Errorf("marking NVIDIA as installed: %w", err)
+			}
+
+			log.Info("NVIDIA drivers installed; rebooting node — will reconnect after postRebootWait",
+				"wait", postRebootWait)
+			// Reboot is best-effort; the SSH connection drops before the response arrives.
+			if _, err := ssh.Run(sshClient, "sudo reboot"); err != nil {
+				log.Info("Reboot command returned an error (expected — connection closes on reboot)", "err", err)
+			}
+			// Requeue after the reboot window so the controller reconnects to the
+			// freshly booted node and continues with CDI generation + image prepull.
+			return ctrl.Result{RequeueAfter: postRebootWait}, nil
 		}
 
-		// Refresh and stamp the nvidia annotation before rebooting.
-		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking NVIDIA installed: %w", err)
+		if cluster.Annotations[annotationCDIGenerated] != "true" {
+			// Drivers are installed and the node has rebooted — the kernel module
+			// is now loaded, so CDI generation via NVML will succeed.
+			if err := kubeadm.GenerateCDI(sshClient); err != nil {
+				return r.fail(ctx, cluster, "CDIGenerateFailed", fmt.Errorf("generating CDI spec on worker node: %w", err))
+			}
+
+			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking CDI generated: %w", err)
+			}
+			ensureAnnotations(cluster)[annotationCDIGenerated] = "true"
+			if err := r.Update(ctx, cluster); err != nil {
+				return ctrl.Result{}, fmt.Errorf("marking CDI as generated: %w", err)
+			}
+			log.Info("CDI spec generated successfully — continuing to image pre-pull")
+			// Explicit requeue: the annotation update does not change generation so
+			// GenerationChangedPredicate would otherwise drop the watch event.
+			return ctrl.Result{Requeue: true}, nil
 		}
-		ensureAnnotations(cluster)[annotationNvidiaInstalled] = "true"
-		if err := r.Update(ctx, cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("marking NVIDIA as installed: %w", err)
+
+		// ── Image pre-pull (GPU nodes only) ──────────────────────────────────
+		// Large GPU images (PyTorch, TensorFlow, etc.) are pulled in a background
+		// goroutine so the reconcile loop is not blocked for the download duration.
+		if cluster.Annotations[annotationImagesPrepulled] != "true" {
+			return r.reconcileImagePrepull(ctx, cluster)
 		}
-
-		log.Info("NVIDIA drivers installed; rebooting worker node for drivers to take effect")
-		// Reboot is best-effort; SSH connection closes before the response arrives.
-		if _, err := ssh.Run(sshClient, "sudo reboot"); err != nil {
-			log.Info("Reboot command returned an error (expected — connection closes on reboot)", "err", err)
-		}
-		return ctrl.Result{}, nil
 	}
 
-	if cluster.Annotations[annotationCDIGenerated] == "true" {
-		log.Info("CDI spec already generated; skipping")
-		return ctrl.Result{}, nil
-	}
-
-	// Drivers are installed and the node has rebooted — the kernel module is now
-	// loaded, so CDI generation via NVML will succeed.
-	if err := kubeadm.GenerateCDI(sshClient); err != nil {
-		return r.fail(ctx, cluster, "CDIGenerateFailed", fmt.Errorf("generating CDI spec on worker node: %w", err))
-	}
-
-	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking CDI generated: %w", err)
-	}
-	ensureAnnotations(cluster)[annotationCDIGenerated] = "true"
-	if err := r.Update(ctx, cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("marking CDI as generated: %w", err)
-	}
-
-	log.Info("CDI spec generated successfully")
 	return ctrl.Result{}, nil
+}
+
+// reconcileImagePrepull manages the background goroutine that pre-pulls GPU
+// images via crictl on the worker node.
+//
+// On every call it either:
+//   - Starts a new goroutine (first call, or after a controller restart) and
+//     returns RequeueAfter so the controller polls back later.
+//   - Polls the result channel of an already-running goroutine.  If not yet
+//     done it requeues again; if done it stamps the annotation and returns.
+//
+// The goroutine opens its own SSH connection so the reconcile loop is free to
+// return immediately — no blocking on large image downloads.
+func (r *RemoteClusterReconciler) reconcileImagePrepull(
+	ctx context.Context,
+	cluster *infrav1.RemoteCluster,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	key := cluster.Namespace + "/" + cluster.Name
+	images := cluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls
+
+	// Nothing to pull — mark done immediately.
+	if len(images) == 0 {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		ensureAnnotations(cluster)[annotationImagesPrepulled] = "true"
+		return ctrl.Result{}, r.Update(ctx, cluster)
+	}
+
+	v, running := r.prepullJobs.Load(key)
+	if !running {
+		// No goroutine in memory — either first call or controller restarted while
+		// a pull was in progress.  Open a dedicated SSH connection for the goroutine
+		// (the caller's sshClient will be closed when the current reconcile returns).
+		sshClient, err := r.getSSHClient(ctx, cluster)
+		if err != nil {
+			return r.fail(ctx, cluster, "SSHConnectionFailed",
+				fmt.Errorf("opening SSH connection for image pre-pull: %w", err))
+		}
+
+		// Capture the logger and image list before returning from this goroutine.
+		glog := log.WithValues("cluster", cluster.Name)
+		imagesCopy := make([]string, len(images))
+		copy(imagesCopy, images)
+
+		ch := make(chan prepullJobResult, 1)
+		// Store as receive-only so the poll branch cannot accidentally send.
+		r.prepullJobs.Store(key, (<-chan prepullJobResult)(ch))
+
+		go func() {
+			defer sshClient.Conn.Close()
+			// The map entry is intentionally NOT deleted here.  Deleting inside the
+			// goroutine creates a race: the goroutine finishes and removes the entry
+			// before the next poll consumes the channel result, causing the poll to
+			// see no running job and restart unnecessarily.  Only the consumer
+			// (the poll branch below) deletes the entry.
+			for _, img := range imagesCopy {
+				img = strings.TrimSpace(img)
+				if img == "" {
+					continue
+				}
+				output, pullErr := ssh.Run(sshClient, fmt.Sprintf("sudo crictl pull %s", img))
+				if pullErr != nil {
+					ch <- prepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
+					return
+				}
+				glog.Info("Pre-pulled image", "image", img)
+			}
+			ch <- prepullJobResult{err: nil}
+		}()
+
+		log.Info("Image pre-pull goroutine started", "images", len(imagesCopy))
+		return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
+	}
+
+	// Goroutine is already running — non-blocking poll of the result channel.
+	ch := v.(<-chan prepullJobResult)
+	select {
+	case res := <-ch:
+		// Result available — consume it and remove the map entry.
+		r.prepullJobs.Delete(key)
+		if res.err != nil {
+			return r.fail(ctx, cluster, "ImagePrepullFailed", res.err)
+		}
+		log.Info("All GPU images pre-pulled successfully")
+
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("refreshing cluster after image pre-pull: %w", err)
+		}
+		ensureAnnotations(cluster)[annotationImagesPrepulled] = "true"
+		if err := r.Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("marking images as prepulled: %w", err)
+		}
+		return ctrl.Result{}, nil
+
+	default:
+		// Still running — come back later.
+		log.Info("Image pre-pull in progress, requeueing", "pollInterval", prepullPollInterval)
+		return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
+	}
 }
 
 func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig(
@@ -475,6 +693,15 @@ data:
 			log.Info("Ensured VPN SSH credentials secret on remote cluster", "secret", vpnSecret.Name)
 		}
 
+		// Build the imagePrepulls YAML block (indented to match softwareConfig children).
+		var imagePrepullsYAML string
+		if len(cluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls) > 0 {
+			imagePrepullsYAML = "    imagePrepulls:\n"
+			for _, img := range cluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls {
+				imagePrepullsYAML += fmt.Sprintf("    - \"%s\"\n", img)
+			}
+		}
+
 		netConfigYAML := fmt.Sprintf(`
 apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
 kind: NodeProvisionNetConfig
@@ -488,7 +715,7 @@ spec:
     nvidiaDriverVersion: "%s"
     nvidiaContainerToolkitVersion: "%s"
     k8sDevicePluginVersion: "%s"
-  vpnRange: %s
+%s  vpnRange: %s
   vpnServerPublicConfig:
     publicIP: %s
     vpnSshCredentialsRef:
@@ -498,15 +725,30 @@ spec:
 			cluster.Spec.ClusterName,
 			cluster.Namespace,
 			cluster.Spec.ClusterName,
-			cluster.Spec.Kubernetes.Version,
+			cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion,
 			cluster.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion,
 			cluster.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion,
 			cluster.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion,
+			imagePrepullsYAML,
 			vpnCIDR,
 			cluster.Spec.VPNConfig.VPNServerPublicIP,
 			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
 			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
 		)
+
+		// Apply the CRD first so the remote API server knows the full schema
+		// (including any fields added since the cluster was originally set up,
+		// e.g. imagePrepulls).  Applying before the resource ensures strict
+		// decoding never rejects a field the schema hasn't seen yet.
+		crdCmd := fmt.Sprintf("cat <<'CRDEOF' | kubectl apply -f -\n%s\nCRDEOF", nodeprovisionnetconfigCRD)
+		if crdOut, crdErr := sshhelper.Run(sshClient, crdCmd); crdErr != nil {
+			// Non-fatal: log and continue.  The worst case is the apply below
+			// fails, which will be caught and surfaced as an error.
+			log.Error(crdErr, "applying NodeProvisionNetConfig CRD on remote cluster (continuing)",
+				"output", crdOut)
+		} else {
+			log.Info("Applied NodeProvisionNetConfig CRD on remote cluster")
+		}
 
 		cmd := fmt.Sprintf(
 			"cat <<'EOF' | kubectl apply -f -\n%s\nEOF",
@@ -1216,5 +1458,6 @@ func (r *RemoteClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1.RemoteCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("remotecluster").
+		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(r)
 }

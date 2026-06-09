@@ -67,6 +67,8 @@ type SoftwareConfig struct {
 	NvidiaDriverVersion           string `json:"nvidiaDriverVersion,omitempty"`
 	NvidiaContainerToolkitVersion string `json:"nvidiaContainerToolkitVersion,omitempty"`
 	K8sDevicePluginVersion        string `json:"k8sDevicePluginVersion,omitempty"`
+
+	ImagePrepulls []string `json:"imagePrepulls,omitempty"`
 }
 
 // NodeProvisionNetConfigStatus defines the observed state of NodeProvisionNetConfig.

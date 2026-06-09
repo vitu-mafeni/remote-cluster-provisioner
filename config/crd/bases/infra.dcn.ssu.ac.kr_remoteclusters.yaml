@@ -94,13 +94,6 @@ spec:
                 type: object
               host:
                 type: string
-              kubernetes:
-                properties:
-                  version:
-                    type: string
-                required:
-                - version
-                type: object
               nodeInfo:
                 properties:
                   hardwareType:
@@ -109,7 +102,13 @@ spec:
                     type: string
                   softwareConfig:
                     properties:
+                      imagePrepulls:
+                        items:
+                          type: string
+                        type: array
                       k8sDevicePluginVersion:
+                        type: string
+                      kubernetesVersion:
                         type: string
                       nvidiaContainerToolkitVersion:
                         type: string
@@ -143,7 +142,6 @@ spec:
             required:
             - auth
             - host
-            - kubernetes
             - port
             - user
             type: object
