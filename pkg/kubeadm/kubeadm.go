@@ -20,7 +20,7 @@ func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteClu
 	}
 	log.Printf("Control plane VPN IP: %s", tunIP)
 
-	clean := strings.TrimPrefix(cluster.Spec.Kubernetes.Version, "v")
+	clean := strings.TrimPrefix(cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion, "v")
 
 	kubeadmConfig := fmt.Sprintf(`
 apiVersion: kubeadm.k8s.io/v1beta4
@@ -77,7 +77,7 @@ mode: ipvs
 
 	parts := strings.Split(clean, ".")
 	if len(parts) < 2 {
-		return "", fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.Kubernetes.Version)
+		return "", fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion)
 	}
 
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
@@ -205,14 +205,14 @@ func getJoinCommand(client *sshhelper.Client) (string, error) {
 // FOR WORKER NODES, we will run the join command in the controller and add the node to the cluster after provisioning, so no need to return join command for worker nodes here.
 // JoinWorkerNode installs all prerequisites on the worker and joins it to the cluster.
 // joinCmd is the full string returned by InitializeControlPlane (or getJoinCommand).
-func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string) (error, string) {
+func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string, clusterParent *infrav1.RemoteCluster) (error, string) {
 	log.Printf("Joining worker node %s to cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)
 
 	if joinCmd == "" {
 		return fmt.Errorf("joinCmd must not be empty"), ""
 	}
-	if cluster.Spec.NodeInfo.HardwareType == "" {
-		return fmt.Errorf("cluster.Spec.NodeInfo.HardwareType must not be empty"), ""
+	if clusterParent.Spec.NodeInfo.HardwareType == "" {
+		return fmt.Errorf("clusterParent.Spec.NodeInfo.HardwareType must not be empty"), ""
 	}
 
 	// Resolve the worker's VPN IP from wg0.
@@ -222,11 +222,11 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 	}
 	log.Printf("Worker VPN IP: %s", nodeIP)
 
-	clean := strings.TrimPrefix(cluster.Spec.Kubernetes.Version, "v")
+	clean := strings.TrimPrefix(clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion, "v")
 
 	parts := strings.Split(clean, ".")
 	if len(parts) < 2 {
-		return fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.Kubernetes.Version), ""
+		return fmt.Errorf("invalid kubernetes version: %s", clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion), ""
 	}
 
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
@@ -379,7 +379,7 @@ func GetTunIP(client *sshhelper.Client) (string, error) {
 // InstallNvidiaContainerToolkit installs the NVIDIA container toolkit on a GPU node
 // and configures CRI-O to use it. This should be called after JoinWorkerNode for
 // nodes where cluster.Spec.NodeInfo.HardwareType == "gpu".
-func InstallNvidiaContainerToolkit(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
+func InstallNvidiaContainerToolkit(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
 	if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 		log.Printf("Skipping NVIDIA container toolkit install — node %s is not a GPU node", cluster.Spec.Host)
 		return nil
@@ -387,7 +387,7 @@ func InstallNvidiaContainerToolkit(client *sshhelper.Client, cluster *infrav1.Re
 
 	log.Printf("Installing NVIDIA container toolkit on GPU node %s", cluster.Spec.Host)
 
-	const nvidiaToolkitVersion = "1.19.0-1"
+	nvidiaToolkitVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
 
 	steps := []string{
 		// =========================
@@ -450,7 +450,7 @@ libnvidia-container1=%s`,
 // InstallNvidiaDrivers installs the NVIDIA drivers on a GPU node.
 // It should be called after InstallNvidiaContainerToolkit.
 // A reboot is typically required after driver installation for the drivers to take effect.
-func InstallNvidiaDrivers(client *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
+func InstallNvidiaDrivers(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
 	// if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 	// 	log.Printf("Skipping NVIDIA driver install — node %s is not a GPU node", cluster.Spec.Host)
 	// 	return nil
@@ -458,8 +458,8 @@ func InstallNvidiaDrivers(client *sshhelper.Client, cluster *infrav1.RemoteClust
 
 	log.Printf("Installing NVIDIA drivers on GPU node %s", cluster.Spec.Host)
 
-	nvidiaDriverVersion := cluster.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion
-	nvidiaToolkitVersion := cluster.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
+	nvidiaDriverVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion
+	nvidiaToolkitVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
 
 	steps := []string{
 		// =========================
