@@ -189,6 +189,15 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") &&
 			(cluster.Annotations[annotationCDIGenerated] != "true" ||
 				cluster.Annotations[annotationImagesPrepulled] != "true") {
+			// If an image pre-pull goroutine is already running, skip the SSH
+			// connection entirely and just poll the result channel directly.
+			// Opening SSH on every 30s requeue is wasteful and generates noisy logs.
+			if cluster.Annotations[annotationCDIGenerated] == "true" {
+				key := cluster.Namespace + "/" + cluster.Name
+				if _, running := r.prepullJobs.Load(key); running {
+					return r.reconcileImagePrepull(ctx, cluster, cluster)
+				}
+			}
 			sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
 			defer cancel()
 			sshClient, err := r.getSSHClient(sshCtx, cluster)
@@ -198,6 +207,9 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 			defer func() { _ = sshClient.Conn.Close() }()
 			return r.reconcileWorker(sshCtx, cluster, sshClient)
+		}
+		if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+			log.Info("GPU worker fully ready — CDI and image pre-pull already complete")
 		}
 		return ctrl.Result{}, nil
 	case phaseFailed:
@@ -463,6 +475,10 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 
 	// ── GPU: driver installation → reboot → CDI generation ──────────────────
 	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+		if clusterParent == nil {
+			log.Error(fmt.Errorf("control-plane not found"), "Cannot proceed with GPU post-processing — control-plane RemoteCluster missing; requeueing")
+			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
+		}
 		if cluster.Annotations[annotationNvidiaInstalled] != "true" {
 			if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster, clusterParent); err != nil {
 				return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
@@ -537,11 +553,41 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	key := cluster.Namespace + "/" + cluster.Name
+
+	// Poll branch — check first so we never do credential lookups or SSH on
+	// every requeue while the goroutine is busy pulling large images.
+	if v, running := r.prepullJobs.Load(key); running {
+		ch := v.(<-chan prepullJobResult)
+		select {
+		case res := <-ch:
+			r.prepullJobs.Delete(key)
+			if res.err != nil {
+				// Do NOT transition to phaseFailed — the node is already joined
+				// and functional.  Log the error and let the next reconcile
+				// re-spawn the goroutine for a fresh attempt.
+				log.Error(res.err, "Image pre-pull attempt failed, will retry on next reconcile")
+				return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
+			}
+			log.Info("All GPU images pre-pulled successfully")
+			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+				return ctrl.Result{}, fmt.Errorf("refreshing cluster after image pre-pull: %w", err)
+			}
+			ensureAnnotations(cluster)[annotationImagesPrepulled] = "true"
+			if err := r.Update(ctx, cluster); err != nil {
+				return ctrl.Result{}, fmt.Errorf("marking images as prepulled: %w", err)
+			}
+			return ctrl.Result{}, nil
+		default:
+			log.V(1).Info("Image pre-pull in progress, requeueing")
+			return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
+		}
+	}
+
 	images := parentCluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls
 
 	// Nothing to pull — mark done immediately.
 	if len(images) == 0 {
-		log.Info("No images configured for pre-pull — skipping (add images to spec.nodeInfo.softwareConfig.imagePrepulls to enable)")
+		log.Info("No images configured for pre-pull — skipping")
 		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -550,8 +596,7 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 	}
 
 	// Resolve registry credentials if a pull secret is referenced.
-	// The secret must have "username" and "password" keys; the credentials are
-	// passed to `crictl pull --creds user:pass` for private registries.
+	// Only runs once — when the goroutine is first spawned.
 	var pullCreds string
 	if ref := parentCluster.Spec.NodeInfo.SoftwareConfig.ImagePullSecretRef; ref != nil {
 		credSecret := &corev1.Secret{}
@@ -559,28 +604,32 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 			Name:      ref.Name,
 			Namespace: cluster.Namespace,
 		}, credSecret); err != nil {
-			return r.fail(ctx, cluster, "ImagePullSecretNotFound",
-				fmt.Errorf("fetching image pull secret %q: %w", ref.Name, err))
+			// Treat as transient — do not fail the cluster.  The secret may not
+			// exist yet or the API server may be temporarily unavailable.
+			log.Error(err, "Cannot fetch image pull secret, will retry", "secret", ref.Name)
+			return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
 		}
 		username := strings.TrimSpace(string(credSecret.Data["username"]))
 		password := strings.TrimSpace(string(credSecret.Data["password"]))
 		if username == "" || password == "" {
-			return r.fail(ctx, cluster, "ImagePullSecretInvalid",
-				fmt.Errorf("image pull secret %q must have non-empty \"username\" and \"password\" keys", ref.Name))
+			log.Error(fmt.Errorf("missing keys"), "Image pull secret must have non-empty \"username\" and \"password\" keys — will retry", "secret", ref.Name)
+			return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
 		}
 		pullCreds = username + ":" + password
 		log.Info("Using registry credentials for image pre-pull", "secret", ref.Name, "user", username)
 	}
 
-	v, running := r.prepullJobs.Load(key)
-	if !running {
+	// No goroutine in memory — spawn one.
+	{
 		// No goroutine in memory — either first call or controller restarted while
 		// a pull was in progress.  Open a dedicated SSH connection for the goroutine
 		// (the caller's sshClient will be closed when the current reconcile returns).
 		sshClient, err := r.getSSHClient(ctx, cluster)
 		if err != nil {
-			return r.fail(ctx, cluster, "SSHConnectionFailed",
-				fmt.Errorf("opening SSH connection for image pre-pull: %w", err))
+			// SSH failure is transient — do not fail the cluster.  The next
+			// reconcile (after prepullPollInterval) will try again.
+			log.Error(err, "Cannot open SSH connection for image pre-pull, will retry")
+			return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
 		}
 
 		// Capture the logger, image list, and credentials before spawning.
@@ -603,11 +652,7 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 
 			// When no explicit credentials are configured, clear any stale registry
 			// auth files that may exist on the node (e.g. from a previous docker login
-			// or a cloud image that ships with credentials baked in).  If those stale
-			// entries are for the same registry as a public image, the runtime sends
-			// them automatically and Docker Hub / other registries reject them with
-			// 401 even though the image is public.  Removing the files is safe: crictl
-			// will simply perform an anonymous pull.
+			// or a cloud image that ships with credentials baked in).
 			if credsCopy == "" {
 				authFiles := []string{
 					"/root/.docker/config.json",
@@ -615,10 +660,9 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 					"/etc/containers/auth.json",
 				}
 				for _, f := range authFiles {
-					// Ignore errors — the file may not exist.
 					_, _ = ssh.Run(sshClient, fmt.Sprintf("sudo rm -f %s", f))
 				}
-				glog.Info("Cleared any stale registry auth files before anonymous pull")
+				glog.Info("Cleared stale registry auth files before anonymous pull")
 			}
 
 			for _, img := range imagesCopy {
@@ -626,49 +670,26 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 				if img == "" {
 					continue
 				}
+				glog.Info("Pulling image", "image", img)
 				var cmd string
 				if credsCopy != "" {
-					cmd = fmt.Sprintf("sudo crictl pull --creds %s %s", credsCopy, img)
+					// Wrap with timeout so a stalled pull (e.g. dead TCP without
+					// keepalive) doesn't block the goroutine indefinitely.
+					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull --creds %s %s", credsCopy, img)
 				} else {
-					cmd = fmt.Sprintf("sudo crictl pull %s", img)
+					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull %s", img)
 				}
 				output, pullErr := ssh.Run(sshClient, cmd)
 				if pullErr != nil {
 					ch <- prepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
 					return
 				}
-				glog.Info("Pre-pulled image", "image", img)
+				glog.Info("Pulled image successfully", "image", img)
 			}
 			ch <- prepullJobResult{err: nil}
 		}()
 
 		log.Info("Image pre-pull goroutine started", "images", len(imagesCopy), "authenticated", pullCreds != "")
-		return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
-	}
-
-	// Goroutine is already running — non-blocking poll of the result channel.
-	ch := v.(<-chan prepullJobResult)
-	select {
-	case res := <-ch:
-		// Result available — consume it and remove the map entry.
-		r.prepullJobs.Delete(key)
-		if res.err != nil {
-			return r.fail(ctx, cluster, "ImagePrepullFailed", res.err)
-		}
-		log.Info("All GPU images pre-pulled successfully")
-
-		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("refreshing cluster after image pre-pull: %w", err)
-		}
-		ensureAnnotations(cluster)[annotationImagesPrepulled] = "true"
-		if err := r.Update(ctx, cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("marking images as prepulled: %w", err)
-		}
-		return ctrl.Result{}, nil
-
-	default:
-		// Still running — come back later.
-		log.Info("Image pre-pull in progress, requeueing", "pollInterval", prepullPollInterval)
 		return ctrl.Result{RequeueAfter: prepullPollInterval}, nil
 	}
 }
@@ -767,6 +788,49 @@ data:
 				)
 			}
 			log.Info("Ensured VPN SSH credentials secret on remote cluster", "secret", vpnSecret.Name)
+		}
+
+		// Ensure the image pull secret exists on the remote cluster so the
+		// NodeProvision controller there can authenticate when pre-pulling images.
+		if ref := clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePullSecretRef; ref != nil {
+			pullSecret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      ref.Name,
+				Namespace: cluster.Namespace,
+			}, pullSecret); err != nil {
+				return ctrl.Result{}, fmt.Errorf(
+					"fetching image pull secret %q: %w",
+					ref.Name, err,
+				)
+			}
+
+			secretData := ""
+			for k, v := range pullSecret.Data {
+				secretData += fmt.Sprintf("  %s: %s\n", k, base64.StdEncoding.EncodeToString(v))
+			}
+			pullSecretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: %s
+data:
+%s`,
+				pullSecret.Name,
+				cluster.Namespace,
+				string(pullSecret.Type),
+				secretData,
+			)
+
+			pullSecretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", pullSecretYAML)
+			pullSecretOutput, pullSecretErr := sshhelper.Run(sshClient, pullSecretCmd)
+			if pullSecretErr != nil {
+				return ctrl.Result{}, fmt.Errorf(
+					"creating image pull secret on remote cluster: %w\nOutput:\n%s",
+					pullSecretErr, pullSecretOutput,
+				)
+			}
+			log.Info("Ensured image pull secret on remote cluster", "secret", pullSecret.Name)
 		}
 
 		// Build optional softwareConfig fields (indented to match sibling keys).
