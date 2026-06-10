@@ -106,7 +106,7 @@ type: Opaque
 stringData:
   id_rsa: |
     -----BEGIN RSA PRIVATE KEY-----
-CHANGE ME TO YOUR VPN SERVER PRIVATE KEY
+    CHANGE ME TO YOUR VPN SERVER PRIVATE KEY
     -----END RSA PRIVATE KEY-----
 ---
 # Secret

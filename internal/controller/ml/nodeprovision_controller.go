@@ -58,6 +58,9 @@ type NodeProvisionReconciler struct {
 	// onPremJobs holds in-flight on-prem provisioning goroutines.
 	// Key: "<namespace>/<name>", Value: <-chan onPremJobResult
 	onPremJobs sync.Map
+	// onPremProgress tracks the current provisioning step for each in-flight goroutine.
+	// Key: "<namespace>/<name>", Value: string
+	onPremProgress sync.Map
 	// npPrepullJobs holds in-flight image pre-pull goroutines.
 	// Key: "<namespace>/<name>", Value: <-chan npPrepullJobResult
 	npPrepullJobs sync.Map
@@ -693,9 +696,12 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	ch := make(chan onPremJobResult, 1)
 	r.onPremJobs.Store(key, (<-chan onPremJobResult)(ch))
 
+	reportStep := func(step string) { r.onPremProgress.Store(key, step) }
+
 	go func() {
 		defer sshClient.Conn.Close()
 		defer vpnServerClient.Conn.Close()
+		defer r.onPremProgress.Delete(key)
 		// Do NOT delete from onPremJobs here. The map entry must remain
 		// until pollOnPremBootstrap reads the result from the channel.
 		// Deleting here creates a window where the goroutine has finished
@@ -709,6 +715,7 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 			sshClient,
 			vpnServerClient,
 			netConfigCopy,
+			reportStep,
 		)
 		ch <- onPremJobResult{vpnIP: vpnNodeIP, publicKey: publicKey, err: err}
 	}()
@@ -781,8 +788,19 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 		return ctrl.Result{RequeueAfter: requeueJoining}, nil
 
 	default:
-		// Still running.
-		log.V(1).Info("On-prem bootstrap in progress, requeueing")
+		// Still running — surface the current step in status so the user can see progress.
+		step := "bootstrapping node (packages and cluster join in progress)"
+		if v, ok := r.onPremProgress.Load(key); ok {
+			step = v.(string)
+		}
+		msg := fmt.Sprintf("Bootstrapping: %s", step)
+		if np.Status.Message != msg {
+			now := metav1.Now()
+			np.Status.Message = msg
+			np.Status.LastUpdated = &now
+			_ = r.Status().Update(ctx, np)
+		}
+		log.Info("On-prem bootstrap in progress", "step", step)
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
 }
@@ -814,10 +832,15 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	}
 
 	if found == nil {
-		log.V(1).Info("Node not yet visible in cluster, requeueing", "vpnIP", targetIP)
+		elapsed := ""
+		if np.Status.LastUpdated != nil {
+			elapsed = fmt.Sprintf(" (%.0fs since last update)", time.Since(np.Status.LastUpdated.Time).Seconds())
+		}
+		log.Info("Node not yet visible in cluster — waiting for kubelet to register",
+			"lookingForIP", targetIP, "elapsed", elapsed)
 		now := metav1.Now()
 		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseRegisteringNode
-		np.Status.Message = "Waiting for node to register with control plane"
+		np.Status.Message = fmt.Sprintf("Waiting for node to register with control plane (VPN IP: %s)", targetIP)
 		np.Status.Progress = 70
 		np.Status.LastUpdated = &now
 		_ = r.Status().Update(ctx, np)

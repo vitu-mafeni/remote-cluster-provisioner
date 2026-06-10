@@ -46,7 +46,11 @@ func NewInClusterProvisioner(
 	sshclient *sshhelper.Client,
 	vpnServerClient *sshhelper.Client,
 	netNodeConfig *mlv1alpha1.NodeProvisionNetConfig,
+	reportStep func(string),
 ) (vpnNodeIP string, publicKey string, err error) {
+	if reportStep == nil {
+		reportStep = func(string) {}
+	}
 
 	log.Printf("Provisioning node %s", nodeProvision.Name)
 
@@ -113,74 +117,50 @@ func NewInClusterProvisioner(
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
 	// ============================================================
-	// Provisioning steps on the node
+	// Provisioning steps on the node — grouped by phase so that
+	// reportStep gives the operator visible progress.
 	// ============================================================
 
-	steps := []string{
+	type stepGroup struct {
+		label string
+		cmds  []string
+	}
 
-		// ========================================================
-		// Disable swap
-		// ========================================================
-
-		"sudo swapoff -a",
-		`sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab`,
-
-		// ========================================================
-		// Kernel modules
-		// ========================================================
-
-		`echo -e "overlay\nbr_netfilter" | sudo tee /etc/modules-load.d/k8s.conf`,
-		"sudo modprobe overlay",
-		"sudo modprobe br_netfilter",
-
-		// ========================================================
-		// Sysctl
-		// ========================================================
-
-		`echo -e "net.bridge.bridge-nf-call-iptables=1
+	groups := []stepGroup{
+		{
+			label: "disabling swap and configuring kernel modules",
+			cmds: []string{
+				"sudo swapoff -a",
+				`sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab`,
+				`echo -e "overlay\nbr_netfilter" | sudo tee /etc/modules-load.d/k8s.conf`,
+				"sudo modprobe overlay",
+				"sudo modprobe br_netfilter",
+				`echo -e "net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
 net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
-
-		"sudo sysctl --system",
-
-		// ========================================================
-		// Base packages
-		// ========================================================
-
-		"sudo apt-get update",
-		"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https",
-		"sudo apt-get install -y wireguard wireguard-tools",
-
-		// ========================================================
-		// WireGuard client config
-		//
-		// We handle three cases:
-		//   A. wg0 is already up with the CORRECT IP (retry after a
-		//      later step failed) → skip teardown and re-write; just
-		//      verify the interface is healthy.
-		//   B. wg0 is up with a DIFFERENT IP (stale from a previous
-		//      failed attempt) → bring it down cleanly, then install
-		//      the new config.
-		//   C. wg0 does not exist → fresh install.
-		// ========================================================
-
-		"sudo mkdir -p /etc/wireguard",
-
-		// Bring down any existing wg0 interface gracefully before
-		// writing a new config.  If the interface is already gone this
-		// is a no-op thanks to the '|| true' guards.
-		fmt.Sprintf(`
+				"sudo sysctl --system",
+			},
+		},
+		{
+			label: "installing base packages (apt-get update, curl, gnupg)",
+			cmds: []string{
+				"sudo apt-get update",
+				"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https",
+			},
+		},
+		{
+			label: "installing WireGuard and configuring VPN tunnel",
+			cmds: []string{
+				"sudo apt-get install -y wireguard wireguard-tools",
+				"sudo mkdir -p /etc/wireguard",
+				fmt.Sprintf(`
 CURRENT_IP=$(sudo wg show wg0 allowed-ips 2>/dev/null | awk '{print $2}' | cut -d/ -f1 | head -1)
 if [ "$CURRENT_IP" = "%s" ]; then
-  # Case A: already up with the correct IP — nothing to do here.
   echo "wg0 already running with correct IP %s, skipping tunnel setup"
 else
-  # Case B / C: tear down whatever is running (if anything) and rebuild.
   sudo systemctl stop wg-quick@wg0 2>/dev/null || true
   sudo wg-quick down wg0 2>/dev/null || true
   sudo ip link delete wg0 2>/dev/null || true
-
-  # Write fresh config and bring the tunnel up.
   cat <<'WGEOF' | sudo tee /etc/wireguard/wg0.conf
 %s
 WGEOF
@@ -189,12 +169,12 @@ WGEOF
   sudo systemctl start wg-quick@wg0
   sleep 5
 fi`, vpnNodeIP, vpnNodeIP, wgConfig),
-
-		// ========================================================
-		// CRI-O
-		// ========================================================
-
-		fmt.Sprintf(`if which crio > /dev/null 2>&1; then
+			},
+		},
+		{
+			label: fmt.Sprintf("installing CRI-O v%s", repoVersion),
+			cmds: []string{
+				fmt.Sprintf(`if which crio > /dev/null 2>&1; then
 	echo "CRI-O already installed"
 else
 	sudo mkdir -p /etc/apt/keyrings &&
@@ -204,39 +184,43 @@ else
 	sudo apt-get update &&
 	sudo apt-get install -y cri-o
 fi`, repoVersion, repoVersion),
-
-		"sudo systemctl enable crio --now",
-		"sudo systemctl restart crio",
-
-		// ========================================================
-		// Kubernetes packages
-		// ========================================================
-
-		"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
-		"sudo mkdir -p /etc/apt/keyrings",
-
-		fmt.Sprintf(
-			`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`,
-			repoVersion,
-		),
-		fmt.Sprintf(
-			`echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null`,
-			repoVersion,
-		),
-		"sudo apt-get update",
-		fmt.Sprintf(
-			"sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages --allow-downgrades",
-			clean, clean, clean,
-		),
-		"sudo apt-mark hold kubelet kubeadm kubectl",
-		"sudo systemctl enable kubelet",
-		"sudo systemctl daemon-reload",
+				"sudo systemctl enable crio --now",
+				"sudo systemctl restart crio",
+			},
+		},
+		{
+			label: fmt.Sprintf("installing Kubernetes packages (kubelet/kubeadm/kubectl v%s)", clean),
+			cmds: []string{
+				"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
+				"sudo mkdir -p /etc/apt/keyrings",
+				fmt.Sprintf(
+					`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`,
+					repoVersion,
+				),
+				fmt.Sprintf(
+					`echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null`,
+					repoVersion,
+				),
+				"sudo apt-get update",
+				fmt.Sprintf(
+					"sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages --allow-downgrades",
+					clean, clean, clean,
+				),
+				"sudo apt-mark hold kubelet kubeadm kubectl",
+				"sudo systemctl enable kubelet",
+				"sudo systemctl daemon-reload",
+			},
+		},
 	}
 
-	for _, cmd := range steps {
-		output, err := sshhelper.Run(sshclient, cmd)
-		if err != nil {
-			return "", "", fmt.Errorf("command failed: %s\nOutput:\n%s", cmd, output)
+	for _, g := range groups {
+		reportStep(g.label)
+		log.Printf("[%s] %s", nodeProvision.Name, g.label)
+		for _, cmd := range g.cmds {
+			output, err := sshhelper.Run(sshclient, cmd)
+			if err != nil {
+				return "", "", fmt.Errorf("command failed (%s): %s\nOutput:\n%s", g.label, cmd, output)
+			}
 		}
 	}
 
@@ -244,47 +228,76 @@ fi`, repoVersion, repoVersion),
 	// Get actual wg0 IP AFTER tunnel starts
 	// ============================================================
 
+	reportStep("reading VPN tunnel IP from node")
 	nodeIP, err := kubeadm.GetTunIP(sshclient)
 	if err != nil {
 		return "", "", fmt.Errorf("failed getting wg0 IP: %w", err)
 	}
-
-	log.Printf("Node VPN IP: %s", nodeIP)
+	log.Printf("[%s] Node VPN IP: %s", nodeProvision.Name, nodeIP)
 
 	// ============================================================
 	// Verify connectivity from VPN server to new peer
 	// ============================================================
 
+	reportStep(fmt.Sprintf("verifying VPN connectivity to %s", nodeIP))
 	verifyVPNConnectivity(vpnServerClient, nodeIP)
 
 	// ============================================================
-	// Configure kubelet node-ip
+	// Configure kubelet node-ip (env file only — no restart yet)
+	//
+	// Write KUBELET_EXTRA_ARGS before kubeadm join so that when kubeadm
+	// starts kubelet as part of the join process it picks up --node-ip
+	// from /etc/default/kubelet automatically.  Restarting kubelet here
+	// would be counterproductive: it would start without a cluster config
+	// and generate spurious connection errors before kubeadm even runs.
 	// ============================================================
 
-	kubeletCmd := fmt.Sprintf(
+	reportStep(fmt.Sprintf("writing kubelet node-ip config (%s)", nodeIP))
+	kubeletEnvCmd := fmt.Sprintf(
 		`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`,
 		nodeIP,
 	)
-	if output, err := sshhelper.Run(sshclient, kubeletCmd); err != nil {
-		return "", "", fmt.Errorf("failed configuring kubelet node ip: %w\nOutput:\n%s", err, output)
+	if output, err := sshhelper.Run(sshclient, kubeletEnvCmd); err != nil {
+		return "", "", fmt.Errorf("failed writing kubelet node-ip env: %w\nOutput:\n%s", err, output)
 	}
 	if output, err := sshhelper.Run(sshclient, "sudo systemctl daemon-reload"); err != nil {
 		return "", "", fmt.Errorf("failed daemon reload: %w\nOutput:\n%s", err, output)
 	}
-	if output, err := sshhelper.Run(sshclient, "sudo systemctl restart kubelet"); err != nil {
-		return "", "", fmt.Errorf("failed restarting kubelet: %w\nOutput:\n%s", err, output)
-	}
 
 	// ============================================================
 	// Join cluster
+	//
+	// kubeadm join stops any running kubelet, writes its config files
+	// (/var/lib/kubelet/kubeadm-flags.env, /var/lib/kubelet/config.yaml),
+	// then starts kubelet — at which point /etc/default/kubelet is sourced
+	// so our KUBELET_EXTRA_ARGS=--node-ip takes effect for the first real
+	// kubelet registration.
+	//
+	// A 10-minute timeout prevents an indefinite hang if container image
+	// pulls stall or the API server becomes temporarily unreachable.
 	// ============================================================
 
-	joinCmd := fmt.Sprintf("sudo %s", netNodeConfig.Status.ClusterJoinCommand)
+	reportStep("running kubeadm join (may take several minutes — pulling images and bootstrapping TLS)")
+	joinCmd := fmt.Sprintf("sudo timeout 600 %s", netNodeConfig.Status.ClusterJoinCommand)
 	if output, err := sshhelper.Run(sshclient, joinCmd); err != nil {
 		return "", "", fmt.Errorf("failed joining cluster: %w\nOutput:\n%s", err, output)
 	}
+	log.Printf("[%s] kubeadm join completed", nodeProvision.Name)
 
-	log.Printf("Node %s successfully joined cluster", nodeProvision.Name)
+	// ============================================================
+	// Post-join: restart kubelet to ensure --node-ip is active
+	//
+	// kubeadm may have amended /var/lib/kubelet/kubeadm-flags.env.
+	// A single daemon-reload + restart ensures kubelet re-reads both
+	// env files and registers the node with the correct VPN IP address.
+	// ============================================================
+
+	reportStep("restarting kubelet to apply node-ip after join")
+	if output, err := sshhelper.Run(sshclient, "sudo systemctl daemon-reload && sudo systemctl restart kubelet"); err != nil {
+		return "", "", fmt.Errorf("failed restarting kubelet after join: %w\nOutput:\n%s", err, output)
+	}
+
+	log.Printf("[%s] successfully joined cluster", nodeProvision.Name)
 
 	return nodeIP, publicKey, nil
 }
