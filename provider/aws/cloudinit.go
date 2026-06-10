@@ -24,6 +24,11 @@ type CloudInitParams struct {
 	NodeName string
 	// Extra labels to apply after join, formatted as "key=value" pairs.
 	Labels []string
+	// SSHUsername is the OS user that will SSH into the node post-join
+	// (e.g. for image pre-pull).  NOPASSWD sudo is granted to this user so
+	// that non-interactive SSH sessions can run privileged commands.
+	// When empty, no sudoers entry is written.
+	SSHUsername string
 }
 
 // BuildUserData renders an idempotent cloud-init bash script and returns it
@@ -37,6 +42,14 @@ func renderBootstrapScript(p CloudInitParams) string {
 	labelCmd := ""
 	if len(p.Labels) > 0 {
 		labelCmd = fmt.Sprintf("kubectl label node \"$(hostname)\" %s --overwrite 2>/dev/null || true", strings.Join(p.Labels, " "))
+	}
+
+	nopasswdBlock := ""
+	if p.SSHUsername != "" {
+		nopasswdBlock = fmt.Sprintf(
+			"echo '%s ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/nopasswd-%s\nchmod 0440 /etc/sudoers.d/nopasswd-%s\n",
+			p.SSHUsername, p.SSHUsername, p.SSHUsername,
+		)
 	}
 
 	// Escape the WireGuard config for embedding in heredoc.
@@ -75,6 +88,9 @@ if [ -f /var/lib/node-bootstrap-complete ]; then
   exit 0
 fi
 
+# ── Passwordless sudo for SSH user ──────────────────────────────────────────
+# Written only when SSHUsernameOverride is set on the NodeProvision.
+%s
 # ── Kill anything holding apt/dpkg locks ────────────────────────────────────
 report "Disabling unattended-upgrades"
 systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
@@ -209,7 +225,8 @@ done
 # ── Done ─────────────────────────────────────────────────────────────────────
 touch /var/lib/node-bootstrap-complete
 report "Bootstrap complete"
-`, wgConf, p.CRIOVersion, p.CRIOVersion,
+`, nopasswdBlock,
+		wgConf, p.CRIOVersion, p.CRIOVersion,
 		p.KubernetesMinorVersion, p.KubernetesMinorVersion,
 		p.KubernetesVersion, p.KubernetesVersion, p.KubernetesVersion,
 		p.VpnIP,
