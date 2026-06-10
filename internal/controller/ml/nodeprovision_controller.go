@@ -808,6 +808,26 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 		if np.Spec.NodeLabel != "" {
 			found.Labels["hardware-type"] = np.Spec.NodeLabel
 		}
+		// GPU-specific labels and taint — mirrors what RemoteCluster does for
+		// GPU workers via kubectl label/taint on the control-plane.
+		if strings.Contains(np.Spec.NodeLabel, "gpu") {
+			found.Labels["gpu"] = "on"
+			gpuTaint := corev1.Taint{
+				Key:    "hardware-type",
+				Value:  "gpu",
+				Effect: corev1.TaintEffectPreferNoSchedule,
+			}
+			hasTaint := false
+			for _, t := range found.Spec.Taints {
+				if t.Key == gpuTaint.Key && t.Effect == gpuTaint.Effect {
+					hasTaint = true
+					break
+				}
+			}
+			if !hasTaint {
+				found.Spec.Taints = append(found.Spec.Taints, gpuTaint)
+			}
+		}
 		// Finalizer on the Node prevents `kubectl delete node` from bypassing
 		// controller-managed cleanup (VPN peer removal, EC2 termination, etc.).
 		controllerutil.AddFinalizer(found, nodeProvisionNodeFinalizer)
@@ -827,11 +847,11 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	np.Status.NodeName = found.Name
 	np.Status.LastUpdated = &now
 
-	// On-prem GPU nodes with images to pre-pull get an intermediate phase so the
-	// background goroutine can run without blocking further reconciles.
-	// AWS nodes handle image pre-pulling via cloud-init instead.
+	// GPU nodes with images configured get an intermediate phase so the
+	// background goroutine can pull without blocking further reconciles.
+	// Works for both on-prem (SSH via VPN IP) and AWS (SSH via VPN IP set during provisioning).
 	// Image list comes from NodeProvisionNetConfig.Spec.SoftwareConfig.ImagePrepulls.
-	if np.Spec.Provider == mlv1alpha1.CloudProviderOnPrem && strings.Contains(np.Spec.NodeLabel, "gpu") {
+	if strings.Contains(np.Spec.NodeLabel, "gpu") {
 		netConfig, err := r.requireNetConfig(ctx, np)
 		if err == nil && len(netConfig.Spec.SoftwareConfig.ImagePrepulls) > 0 {
 			np.Status.Phase = mlv1alpha1.NodeProvisionPhasePrePullingImages
