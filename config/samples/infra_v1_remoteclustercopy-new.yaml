@@ -26,6 +26,7 @@ spec:
 
     # cpu or gpu
     hardwareType: "cpu"
+
     softwareConfig:
       # GPU-related fields are optional.
       # Only required when hardwareType=gpu
@@ -105,7 +106,7 @@ type: Opaque
 stringData:
   id_rsa: |
     -----BEGIN RSA PRIVATE KEY----- CHANGE ME TO YOUR VPN SERVER PRIVATE KEY -----END RSA PRIVATE KEY-----
-
+---
 # Secret
 apiVersion: v1
 kind: Secret
@@ -115,4 +116,4 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: KEY
+  password: <change me>
