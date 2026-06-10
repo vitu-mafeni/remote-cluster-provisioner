@@ -53,6 +53,13 @@ spec:
                     description: EC2 key pair name for SSH access (optional when using
                       cloud-init only).
                     type: string
+                  rootVolumeSizeGB:
+                    description: |-
+                      RootVolumeSizeGB overrides the root EBS volume size in GB.
+                      Defaults to 50 GB when unset. The Ubuntu 22.04 AMI default (8 GB) is
+                      too small for a Kubernetes node running CRI-O and container images.
+                    format: int32
+                    type: integer
                   securityGroupIds:
                     description: Security group IDs to attach to the instance.
                     items:

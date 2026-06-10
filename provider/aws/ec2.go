@@ -645,13 +645,30 @@ func ValidateInstanceTypeAvailability(ctx context.Context, region, instanceType 
 // helpers
 // ────────────────────────────────────────────────────────────────────────────
 
+const defaultRootVolumeSizeGB = 50
+
 func buildRunInstancesInput(np *mlv1alpha1.NodeProvision, userDataB64 string) *ec2.RunInstancesInput {
+	rootVolumeGB := int32(defaultRootVolumeSizeGB)
+	if np.Spec.AWSConfig != nil && np.Spec.AWSConfig.RootVolumeSizeGB > 0 {
+		rootVolumeGB = np.Spec.AWSConfig.RootVolumeSizeGB
+	}
+
 	input := &ec2.RunInstancesInput{
 		ImageId:      awssdk.String(np.Spec.AWSConfig.AMI),
 		InstanceType: types.InstanceType(np.Spec.InstanceType),
 		MinCount:     awssdk.Int32(1),
 		MaxCount:     awssdk.Int32(1),
 		UserData:     awssdk.String(userDataB64),
+		BlockDeviceMappings: []types.BlockDeviceMapping{
+			{
+				DeviceName: awssdk.String("/dev/sda1"),
+				Ebs: &types.EbsBlockDevice{
+					VolumeSize:          awssdk.Int32(rootVolumeGB),
+					VolumeType:          types.VolumeTypeGp3,
+					DeleteOnTermination: awssdk.Bool(true),
+				},
+			},
+		},
 		NetworkInterfaces: []types.InstanceNetworkInterfaceSpecification{
 			{
 				DeviceIndex:              awssdk.Int32(0),
