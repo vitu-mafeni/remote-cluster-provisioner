@@ -117,6 +117,15 @@ func NewInClusterProvisioner(
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
 	// ============================================================
+	// Check if wg0 is already up — if so, skip the WireGuard group
+	// entirely and use the existing interface IP.
+	// ============================================================
+
+	existingWg0IP, _ := sshhelper.Run(sshclient,
+		`ip -4 addr show wg0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1`)
+	existingWg0IP = strings.TrimSpace(existingWg0IP)
+
+	// ============================================================
 	// Provisioning steps on the node — grouped by phase so that
 	// reportStep gives the operator visible progress.
 	// ============================================================
@@ -124,6 +133,35 @@ func NewInClusterProvisioner(
 	type stepGroup struct {
 		label string
 		cmds  []string
+	}
+
+	wgGroup := stepGroup{
+		label: "installing WireGuard and configuring VPN tunnel",
+		cmds: []string{
+			"sudo apt-get install -y wireguard wireguard-tools",
+			"sudo mkdir -p /etc/wireguard",
+			fmt.Sprintf(`
+CURRENT_IP=$(sudo wg show wg0 allowed-ips 2>/dev/null | awk '{print $2}' | cut -d/ -f1 | head -1)
+if [ "$CURRENT_IP" = "%s" ]; then
+  echo "wg0 already running with correct IP %s, skipping tunnel setup"
+else
+  sudo systemctl stop wg-quick@wg0 2>/dev/null || true
+  sudo wg-quick down wg0 2>/dev/null || true
+  sudo ip link delete wg0 2>/dev/null || true
+  cat <<'WGEOF' | sudo tee /etc/wireguard/wg0.conf
+%s
+WGEOF
+  sudo chmod 600 /etc/wireguard/wg0.conf
+  sudo systemctl enable wg-quick@wg0
+  sudo systemctl start wg-quick@wg0
+  sleep 5
+fi`, vpnNodeIP, vpnNodeIP, wgConfig),
+		},
+	}
+	if existingWg0IP != "" {
+		log.Printf("[%s] wg0 already up with IP %s — skipping WireGuard installation and reconfiguration", nodeProvision.Name, existingWg0IP)
+		reportStep(fmt.Sprintf("wg0 already configured (%s) — skipping WireGuard setup", existingWg0IP))
+		wgGroup = stepGroup{} // skip entirely
 	}
 
 	groups := []stepGroup{
@@ -148,29 +186,7 @@ net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
 				"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https",
 			},
 		},
-		{
-			label: "installing WireGuard and configuring VPN tunnel",
-			cmds: []string{
-				"sudo apt-get install -y wireguard wireguard-tools",
-				"sudo mkdir -p /etc/wireguard",
-				fmt.Sprintf(`
-CURRENT_IP=$(sudo wg show wg0 allowed-ips 2>/dev/null | awk '{print $2}' | cut -d/ -f1 | head -1)
-if [ "$CURRENT_IP" = "%s" ]; then
-  echo "wg0 already running with correct IP %s, skipping tunnel setup"
-else
-  sudo systemctl stop wg-quick@wg0 2>/dev/null || true
-  sudo wg-quick down wg0 2>/dev/null || true
-  sudo ip link delete wg0 2>/dev/null || true
-  cat <<'WGEOF' | sudo tee /etc/wireguard/wg0.conf
-%s
-WGEOF
-  sudo chmod 600 /etc/wireguard/wg0.conf
-  sudo systemctl enable wg-quick@wg0
-  sudo systemctl start wg-quick@wg0
-  sleep 5
-fi`, vpnNodeIP, vpnNodeIP, wgConfig),
-			},
-		},
+		wgGroup,
 		{
 			label: fmt.Sprintf("installing CRI-O v%s", repoVersion),
 			cmds: []string{
@@ -214,6 +230,9 @@ fi`, repoVersion, repoVersion),
 	}
 
 	for _, g := range groups {
+		if g.label == "" {
+			continue // empty group (e.g. wg0 already up — WireGuard step skipped)
+		}
 		reportStep(g.label)
 		log.Printf("[%s] %s", nodeProvision.Name, g.label)
 		for _, cmd := range g.cmds {
