@@ -199,10 +199,14 @@ func ProvisionEC2Node(
 	})
 
 	// ── Create EC2 instance ────────────────────────────────────────────────
+	// vpnResult carries VPN allocation data so the caller can persist it even
+	// if EC2 launch fails — preventing orphaned peers on retry.
+	vpnResult := &ProvisionResult{VpnIP: vpnIP, PublicKey: publicKey}
+
 	creds := ResolveAWSCredentials(secret)
 	ec2Client, err := newEC2Client(ctx, nodeProvision.Spec.Region, creds)
 	if err != nil {
-		return nil, fmt.Errorf("creating EC2 client: %w", err)
+		return vpnResult, fmt.Errorf("creating EC2 client: %w", err)
 	}
 
 	log.Printf("[INFO] NodeProvision/%s: Creating EC2 instance (type=%s region=%s)",
@@ -211,10 +215,10 @@ func ProvisionEC2Node(
 	input := buildRunInstancesInput(nodeProvision, userDataB64)
 	runOut, err := ec2Client.RunInstances(ctx, input)
 	if err != nil {
-		return nil, fmt.Errorf("launching EC2 instance: %w", err)
+		return vpnResult, fmt.Errorf("launching EC2 instance: %w", err)
 	}
 	if len(runOut.Instances) == 0 {
-		return nil, fmt.Errorf("RunInstances returned no instances")
+		return vpnResult, fmt.Errorf("RunInstances returned no instances")
 	}
 
 	instanceID := awssdk.ToString(runOut.Instances[0].InstanceId)

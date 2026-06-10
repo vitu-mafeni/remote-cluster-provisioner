@@ -215,18 +215,29 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 
 	case mlv1alpha1.NodeProvisionPhaseFailed:
-		log.Info("Retrying NodeProvision after failure — releasing stale VPN IP and resetting phase")
 		if err := r.cleanupVPNPeer(ctx, np); err != nil {
 			log.Error(err, "releasing stale VPN peer before retry (continuing)")
 		}
+		// Re-fetch to get the latest ResourceVersion before writing — a parallel
+		// reconcile may have already reset the phase, in which case we do nothing.
+		fresh := &mlv1alpha1.NodeProvision{}
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
+			return ctrl.Result{}, err
+		}
+		if fresh.Status.Phase != mlv1alpha1.NodeProvisionPhaseFailed {
+			return ctrl.Result{}, nil
+		}
 		now := metav1.Now()
-		np.Status.Phase = ""
-		np.Status.VpnIP = ""
-		np.Status.IPAddress = ""
-		np.Status.Message = "Retrying after failure"
-		np.Status.LastUpdated = &now
-		if err := r.Status().Update(ctx, np); err != nil {
-			return ctrl.Result{}, fmt.Errorf("resetting NodeProvision phase for retry: %w", err)
+		fresh.Status.Phase = ""
+		fresh.Status.VpnIP = ""
+		fresh.Status.IPAddress = ""
+		fresh.Status.Message = "Retrying after failure"
+		fresh.Status.LastUpdated = &now
+		log.Info("Retrying NodeProvision after failure — releasing stale VPN IP and resetting phase")
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			// Another reconcile won the race — its reset will trigger re-provisioning.
+			log.Info("Phase reset race lost, other reconcile already reset", "err", err)
+			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{RequeueAfter: requeueFailed}, nil
 
@@ -357,17 +368,20 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	log.Info("Creating EC2 instance")
 
 	result, err := awsprovision.ProvisionEC2Node(ctx, np, secret, vpnServerClient, netConfig)
+	// Always persist VPN allocation immediately — even on EC2 failure — so that
+	// cleanupVPNPeer can find and release the peer on the next retry instead of
+	// leaving it as an orphan and allocating yet another IP.
+	if result != nil && result.VpnIP != "" {
+		if uErr := r.updateNetConfigStatus(ctx, netConfig, result.VpnIP, result.PublicKey, name); uErr != nil {
+			log.Error(uErr, "persisting VPN allocation to NetConfig (non-fatal)")
+		}
+		np.Status.VpnIP = result.VpnIP
+		np.Status.IPAddress = result.VpnIP
+	}
 	if err != nil {
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("EC2 provisioning failed: %v", err))
 	}
 	log.Info("EC2 instance created", "instanceId", result.InstanceID)
-
-	// Persist VPN peer in NetConfig before writing InstanceID into NodeProvision
-	// status.  If the NodeProvision update fails we can still recover the VPN
-	// allocation on the next reconcile via the NetConfig peer list.
-	if err := r.updateNetConfigStatus(ctx, netConfig, result.VpnIP, result.PublicKey, name); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
-	}
 
 	// Re-fetch to ensure we have the latest ResourceVersion before writing
 	// the critical InstanceID field.  This is necessary because the
