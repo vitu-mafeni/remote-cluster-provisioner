@@ -353,9 +353,12 @@ cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/9
 	}
 
 	// cluster.Spec.Host is the node ip as registered in the cluster.
-	labelCmd := fmt.Sprintf("kubectl label node %s hardware-type=%s gpu=on --overwrite", nodeName, cluster.Spec.NodeInfo.HardwareType)
-	if output, err := sshhelper.Run(cpClient, labelCmd); err != nil {
-		return fmt.Errorf("failed to label worker node %s: %w\nOutput:\n%s", nodeName, err, output), ""
+	labelAndTaintCmd := fmt.Sprintf(
+		"kubectl label node %s hardware-type=%s gpu=on --overwrite && kubectl taint node %s hardware-type=gpu:PreferNoSchedule",
+		nodeName, cluster.Spec.NodeInfo.HardwareType, nodeName,
+	)
+	if output, err := sshhelper.Run(cpClient, labelAndTaintCmd); err != nil {
+		return fmt.Errorf("failed to label/taint worker node %s: %w\nOutput:\n%s", nodeName, err, output), ""
 	}
 
 	log.Printf("Worker node %s successfully joined cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)
