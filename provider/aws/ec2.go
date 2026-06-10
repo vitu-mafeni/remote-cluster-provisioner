@@ -195,6 +195,7 @@ func ProvisionEC2Node(
 		CRIOVersion:            crioVersion,
 		NodeName:               name,
 		Labels:                 labels,
+		SSHUsername:            nodeProvision.Spec.SSHUsernameOverride,
 	})
 
 	// ── Create EC2 instance ────────────────────────────────────────────────

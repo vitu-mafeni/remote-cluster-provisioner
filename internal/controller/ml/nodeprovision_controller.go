@@ -215,7 +215,19 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 
 	case mlv1alpha1.NodeProvisionPhaseFailed:
-		log.Info("NodeProvision failed; waiting before retry")
+		log.Info("Retrying NodeProvision after failure — releasing stale VPN IP and resetting phase")
+		if err := r.cleanupVPNPeer(ctx, np); err != nil {
+			log.Error(err, "releasing stale VPN peer before retry (continuing)")
+		}
+		now := metav1.Now()
+		np.Status.Phase = ""
+		np.Status.VpnIP = ""
+		np.Status.IPAddress = ""
+		np.Status.Message = "Retrying after failure"
+		np.Status.LastUpdated = &now
+		if err := r.Status().Update(ctx, np); err != nil {
+			return ctrl.Result{}, fmt.Errorf("resetting NodeProvision phase for retry: %w", err)
+		}
 		return ctrl.Result{RequeueAfter: requeueFailed}, nil
 
 	default:
@@ -1213,23 +1225,36 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 	}
 	netConfig := &netConfigList.Items[0]
 
-	// ── 1. Resolve public key from CR status ─────────────────────────────────
+	// ── 1. Resolve public key and VPN IP from CR status ─────────────────────
 	var peerPublicKey string
+	var resolvedVpnIP string // IP from the peer entry — valid even when np.Status.VpnIP was never written
 	newPeers := make([]mlv1alpha1.VPNPeerStatus, 0, len(netConfig.Status.VPNPeers))
 	for _, p := range netConfig.Status.VPNPeers {
 		if p.NodeName == np.Name || p.VPNIP == np.Status.VpnIP {
 			peerPublicKey = p.PublicKey
+			resolvedVpnIP = p.VPNIP
 		} else {
 			newPeers = append(newPeers, p)
 		}
 	}
 
-	// Release IP from used list regardless of whether we find the key.
+	// Best-effort IP to release: prefer the peer-entry IP, fall back to status fields.
+	ipToRelease := resolvedVpnIP
+	if ipToRelease == "" {
+		ipToRelease = np.Status.VpnIP
+	}
+	if ipToRelease == "" {
+		ipToRelease = np.Status.IPAddress
+	}
+
+	// Release IP from used list — only match non-empty IPs to avoid spuriously
+	// removing unrelated entries when the IP was never written to np.Status.
 	newIPs := make([]string, 0, len(netConfig.Status.UsedIPAddresses))
 	for _, ip := range netConfig.Status.UsedIPAddresses {
-		if ip != np.Status.VpnIP && ip != np.Status.IPAddress {
-			newIPs = append(newIPs, ip)
+		if ipToRelease != "" && ip == ipToRelease {
+			continue
 		}
+		newIPs = append(newIPs, ip)
 	}
 	netConfig.Status.VPNPeers = newPeers
 	netConfig.Status.UsedIPAddresses = newIPs
