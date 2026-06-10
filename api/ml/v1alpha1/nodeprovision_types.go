@@ -79,6 +79,11 @@ type AWSConfig struct {
 	// Additional tags to apply to created AWS resources.
 	// +optional
 	Tags map[string]string `json:"tags,omitempty"`
+	// RootVolumeSizeGB overrides the root EBS volume size in GB.
+	// Defaults to 50 GB when unset. The Ubuntu 22.04 AMI default (8 GB) is
+	// too small for a Kubernetes node running CRI-O and container images.
+	// +optional
+	RootVolumeSizeGB int32 `json:"rootVolumeSizeGB,omitempty"`
 }
 
 // NodeProvisionSpec defines the desired state of NodeProvision.
