@@ -58,7 +58,7 @@ type NodeProvisionReconciler struct {
 	// onPremJobs holds in-flight on-prem provisioning goroutines.
 	// Key: "<namespace>/<name>", Value: <-chan onPremJobResult
 	onPremJobs sync.Map
-	// npPrepullJobs holds in-flight GPU image pre-pull goroutines.
+	// npPrepullJobs holds in-flight image pre-pull goroutines.
 	// Key: "<namespace>/<name>", Value: <-chan npPrepullJobResult
 	npPrepullJobs sync.Map
 }
@@ -94,7 +94,7 @@ const (
 	requeueJoining = 15 * time.Second
 	// requeueFailed is used to allow manual remediation before retrying.
 	requeueFailed = time.Minute
-	// npPrepullPollInterval is the requeue interval while GPU images are pre-pulling.
+	// npPrepullPollInterval is the requeue interval while images are pre-pulling.
 	npPrepullPollInterval = 30 * time.Second
 )
 
@@ -187,8 +187,13 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	case mlv1alpha1.NodeProvisionPhaseBootstrapping:
 		// On-prem: poll the background SSH provisioning goroutine.
-		// AWS: cloud-init is running on the instance; just wait for the node to appear.
+		// Skip getSecret when the goroutine is already running — it is only
+		// needed if we need to restart provisioning (no goroutine in map).
 		if np.Spec.Provider == mlv1alpha1.CloudProviderOnPrem {
+			key := np.Namespace + "/" + np.Name
+			if _, running := r.onPremJobs.Load(key); running {
+				return r.pollOnPremBootstrap(ctx, np, nil)
+			}
 			secret, err := r.getSecret(ctx, np)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("getting credentials secret: %w", err)
@@ -206,7 +211,7 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.reconcileNPImagePrepull(ctx, np)
 
 	case mlv1alpha1.NodeProvisionPhaseReady:
-		log.Info("NodeProvision is ready, no action needed")
+		log.V(1).Info("NodeProvision is ready, no action needed")
 		return ctrl.Result{}, nil
 
 	case mlv1alpha1.NodeProvisionPhaseFailed:
@@ -694,6 +699,8 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 	if !running {
 		// No goroutine in memory — controller likely restarted mid-provisioning.
 		// Re-enter provisioning to restart the SSH session.
+		// secret is guaranteed non-nil here: the Bootstrapping case only passes
+		// nil when it has already confirmed the goroutine is running.
 		log.Info("No in-flight bootstrap goroutine found (possible restart), restarting provisioning")
 		return r.reconcileOnPremProvisioning(ctx, np, secret)
 	}
@@ -737,7 +744,7 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 
 	default:
 		// Still running.
-		log.Info("On-prem bootstrap in progress, requeueing")
+		log.V(1).Info("On-prem bootstrap in progress, requeueing")
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
 }
@@ -769,7 +776,7 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	}
 
 	if found == nil {
-		log.Info("Node not yet visible in cluster, requeueing", "vpnIP", targetIP)
+		log.V(1).Info("Node not yet visible in cluster, requeueing", "vpnIP", targetIP)
 		now := metav1.Now()
 		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseRegisteringNode
 		np.Status.Message = "Waiting for node to register with control plane"
@@ -780,7 +787,6 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	}
 
 	log.Info("Node registered with control plane", "node", found.Name)
-	log.Info("Node join progress: verifying health")
 
 	// Stamp ownership labels + hardware-type label + management finalizer onto
 	// the Kubernetes Node object in a single patch.  We always do this so that
@@ -821,10 +827,11 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	np.Status.NodeName = found.Name
 	np.Status.LastUpdated = &now
 
-	// GPU nodes with images to pre-pull get an intermediate phase so the
+	// On-prem GPU nodes with images to pre-pull get an intermediate phase so the
 	// background goroutine can run without blocking further reconciles.
+	// AWS nodes handle image pre-pulling via cloud-init instead.
 	// Image list comes from NodeProvisionNetConfig.Spec.SoftwareConfig.ImagePrepulls.
-	if strings.Contains(np.Spec.NodeLabel, "gpu") {
+	if np.Spec.Provider == mlv1alpha1.CloudProviderOnPrem && strings.Contains(np.Spec.NodeLabel, "gpu") {
 		netConfig, err := r.requireNetConfig(ctx, np)
 		if err == nil && len(netConfig.Spec.SoftwareConfig.ImagePrepulls) > 0 {
 			np.Status.Phase = mlv1alpha1.NodeProvisionPhasePrePullingImages
@@ -872,8 +879,43 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 	log := logf.FromContext(ctx)
 	key := np.Namespace + "/" + np.Name
 
-	v, running := r.npPrepullJobs.Load(key)
-	if !running {
+	// Poll branch — hoisted to the top so credential lookups and SSH only
+	// happen once (when spawning), not on every 30s requeue.
+	if v, running := r.npPrepullJobs.Load(key); running {
+		ch := v.(<-chan npPrepullJobResult)
+		select {
+		case res := <-ch:
+			r.npPrepullJobs.Delete(key)
+			if res.err != nil {
+				// Do NOT fail the NodeProvision — the node is already joined.
+				// Log the error and let the next reconcile re-spawn for a retry.
+				log.Error(res.err, "Image pre-pull attempt failed, will retry on next reconcile",
+					"node", np.Status.NodeName)
+				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+			}
+			log.Info("All GPU images pre-pulled successfully", "node", np.Status.NodeName)
+
+			if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+				return ctrl.Result{}, fmt.Errorf("refreshing NodeProvision after pre-pull: %w", err)
+			}
+			now := metav1.Now()
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
+			np.Status.Message = "Node successfully joined cluster"
+			np.Status.Progress = 100
+			np.Status.CompletionTime = &now
+			np.Status.LastUpdated = &now
+			if err := r.Status().Update(ctx, np); err != nil {
+				return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to Ready: %w", err)
+			}
+			return ctrl.Result{}, nil
+		default:
+			log.V(1).Info("GPU image pre-pull in progress, requeueing")
+			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+		}
+	}
+
+	// No goroutine in memory — fetch config and spawn one.
+	{
 		// Fetch the image list from NodeProvisionNetConfig.
 		netConfig, err := r.requireNetConfig(ctx, np)
 		if err != nil {
@@ -903,14 +945,15 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 				Name:      ref.Name,
 				Namespace: np.Namespace,
 			}, credSecret); err != nil {
-				return r.failNodeProvision(ctx, np,
-					fmt.Sprintf("fetching image pull secret %q: %v", ref.Name, err))
+				// Transient — do not fail the NodeProvision.
+				log.Error(err, "Cannot fetch image pull secret, will retry", "secret", ref.Name)
+				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 			}
 			username := strings.TrimSpace(string(credSecret.Data["username"]))
 			password := strings.TrimSpace(string(credSecret.Data["password"]))
 			if username == "" || password == "" {
-				return r.failNodeProvision(ctx, np,
-					fmt.Sprintf("image pull secret %q must have non-empty \"username\" and \"password\" keys", ref.Name))
+				log.Error(fmt.Errorf("missing keys"), "Image pull secret must have non-empty \"username\" and \"password\" keys — will retry", "secret", ref.Name)
+				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 			}
 			pullCreds = username + ":" + password
 			log.Info("Using registry credentials for image pre-pull",
@@ -922,8 +965,9 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 		// the controller is also in-cluster on the same VPN mesh.
 		sshClient, err := r.getSSHClientPostJoin(ctx, np)
 		if err != nil {
-			return r.failNodeProvision(ctx, np,
-				fmt.Sprintf("opening SSH connection for image pre-pull: %v", err))
+			// SSH failure is transient — do not fail the NodeProvision.
+			log.Error(err, "Cannot open SSH connection for image pre-pull, will retry")
+			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 		}
 
 		imagesCopy := make([]string, len(images))
@@ -948,7 +992,7 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 				for _, f := range authFiles {
 					_, _ = ssh.Run(sshClient, fmt.Sprintf("sudo rm -f %s", f))
 				}
-				glog.Info("Cleared any stale registry auth files before anonymous pull")
+				glog.Info("Cleared stale registry auth files before anonymous pull")
 			}
 
 			for _, img := range imagesCopy {
@@ -956,18 +1000,21 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 				if img == "" {
 					continue
 				}
+				glog.Info("Pulling image", "image", img)
 				var cmd string
 				if credsCopy != "" {
-					cmd = fmt.Sprintf("sudo crictl pull --creds %s %s", credsCopy, img)
+					// timeout prevents an indefinite hang if the TCP connection
+					// drops silently (no SSH keepalive through firewalls).
+					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull --creds %s %s", credsCopy, img)
 				} else {
-					cmd = fmt.Sprintf("sudo crictl pull %s", img)
+					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull %s", img)
 				}
 				output, pullErr := ssh.Run(sshClient, cmd)
 				if pullErr != nil {
 					ch <- npPrepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
 					return
 				}
-				glog.Info("Pre-pulled image", "image", img)
+				glog.Info("Pulled image successfully", "image", img)
 			}
 			ch <- npPrepullJobResult{err: nil}
 		}()
@@ -975,36 +1022,6 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 		log.Info("GPU image pre-pull goroutine started",
 			"node", np.Status.NodeName, "images", len(imagesCopy),
 			"authenticated", pullCreds != "")
-		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-	}
-
-	// Poll the result channel (non-blocking).
-	ch := v.(<-chan npPrepullJobResult)
-	select {
-	case res := <-ch:
-		r.npPrepullJobs.Delete(key)
-		if res.err != nil {
-			return r.failNodeProvision(ctx, np,
-				fmt.Sprintf("image pre-pull failed: %v", res.err))
-		}
-		log.Info("All GPU images pre-pulled successfully", "node", np.Status.NodeName)
-
-		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
-			return ctrl.Result{}, fmt.Errorf("refreshing NodeProvision after pre-pull: %w", err)
-		}
-		now := metav1.Now()
-		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
-		np.Status.Message = "Node successfully joined cluster"
-		np.Status.Progress = 100
-		np.Status.CompletionTime = &now
-		np.Status.LastUpdated = &now
-		if err := r.Status().Update(ctx, np); err != nil {
-			return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to Ready: %w", err)
-		}
-		return ctrl.Result{}, nil
-
-	default:
-		log.Info("GPU image pre-pull in progress, requeueing")
 		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 	}
 }
