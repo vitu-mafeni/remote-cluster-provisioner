@@ -614,6 +614,18 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("SSH connectivity check failed: %v", err))
 	}
 
+	// Verify passwordless sudo before attempting any provisioning.
+	// All provisioning commands require sudo in a non-interactive SSH session
+	// (no TTY), so the node must have NOPASSWD configured for the SSH user.
+	if out, err := ssh.Run(sshClient, "sudo -n true"); err != nil {
+		sshClient.Conn.Close()
+		return r.failNodeProvision(ctx, np, fmt.Sprintf(
+			"passwordless sudo check failed — configure NOPASSWD for the SSH user on this node "+
+				"(e.g. echo '<user> ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/nopasswd): %v\nOutput: %s",
+			err, out,
+		))
+	}
+
 	netConfig, err := r.requireNetConfig(ctx, np)
 	if err != nil {
 		sshClient.Conn.Close()
@@ -1070,7 +1082,11 @@ func (r *NodeProvisionReconciler) getSSHClientPostJoin(ctx context.Context, np *
 	if host == "" {
 		host = np.Spec.Hostname
 	}
-	return dialSSH(host, np.Spec.SSHPort, np.Spec.SSHUsernameOverride, string(credBytes))
+	user := np.Spec.SSHUsernameOverride
+	if user == "" {
+		user = "ubuntu"
+	}
+	return dialSSH(host, np.Spec.SSHPort, user, string(credBytes))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1299,7 +1315,11 @@ func (r *NodeProvisionReconciler) cleanupOnPremNode(ctx context.Context, np *mlv
 
 	sshClient, err := r.getSSHClient(ctx, np)
 	if err != nil {
-		log.Error(err, "SSH to on-prem node failed during cleanup (continuing)")
+		// Credential secret may have been deleted before the NodeProvision.
+		// VPN peer and Kubernetes node are already cleaned up — this is
+		// best-effort kubeadm reset on the physical node.
+		log.Info("Cannot SSH to on-prem node for kubeadm reset — credential secret missing or node unreachable; skipping node-side cleanup",
+			"err", err)
 		return
 	}
 	defer sshClient.Conn.Close()
@@ -1430,7 +1450,11 @@ func (r *NodeProvisionReconciler) getSSHClient(ctx context.Context, np *mlv1alph
 	if host == "" {
 		host = np.Spec.Hostname
 	}
-	return dialSSH(host, np.Spec.SSHPort, np.Spec.SSHUsernameOverride, string(credBytes))
+	user := np.Spec.SSHUsernameOverride
+	if user == "" {
+		user = "ubuntu"
+	}
+	return dialSSH(host, np.Spec.SSHPort, user, string(credBytes))
 }
 
 // getVPNServerSSHClient creates an SSH client to the WireGuard VPN server.
