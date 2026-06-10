@@ -202,8 +202,14 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			defer cancel()
 			sshClient, err := r.getSSHClient(sshCtx, cluster)
 			if err != nil {
-				return r.fail(ctx, cluster, "SSHConnectionFailed",
-					fmt.Errorf("connecting for GPU post-processing: %w", err))
+				// SSH failure here is likely the node still booting after the
+				// NVIDIA driver reboot.  Requeue and retry rather than failing
+				// the cluster — the node will be reachable once it finishes
+				// coming up, regardless of whether that takes more or less than
+				// postRebootWait.
+				log.Info("SSH not yet reachable for GPU post-processing — node may still be rebooting, retrying",
+					"err", err)
+				return ctrl.Result{RequeueAfter: postRebootWait}, nil
 			}
 			defer func() { _ = sshClient.Conn.Close() }()
 			return r.reconcileWorker(sshCtx, cluster, sshClient)
@@ -494,13 +500,24 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 
 			log.Info("NVIDIA drivers installed; rebooting node — will reconnect after postRebootWait",
 				"wait", postRebootWait)
-			// Fire the reboot in a goroutine so we do NOT block waiting for the
-			// SSH session to drop.  A synchronous ssh.Run("sudo reboot") hangs for
-			// several minutes until TCP times out — postRebootWait would only start
-			// counting after that hang, making the total dead time far too long.
-			// The command is already on the wire; closing the connection after we
-			// return is harmless — the kernel will execute the reboot regardless.
-			go func() { _, _ = ssh.Run(sshClient, "sudo reboot") }()
+			// Open a *dedicated* SSH connection for the reboot so it doesn't race
+			// with the defer that closes the shared sshClient when this function
+			// returns.  Using the shared connection caused the reboot to silently
+			// no-op when the defer fired before the goroutine ran NewSession().
+			rebootLog := log
+			go func() {
+				rebootCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				rebootClient, err := r.getSSHClient(rebootCtx, cluster)
+				if err != nil {
+					rebootLog.Error(err, "Could not open SSH connection for reboot — node may not reboot")
+					return
+				}
+				defer rebootClient.Conn.Close()
+				// Error is ignored: the connection resets when the node starts
+				// rebooting, which looks like a failure to ssh.Run.
+				_, _ = ssh.Run(rebootClient, "sudo reboot")
+			}()
 			return ctrl.Result{RequeueAfter: postRebootWait}, nil
 		}
 
