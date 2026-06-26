@@ -10,6 +10,11 @@ import (
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
 
+const (
+	CrioAsset  = "https://github.com/vitu-mafeni/leehun-cri-o/releases/download/crio-1.35.0-restore-from-file/crio"
+	CrioCommit = "a0e6cb3d7f0ca8e9f31131daa17570082e716393"
+)
+
 func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (string, error) {
 	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
 
@@ -101,20 +106,65 @@ mode: ipvs
 		"sudo apt-get update",
 		"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https",
 		"sudo install -m 0755 -d /etc/apt/keyrings",
+
+		// custom cri-o
+
+		// repoVersion MUST be "1.35" so the packaged conmon/runc/config match the custom binary
 		"sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg",
 		fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
-| gpg --dearmor | sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
+		| gpg --dearmor | sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
 		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
-https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
-| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
+		https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
+		| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
 		fmt.Sprintf("CRICTL_VERSION=v%s", clean),
 		"sudo apt-get update",
-		"sudo apt-get install -y jq",
-		"sudo apt-get install -y cri-o ",
-		"sudo systemctl enable crio --now",
-		"sudo systemctl restart crio",
+		"sudo apt-get install -y jq criu crun conmon",
+		// crun from apt (typically 0.17 on Ubuntu 22.04) rejects OCI spec 1.1.0 with
+		// "unknown version specified". CRI-O 1.35 generates specs at 1.1.0, so we must
+		// install crun >= 1.0 from GitHub and pin CRI-O to use that exact path.
+		`CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null) && \
+		{ [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17 && \
+		sudo curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \
+		  -o /usr/local/bin/crun && \
+		sudo chmod 0755 /usr/local/bin/crun && \
+		sudo cp -f /usr/local/bin/crun /usr/bin/crun && \
+		crun --version`,
+		"sudo apt-get install -y cri-o",
+		// Always point CRI-O at the GitHub-sourced crun so the apt version (which may
+		// be on PATH before /usr/local/bin) is never used.
+		`sudo mkdir -p /etc/crio/crio.conf.d && \
+		printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
+		| sudo tee /etc/crio/crio.conf.d/10-crun.conf`,
+		"sudo systemctl enable crio --now || { sudo journalctl -xeu crio.service --no-pager >&2; false; }",
+
+		// --- swap in the custom restore-from-file binary, idempotent on commit ---
+		fmt.Sprintf(`WANT=%s; \
+		HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit); \
+		if [ "$HAVE" = "$WANT" ]; then \
+		echo "custom crio $WANT already installed, skipping"; \
+		else \
+		curl -fsSL %s -o /tmp/crio && \
+		chmod 0755 /tmp/crio && \
+		GOT=$(/tmp/crio version --json | jq -r .gitCommit) && \
+		[ "$GOT" = "$WANT" ] && \
+		sudo systemctl stop crio && \
+		sudo install -m 0755 /tmp/crio /usr/bin/crio && \
+		sudo systemctl daemon-reload && \
+		sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; } && \
+		rm -f /tmp/crio; \
+		fi`, CrioCommit, CrioAsset),
+
+		// the binary was built with PREFIX=/usr/local, so it looks for the CRIU device
+		// restorer at /usr/local/libexec; the package ships it under /usr/libexec
+		`test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
+		sudo install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
+		/usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
+		echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"`,
+
+		"sudo crio version || true",
 		"sudo crictl info || true",
 		"sudo systemctl status crio --no-pager || true",
+
 		"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
 		"sudo mkdir -p /etc/apt/keyrings",
 		fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
@@ -127,8 +177,33 @@ https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		// Set kubelet node IP to VPN IP before init.
 		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, tunIP),
 		"sudo systemctl daemon-reload",
+		`sudo mkdir -p /etc/containers && \
+		echo '{"default":[{"type":"insecureAcceptAnything"}]}' \
+		| sudo tee /etc/containers/policy.json > /dev/null`,
 		fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF", kubeadmConfig),
-		"test -f /etc/kubernetes/admin.conf || sudo kubeadm init --config /tmp/kubeadm-config.yaml",
+		// Always restart CRI-O here to pick up any config changes made above
+		// (e.g. new crun path). A passive "is-active || start" misses the case where
+		// CRI-O is active but using stale config from a previous failed provisioning run.
+		`sudo systemctl daemon-reload && sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
+		`for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
+		test -S /var/run/crio/crio.sock && echo "CRI-O socket ready" && break; \
+		echo "Waiting for CRI-O socket ($i/20)..."; sleep 3; \
+		done; \
+		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
+		`test -f /etc/kubernetes/admin.conf || ( \
+sudo kubeadm init --config /tmp/kubeadm-config.yaml; RC=$?; \
+if [ $RC -ne 0 ]; then \
+echo "=== crictl ps -a ===" >&2; \
+sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a >&2 2>&1 || true; \
+CIDS=$(sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a -q 2>/dev/null | head -6); \
+for CID in $CIDS; do \
+echo "=== container logs: $CID ===" >&2; \
+sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock logs --tail=50 "$CID" >&2 2>&1 || true; \
+done; \
+echo "=== kubelet journal ===" >&2; \
+sudo journalctl -xeu kubelet --no-pager -n 80 >&2 2>&1 || true; \
+fi; \
+exit $RC )`,
 		"mkdir -p $HOME/.kube",
 		"sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config",
 		"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
@@ -260,20 +335,54 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		// =========================
 		// Install CRI-O
 		// =========================
-		fmt.Sprintf(`if which crio > /dev/null 2>&1; then
-			echo "CRI-O already installed, skipping"
-		else
-			sudo mkdir -p /etc/apt/keyrings &&
-			sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg &&
-			curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg &&
-			echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null &&
-			sudo apt-get update &&
-			sudo apt-get install -y cri-o
-		fi`, repoVersion, repoVersion),
+		"sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg",
+		fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
+		| gpg --dearmor | sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
+		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
+		https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
+		| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
 		"sudo apt-get update",
+		"sudo apt-get install -y jq criu crun conmon",
+		`CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null) && \
+		{ [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17 && \
+		sudo curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \
+		  -o /usr/local/bin/crun && \
+		sudo chmod 0755 /usr/local/bin/crun && \
+		crun --version`,
 		"sudo apt-get install -y cri-o",
-		"sudo systemctl enable crio --now",
-		"sudo systemctl restart crio",
+		// pin absolute crun path so CRI-O uses os.Stat instead of exec.LookPath
+		`CRUN_BIN=$(command -v crun 2>/dev/null || echo /usr/local/bin/crun) && \
+		echo "crun path: $CRUN_BIN" && \
+		sudo mkdir -p /etc/crio/crio.conf.d && \
+		printf '[crio.runtime.runtimes.crun]\nruntime_path = "%s"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' "$CRUN_BIN" \
+		| sudo tee /etc/crio/crio.conf.d/10-crun.conf`,
+		"sudo systemctl enable crio --now || { sudo journalctl -xeu crio.service --no-pager >&2; false; }",
+
+		// swap in the custom restore-from-file binary, idempotent on commit
+		fmt.Sprintf(`WANT=%s; \
+		HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit); \
+		if [ "$HAVE" = "$WANT" ]; then \
+		echo "custom crio $WANT already installed, skipping"; \
+		else \
+		curl -fsSL %s -o /tmp/crio && \
+		chmod 0755 /tmp/crio && \
+		GOT=$(/tmp/crio version --json | jq -r .gitCommit) && \
+		[ "$GOT" = "$WANT" ] && \
+		sudo systemctl stop crio && \
+		sudo install -m 0755 /tmp/crio /usr/bin/crio && \
+		sudo systemctl daemon-reload && \
+		sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; } && \
+		rm -f /tmp/crio; \
+		fi`, CrioCommit, CrioAsset),
+
+		`test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
+		sudo install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
+		/usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
+		echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"`,
+
+		"sudo crio version || true",
+		"sudo crictl info || true",
+		"sudo systemctl status crio --no-pager || true",
 
 		// =========================
 		// Kubernetes repository + packages

@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+
+	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 )
 
 // CloudInitParams holds all values needed to render the bootstrap user-data script.
@@ -172,18 +174,45 @@ report "VPN tunnel established"
 # ── CRI-O ────────────────────────────────────────────────────────────────────
 report "Installing CRI-O"
 if ! which crio > /dev/null 2>&1; then
-  mkdir -p /etc/apt/keyrings
   rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg
   curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
-    | gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
-https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
+    | gpg --dearmor | tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null
+  echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
     > /etc/apt/sources.list.d/cri-o.list
   $APT update
-  $APT install -y cri-o
+  $APT install -y jq criu crun conmon cri-o
+  CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null)
+  { [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17
+  curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \
+    -o /usr/local/bin/crun
+  chmod 0755 /usr/local/bin/crun
+  cp -f /usr/local/bin/crun /usr/bin/crun
+  crun --version
+  mkdir -p /etc/crio/crio.conf.d
+  printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
+    > /etc/crio/crio.conf.d/10-crun.conf
+  systemctl enable crio --now || { journalctl -xeu crio.service --no-pager >&2; false; }
 fi
-systemctl enable crio --now
-systemctl restart crio
+WANT=%s
+HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit)
+if [ "$HAVE" != "$WANT" ]; then
+  curl -fsSL %s -o /tmp/crio
+  chmod 0755 /tmp/crio
+  GOT=$(/tmp/crio version --json | jq -r .gitCommit)
+  if [ "$GOT" = "$WANT" ]; then
+    systemctl stop crio
+    install -m 0755 /tmp/crio /usr/bin/crio
+    systemctl daemon-reload
+    systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
+    rm -f /tmp/crio
+  fi
+fi
+test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
+  install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
+  /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
+  echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"
+systemctl enable crio --now || { journalctl -xeu crio.service --no-pager >&2; false; }
+systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
 report "CRI-O installed"
 
 # ── Kubernetes packages ──────────────────────────────────────────────────────
@@ -226,7 +255,9 @@ done
 touch /var/lib/node-bootstrap-complete
 report "Bootstrap complete"
 `, nopasswdBlock,
-		wgConf, p.CRIOVersion, p.CRIOVersion,
+		wgConf,
+		p.CRIOVersion, p.CRIOVersion,
+		kubeadm.CrioCommit, kubeadm.CrioAsset,
 		p.KubernetesMinorVersion, p.KubernetesMinorVersion,
 		p.KubernetesVersion, p.KubernetesVersion, p.KubernetesVersion,
 		p.VpnIP,
