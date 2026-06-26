@@ -235,6 +235,9 @@ else \
   echo "installed custom criu $WANT at $CRIU_BIN"; \
 fi`, kubeadm.CriuGitID, kubeadm.CriuAsset),
 				"criu --version || true",
+				// Grant CAP_CHECKPOINT_RESTORE capability so criu can run
+				"sudo setcap cap_checkpoint_restore+eip /usr/sbin/criu || true",
+				"criu check 2>&1 | head -1 || true",
 
 				// Install latest runc, idempotent on version
 				fmt.Sprintf(`WANT=%[1]s; \
