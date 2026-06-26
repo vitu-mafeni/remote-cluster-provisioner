@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	CrioAsset  = "https://github.com/vitu-mafeni/leehun-cri-o/releases/download/crio-1.35.0-restore-from-file/crio"
-	CrioCommit = "a0e6cb3d7f0ca8e9f31131daa17570082e716393"
-	CriuAsset  = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-device-restore-with-hook/criu"
-	CriuGitID  = "eece9e851"
+	CrioAsset   = "https://github.com/vitu-mafeni/leehun-cri-o/releases/download/crio-1.35.0-restore-from-file/crio"
+	CrioCommit  = "a0e6cb3d7f0ca8e9f31131daa17570082e716393"
+	CriuAsset   = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-device-restore-with-hook/criu"
+	CriuGitID   = "eece9e851"
 	RuncVersion = "v1.5.0"
 )
 
@@ -159,6 +159,9 @@ else \
   echo "installed custom criu $WANT at $CRIU_BIN"; \
 fi`, CriuGitID, CriuAsset),
 		"criu --version || true",
+		// Grant CAP_CHECKPOINT_RESTORE capability so criu can run
+		"sudo setcap cap_checkpoint_restore+eip /usr/sbin/criu || true",
+		"criu check 2>&1 | head -1 || true",
 
 		// --- Install latest runc, idempotent on version ---
 		fmt.Sprintf(`WANT=%[1]s; \
