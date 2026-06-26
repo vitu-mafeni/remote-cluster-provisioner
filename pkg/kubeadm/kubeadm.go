@@ -13,6 +13,9 @@ import (
 const (
 	CrioAsset  = "https://github.com/vitu-mafeni/leehun-cri-o/releases/download/crio-1.35.0-restore-from-file/crio"
 	CrioCommit = "a0e6cb3d7f0ca8e9f31131daa17570082e716393"
+	CriuAsset  = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-device-restore-with-hook/criu"
+	CriuGitID  = "eece9e851"
+	RuncVersion = "v1.5.0"
 )
 
 func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (string, error) {
@@ -136,6 +139,41 @@ mode: ipvs
 		printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
 		| sudo tee /etc/crio/crio.conf.d/10-crun.conf`,
 		"sudo systemctl enable crio --now || { sudo journalctl -xeu crio.service --no-pager >&2; false; }",
+
+		// --- Install custom criu (device-restore-with-hook), idempotent on GitID ---
+		fmt.Sprintf(`WANT="%s"; \
+CRIU_BIN=$(command -v criu || echo /usr/sbin/criu); \
+HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}'); \
+if [ "$HAVE" = "$WANT" ]; then \
+  echo "custom criu $WANT already at $CRIU_BIN, skipping"; \
+else \
+  curl -fsSL %s -o /tmp/criu && \
+  chmod 0755 /tmp/criu && \
+  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}') && \
+  [ "$GOT" = "$WANT" ] && \
+  sudo install -m 0755 /tmp/criu "$CRIU_BIN" && \
+  rm -f /tmp/criu && \
+  echo "installed custom criu $WANT at $CRIU_BIN"; \
+fi`, CriuGitID, CriuAsset),
+		"criu --version || true",
+
+		// --- Install latest runc, idempotent on version ---
+		fmt.Sprintf(`WANT=%[1]s; \
+RUNC_BIN=$(command -v runc || echo /usr/local/sbin/runc); \
+HAVE=$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}'); \
+if [ "$HAVE" = "$WANT" ]; then \
+  echo "runc $WANT already installed at $RUNC_BIN, skipping"; \
+else \
+  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.amd64 -o /tmp/runc && \
+  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.sha256sum -o /tmp/runc.sha256sum && \
+  WSHA=$(awk '/ runc\.amd64$/{print $1}' /tmp/runc.sha256sum) && \
+  GSHA=$(sha256sum /tmp/runc | awk '{print $1}') && \
+  [ -n "$WSHA" ] && [ "$WSHA" = "$GSHA" ] && \
+  sudo install -m 0755 /tmp/runc "$RUNC_BIN" && \
+  rm -f /tmp/runc /tmp/runc.sha256sum && \
+  echo "installed runc $WANT at $RUNC_BIN"; \
+fi`, RuncVersion),
+		"runc --version || true",
 
 		// --- swap in the custom restore-from-file binary, idempotent on commit ---
 		fmt.Sprintf(`WANT=%s; \
