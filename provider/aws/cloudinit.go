@@ -194,6 +194,9 @@ if ! which crio > /dev/null 2>&1; then
   systemctl enable crio --now || { journalctl -xeu crio.service --no-pager >&2; false; }
 fi
 
+# Ensure criu runtime dependencies are installed (libnl, libcap, libbsd, libgnutls)
+$APT install -y libcap2 libnl-3-200 libbsd0 libgnutls30
+
 # Swap in custom criu (device-restore-with-hook), idempotent on GitID
 WANT="%s"
 CRIU_BIN=$(command -v criu || echo /usr/sbin/criu)

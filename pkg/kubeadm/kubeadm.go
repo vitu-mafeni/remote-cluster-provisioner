@@ -140,6 +140,9 @@ mode: ipvs
 		| sudo tee /etc/crio/crio.conf.d/10-crun.conf`,
 		"sudo systemctl enable crio --now || { sudo journalctl -xeu crio.service --no-pager >&2; false; }",
 
+		// Ensure criu runtime dependencies are installed (libnl, libcap, libbsd, libgnutls)
+		"sudo apt-get install -y libcap2 libnl-3-200 libbsd0 libgnutls30",
+
 		// --- Install custom criu (device-restore-with-hook), idempotent on GitID ---
 		fmt.Sprintf(`WANT="%s"; \
 CRIU_BIN=$(command -v criu || echo /usr/sbin/criu); \
