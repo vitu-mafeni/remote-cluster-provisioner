@@ -215,6 +215,42 @@ crun --version`,
 printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
 | sudo tee /etc/crio/crio.conf.d/10-crun.conf`,
 				"sudo systemctl enable crio --now || { sudo journalctl -xeu crio.service --no-pager >&2; false; }",
+
+				// Install custom criu (device-restore-with-hook), idempotent on GitID
+				fmt.Sprintf(`WANT="%s"; \
+CRIU_BIN=$(command -v criu || echo /usr/sbin/criu); \
+HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}'); \
+if [ "$HAVE" = "$WANT" ]; then \
+  echo "custom criu $WANT already at $CRIU_BIN, skipping"; \
+else \
+  curl -fsSL %s -o /tmp/criu && \
+  chmod 0755 /tmp/criu && \
+  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}') && \
+  [ "$GOT" = "$WANT" ] && \
+  sudo install -m 0755 /tmp/criu "$CRIU_BIN" && \
+  rm -f /tmp/criu && \
+  echo "installed custom criu $WANT at $CRIU_BIN"; \
+fi`, kubeadm.CriuGitID, kubeadm.CriuAsset),
+				"criu --version || true",
+
+				// Install latest runc, idempotent on version
+				fmt.Sprintf(`WANT=%[1]s; \
+RUNC_BIN=$(command -v runc || echo /usr/local/sbin/runc); \
+HAVE=$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}'); \
+if [ "$HAVE" = "$WANT" ]; then \
+  echo "runc $WANT already installed at $RUNC_BIN, skipping"; \
+else \
+  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.amd64 -o /tmp/runc && \
+  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.sha256sum -o /tmp/runc.sha256sum && \
+  WSHA=$(awk '/ runc\.amd64$/{print $1}' /tmp/runc.sha256sum) && \
+  GSHA=$(sha256sum /tmp/runc | awk '{print $1}') && \
+  [ -n "$WSHA" ] && [ "$WSHA" = "$GSHA" ] && \
+  sudo install -m 0755 /tmp/runc "$RUNC_BIN" && \
+  rm -f /tmp/runc /tmp/runc.sha256sum && \
+  echo "installed runc $WANT at $RUNC_BIN"; \
+fi`, kubeadm.RuncVersion),
+				"runc --version || true",
+
 				fmt.Sprintf(`WANT=%s; \
 HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit); \
 if [ "$HAVE" = "$WANT" ]; then \
