@@ -106,31 +106,7 @@ type: Opaque
 stringData:
   id_rsa: |
     -----BEGIN RSA PRIVATE KEY-----
-    MIIEogIBAAKCAQEA6Kb5qGDJAPDt60rm8JhR4RpzlS9rwaz74ACSjjBRz7uCKvr0
-    jw05oU/cfvEekc7+PjX3O90kAe6EhI3m56WWABoxvXrbyII4MyTIkPKcMBENC0L2
-    9JjZAP+Auo8EGriL2Kpz5DmGzqr/9uRMIjH5a87WCBJ3sxNrKW148b+8ZVO052bS
-    W+VAwH26iq0h31TAHZl8R4jxDMkGH1mbaLP5Q156A29NqPYPW4xh0NCfj3Vpzp4S
-    IcfnJv59rFuA8fBYn1XhtKDvIrQKSTI6igizC/H1/9kXph2fFSmHlvpaRU5HVUQx
-    6naU2QNVfQ2r2gGEeLhidktFmJE3oA+YJ2lGpQIDAQABAoIBAA8byNrGbkdBXjIJ
-    izXUrnyP2zG1AqpxMWo6n0ncmXOEGc/wvDEOCtAO/6K+xd1yM9CWcJfSpKP7eV+i
-    V3xzpGodSV2kvOEok72+hcfj+YClmtNAZgk8Y9tMvG9hGkMh+PL5Hs2Tbs29DSJb
-    cRZHaIs3w26CxIM8n5jxIwmQCgwKY+ISP9t6l/0axOOPwECpgOCQ3yWFeikmVKNe
-    xA/N894Ru/yG0JdJMIbcQJAUd7v53jZI/F2F7QvTLBJtM5zBoH1ycnidGGzPagIn
-    +WaRXxuEe2ZbHUu+EuOYLQSzo6OZKj+OV+CRMFs4sgyG7eYs1QO1TmwM1b6AfhTG
-    TJ11pAECgYEA9sYK7Qo8Hx2DcxvclB+cy+4HlaH8w4ne7RMBOPCTnsVI50tExmTE
-    uVlqtkKaifE0Ken1b/pYX/y3mt2SibbZFBOPh8B4goJMICVP6fCZnfY3dzFNIGK3
-    Wma5EMHKYWGnf7Np1HkXqPQ77ESnC/ww1jIDQW6PLSDqBambaEssAE0CgYEA8VnF
-    pPlz/ZCGq5+eR3fp6AgBjq7kvP4SpuabTlg+7frcL7I5I0pXXL3+k7dKyY+48AEZ
-    E1ORifJxuCAIHw2K7A9yoIGoXKHb9KHXCIGwL0HIg+3qD9+WeI0NTKy6DpbZ6rd4
-    twMcdbvQPKKwGkQlqW6B/k1QMrub2hEjQuHgy7kCgYBOkLSvzP9hJKNSBX/PhNUF
-    tA2kHQN9OarIrbFI8Ib/GG5ifPszcqeTHx2zUzciTbG+2maytPBn9ux5mKtrvtQT
-    6TpcDPIREuyrm1V69Ifj25zDDOYyNluLo4KuDBSjtlR+ep9p7veSadeeHClWzn65
-    4whYT5uz0XPQQ7RfmvcyTQKBgAa+MlZsnb/81LZgzERE5mUULC73Ve6tzomZMceb
-    kY6GjrZKbWw9/Hjb2gv4d/9vo4QZE8FFeXB4NJMnWfK8JyB3QgWX+cM0xndsOhzD
-    us9nMBn3gK2W2pZdonx86unTbx0uqRG75YSojaXUCcWCF+dG7hzTviTctvr9tZV9
-    yBEJAoGAFjw2ZLLaeE2QgOweFpqncEC5/qinpFc51dX8qTMfgNzDxb8EUOTfklBV
-    hTpDPqU5c3ttLkACemOfp9eGUsIXPgCTYrDPzpKk6IIY+QLF8T7ANr1/zyju8SRK
-    jtiM9JLrHsl6kUYB/3G4lUPo6hTcsavKTr1t4FeS1rcOfzswc1I=
+    CHANGE ME
     -----END RSA PRIVATE KEY-----
 ---
 # Secret
@@ -142,4 +118,4 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: "REDACTED"
+  password: "CHANGE ME"
