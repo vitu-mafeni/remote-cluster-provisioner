@@ -128,6 +128,15 @@ mode: ipvs
 		fmt.Sprintf("CRICTL_VERSION=v%s", clean),
 		"sudo apt-get update",
 		"sudo apt-get install -y jq criu crun conmon cri-tools",
+		// Fallback: if crictl isn't available, install from GitHub
+		fmt.Sprintf(`if ! command -v crictl >/dev/null 2>&1; then \
+  CRICTL_VERSION=%s; \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz && \
+  tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl && \
+  rm -f /tmp/crictl.tar.gz && \
+  chmod +x /usr/local/bin/crictl && \
+  ln -sf /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true; \
+fi`, "v1.34.0"),
 		// crun from apt (typically 0.17 on Ubuntu 22.04) rejects OCI spec 1.1.0 with
 		// "unknown version specified". CRI-O 1.35 generates specs at 1.1.0, so we must
 		// install crun >= 1.0 from GitHub and pin CRI-O to use that exact path.
@@ -415,6 +424,15 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
 		"sudo apt-get update",
 		"sudo apt-get install -y jq criu crun conmon cri-tools",
+		// Fallback: if crictl isn't available, install from GitHub
+		fmt.Sprintf(`if ! command -v crictl >/dev/null 2>&1; then \
+  CRICTL_VERSION=%s; \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz && \
+  tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl && \
+  rm -f /tmp/crictl.tar.gz && \
+  chmod +x /usr/local/bin/crictl && \
+  ln -sf /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true; \
+fi`, "v1.34.0"),
 		`CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null) && \
 		{ [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17 && \
 		sudo curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \
