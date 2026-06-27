@@ -118,7 +118,7 @@ report "Running apt-get update"
 $APT update
 
 report "Installing base packages"
-$APT install -y ca-certificates curl gnupg apt-transport-https lsof
+$APT install -y ca-certificates curl gnupg apt-transport-https lsof cri-tools
 
 report "Installing WireGuard"
 $APT install -y wireguard wireguard-tools iputils-ping
