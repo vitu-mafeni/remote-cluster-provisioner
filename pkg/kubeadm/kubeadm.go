@@ -394,13 +394,53 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		sudo chmod 0755 /usr/local/bin/crun && \
 		crun --version`,
 		"sudo apt-get install -y cri-o",
-		// pin absolute crun path so CRI-O uses os.Stat instead of exec.LookPath
-		`CRUN_BIN=$(command -v crun 2>/dev/null || echo /usr/local/bin/crun) && \
-		echo "crun path: $CRUN_BIN" && \
-		sudo mkdir -p /etc/crio/crio.conf.d && \
-		printf '[crio.runtime.runtimes.crun]\nruntime_path = "%s"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' "$CRUN_BIN" \
+		// Hardcode /usr/local/bin/crun — do NOT use command -v crun because that may
+		// resolve to /usr/bin/crun (old apt crun) if /usr/bin precedes /usr/local/bin in PATH.
+		`sudo mkdir -p /etc/crio/crio.conf.d && \
+		printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
 		| sudo tee /etc/crio/crio.conf.d/10-crun.conf`,
 		"sudo systemctl enable crio --now || { sudo journalctl -xeu crio.service --no-pager >&2; false; }",
+
+		// Ensure criu runtime dependencies are installed (libnl, libcap, libbsd, libgnutls)
+		"sudo apt-get install -y libcap2 libnl-3-200 libbsd0 libgnutls30",
+
+		// --- Install custom criu (device-restore-with-hook), idempotent on GitID ---
+		fmt.Sprintf(`WANT="%s"; \
+CRIU_BIN=$(command -v criu || echo /usr/sbin/criu); \
+HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}'); \
+if [ "$HAVE" = "$WANT" ]; then \
+  echo "custom criu $WANT already at $CRIU_BIN, skipping"; \
+else \
+  curl -fsSL %s -o /tmp/criu && \
+  chmod 0755 /tmp/criu && \
+  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}') && \
+  [ "$GOT" = "$WANT" ] && \
+  sudo install -m 0755 /tmp/criu "$CRIU_BIN" && \
+  rm -f /tmp/criu && \
+  echo "installed custom criu $WANT at $CRIU_BIN"; \
+fi`, CriuGitID, CriuAsset),
+		"criu --version || true",
+		// Grant CAP_CHECKPOINT_RESTORE capability so criu can run
+		"sudo setcap cap_checkpoint_restore+eip /usr/sbin/criu || true",
+		"criu check 2>&1 | head -1 || true",
+
+		// --- Install latest runc, idempotent on version ---
+		fmt.Sprintf(`WANT=%[1]s; \
+RUNC_BIN=$(command -v runc || echo /usr/local/sbin/runc); \
+HAVE=$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}'); \
+if [ "$HAVE" = "$WANT" ]; then \
+  echo "runc $WANT already installed at $RUNC_BIN, skipping"; \
+else \
+  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.amd64 -o /tmp/runc && \
+  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.sha256sum -o /tmp/runc.sha256sum && \
+  WSHA=$(awk '/ runc\.amd64$/{print $1}' /tmp/runc.sha256sum) && \
+  GSHA=$(sha256sum /tmp/runc | awk '{print $1}') && \
+  [ -n "$WSHA" ] && [ "$WSHA" = "$GSHA" ] && \
+  sudo install -m 0755 /tmp/runc "$RUNC_BIN" && \
+  rm -f /tmp/runc /tmp/runc.sha256sum && \
+  echo "installed runc $WANT at $RUNC_BIN"; \
+fi`, RuncVersion),
+		"runc --version || true",
 
 		// swap in the custom restore-from-file binary, idempotent on commit
 		fmt.Sprintf(`WANT=%s; \
@@ -448,15 +488,15 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, nodeIP),
 		"sudo systemctl daemon-reload",
 
-		// Ensure CRI-O is fresh before join — restart picks up config changes
-		"sudo systemctl restart crio",
-
-		// Wait for CRI-O socket to be ready (up to 90s)
-		`for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do \
+		// Always restart CRI-O here to pick up any config changes made above
+		// (e.g. new crun path). A passive "is-active || start" misses the case where
+		// CRI-O is active but using stale config from a previous failed provisioning run.
+		`sudo systemctl daemon-reload && sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
+		`for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
 		test -S /var/run/crio/crio.sock && echo "CRI-O socket ready" && break; \
-		echo "Waiting for CRI-O socket ($i/30)..."; sleep 3; \
+		echo "Waiting for CRI-O socket ($i/20)..."; sleep 3; \
 		done; \
-		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 50 >&2; false; }`,
+		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
 
 		// Append --cri-socket to use CRI-O instead of defaulting to containerd
 		fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
