@@ -166,6 +166,15 @@ fi`, vpnNodeIP, vpnNodeIP, wgConfig),
 
 	groups := []stepGroup{
 		{
+			label: "cleaning up previous provisioning state",
+			cmds: []string{
+				"sudo systemctl stop kubelet crio 2>/dev/null || true",
+				"sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true",
+				"sudo umount -l /var/lib/crio 2>/dev/null || true",
+				"sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true",
+			},
+		},
+		{
 			label: "disabling swap and configuring kernel modules",
 			cmds: []string{
 				"sudo swapoff -a",

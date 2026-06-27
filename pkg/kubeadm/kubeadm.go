@@ -91,6 +91,12 @@ mode: ipvs
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
 	steps := []string{
+		// Clean up any leftover state from previous provisioning runs to avoid image cache corruption
+		"sudo systemctl stop kubelet crio 2>/dev/null || true",
+		"sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true",
+		"sudo umount -l /var/lib/crio 2>/dev/null || true",
+		"sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true",
+
 		"sudo apt-get install -y nfs-kernel-server nfs-common",
 		"sudo mkdir -p /srv/nfs/k8s",
 		"sudo chown -R nobody:nogroup /srv/nfs/k8s",
@@ -367,6 +373,12 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
 	steps := []string{
+		// Clean up any leftover state from previous provisioning runs to avoid image cache corruption
+		"sudo systemctl stop kubelet crio 2>/dev/null || true",
+		"sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true",
+		"sudo umount -l /var/lib/crio 2>/dev/null || true",
+		"sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true",
+
 		// =========================
 		// Disable swap
 		// =========================
