@@ -92,6 +92,9 @@ umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
 umount -l /var/lib/crio 2>/dev/null || true
 rm -rf /var/lib/crio /run/crio /var/lib/containers/storage /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true
 
+# Store Kubernetes version for crictl installation
+K8S_VERSION=v%s
+
 # ── Idempotency guard ────────────────────────────────────────────────────────
 if [ -f /var/lib/node-bootstrap-complete ]; then
   report "Bootstrap already completed, skipping"
@@ -128,16 +131,18 @@ $APT update
 report "Installing base packages"
 $APT install -y ca-certificates curl gnupg apt-transport-https lsof cri-tools
 
-# Fallback: if crictl isn't available after apt install, get it from GitHub
+# Ensure crictl is in PATH for controller image pre-pull
+# CRI-tools releases use minor version (e.g., v1.34, not v1.34.2)
 if ! command -v crictl >/dev/null 2>&1; then
-  report "Installing crictl from GitHub (apt install failed or took time)"
-  CRICTL_VERSION=v1.34.0
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz
-  tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl
+  report "Installing crictl from GitHub"
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$K8S_VERSION/crictl-${K8S_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz 2>/dev/null || \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz -o /tmp/crictl.tar.gz
+  sudo tar xzf /tmp/crictl.tar.gz -C /usr/local/bin/ crictl
+  sudo chmod 0755 /usr/local/bin/crictl
   rm -f /tmp/crictl.tar.gz
-  chmod +x /usr/local/bin/crictl
-  ln -sf /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true
+  sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl
 fi
+crictl --version 2>/dev/null || { report "ERROR: crictl not found"; exit 1; }
 
 report "Installing WireGuard"
 $APT install -y wireguard wireguard-tools iputils-ping
@@ -276,6 +281,9 @@ systemctl enable crio --now || { journalctl -xeu crio.service --no-pager >&2; fa
 systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
 report "CRI-O installed"
 
+# Fix storage directory permissions (CRI-O may create with restrictive permissions)
+sudo chmod 0711 /var/lib/crio /var/lib/containers/storage 2>/dev/null || true
+
 # ── Kubernetes packages ──────────────────────────────────────────────────────
 report "Installing Kubernetes packages"
 rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
@@ -355,6 +363,7 @@ done
 touch /var/lib/node-bootstrap-complete
 report "Bootstrap complete"
 `, nopasswdBlock,
+		p.KubernetesVersion,
 		wgConf,
 		p.CRIOVersion, p.CRIOVersion,
 		kubeadm.CriuGitID, kubeadm.CriuAsset,
