@@ -280,6 +280,17 @@ systemctl daemon-reload
 systemctl restart kubelet
 
 # ── Join cluster ─────────────────────────────────────────────────────────────
+report "Waiting for CRI-O socket"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if test -S /var/run/crio/crio.sock; then
+    report "CRI-O socket ready"
+    break
+  fi
+  echo "Waiting for CRI-O socket ($i/20)..."
+  sleep 3
+done
+test -S /var/run/crio/crio.sock || { journalctl -xeu crio.service --no-pager -n 100 >&2; false; }
+
 report "Joining cluster"
 for attempt in 1 2 3 4 5; do
   # Append --cri-socket to use CRI-O instead of defaulting to containerd
