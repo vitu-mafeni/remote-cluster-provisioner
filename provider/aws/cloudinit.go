@@ -280,19 +280,23 @@ systemctl daemon-reload
 systemctl restart kubelet
 
 # ── Join cluster ─────────────────────────────────────────────────────────────
-report "Restarting CRI-O before join"
-systemctl restart crio
+# Always restart CRI-O here to pick up any config changes made above
+# (e.g. new crun path). A passive "is-active || start" misses the case where
+# CRI-O is active but using stale config from a previous failed provisioning run.
+report "Restarting CRI-O and waiting for socket readiness"
+systemctl daemon-reload
+systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
 
-report "Waiting for CRI-O socket"
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+# Wait for CRI-O socket to be ready (up to 60s)
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   if test -S /var/run/crio/crio.sock; then
     report "CRI-O socket ready"
     break
   fi
-  echo "Waiting for CRI-O socket ($i/30)..."
+  echo "Waiting for CRI-O socket ($i/20)..."
   sleep 3
 done
-test -S /var/run/crio/crio.sock || { journalctl -xeu crio.service --no-pager -n 50 >&2; false; }
+test -S /var/run/crio/crio.sock || { journalctl -xeu crio.service --no-pager -n 100 >&2; false; }
 
 report "Joining cluster"
 for attempt in 1 2 3 4 5; do

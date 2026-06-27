@@ -23,5 +23,6 @@ go.work
 .idea
 .vscode
 *.swp
+.claude
 *.swo
 *~
