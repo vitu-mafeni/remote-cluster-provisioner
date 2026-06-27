@@ -121,7 +121,7 @@ mode: ipvs
 		| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
 		fmt.Sprintf("CRICTL_VERSION=v%s", clean),
 		"sudo apt-get update",
-		"sudo apt-get install -y jq criu crun conmon",
+		"sudo apt-get install -y jq criu crun conmon cri-tools",
 		// crun from apt (typically 0.17 on Ubuntu 22.04) rejects OCI spec 1.1.0 with
 		// "unknown version specified". CRI-O 1.35 generates specs at 1.1.0, so we must
 		// install crun >= 1.0 from GitHub and pin CRI-O to use that exact path.
@@ -402,7 +402,7 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
 		| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
 		"sudo apt-get update",
-		"sudo apt-get install -y jq criu crun conmon",
+		"sudo apt-get install -y jq criu crun conmon cri-tools",
 		`CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null) && \
 		{ [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17 && \
 		sudo curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \

@@ -183,7 +183,7 @@ net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
 			label: "installing base packages (apt-get update, curl, gnupg)",
 			cmds: []string{
 				"sudo apt-get update",
-				"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https",
+				"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https cri-tools",
 			},
 		},
 		wgGroup,
