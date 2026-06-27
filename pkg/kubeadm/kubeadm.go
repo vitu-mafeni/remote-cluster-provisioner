@@ -447,6 +447,14 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		// Set kubelet node IP before joining so the node registers with the correct address.
 		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, nodeIP),
 		"sudo systemctl daemon-reload",
+
+		// Wait for CRI-O socket to be ready (up to 60s)
+		`for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
+		test -S /var/run/crio/crio.sock && echo "CRI-O socket ready" && break; \
+		echo "Waiting for CRI-O socket ($i/20)..."; sleep 3; \
+		done; \
+		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
+
 		// Append --cri-socket to use CRI-O instead of defaulting to containerd
 		fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
 
