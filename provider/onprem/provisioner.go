@@ -374,7 +374,8 @@ echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"`,
 	// ============================================================
 
 	reportStep("running kubeadm join (may take several minutes — pulling images and bootstrapping TLS)")
-	joinCmd := fmt.Sprintf("sudo timeout 600 %s", netNodeConfig.Status.ClusterJoinCommand)
+	// Append --cri-socket to use CRI-O instead of defaulting to containerd
+	joinCmd := fmt.Sprintf("sudo timeout 600 %s --cri-socket=unix:///var/run/crio/crio.sock", netNodeConfig.Status.ClusterJoinCommand)
 	if output, err := sshhelper.Run(sshclient, joinCmd); err != nil {
 		return "", "", fmt.Errorf("failed joining cluster: %w\nOutput:\n%s", err, output)
 	}

@@ -282,7 +282,8 @@ systemctl restart kubelet
 # ── Join cluster ─────────────────────────────────────────────────────────────
 report "Joining cluster"
 for attempt in 1 2 3 4 5; do
-  if %s; then
+  # Append --cri-socket to use CRI-O instead of defaulting to containerd
+  if %s --cri-socket=unix:///var/run/crio/crio.sock; then
     report "Cluster join succeeded"
     break
   fi
