@@ -390,6 +390,28 @@ test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-page
 		return "", "", fmt.Errorf("CRI-O socket not ready: %w\nOutput:\n%s", err, output)
 	}
 
+	// CRI-O recovery: when swapping binaries (especially custom CRI-O), the image cache
+	// can become inconsistent, causing containers to fail with "image not found" errors.
+	// Force a clean reset: stop services, unmount overlay storage, clear cache, restart.
+	reportStep("checking CRI-O image cache consistency")
+	if output, err := sshhelper.Run(sshclient, `if ! sudo systemctl is-active crio >/dev/null 2>&1 || ! test -S /var/run/crio/crio.sock; then \
+  echo "CRI-O not responding, force-resetting image cache"; \
+  sudo systemctl stop kubelet crio 2>/dev/null || true; \
+  sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true; \
+  sudo umount -l /var/lib/crio 2>/dev/null || true; \
+  sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true; \
+  sudo systemctl restart crio; \
+  sleep 5; \
+  for i in 1 2 3 4 5; do \
+    test -S /var/run/crio/crio.sock && break; \
+    sleep 3; \
+  done; \
+  sudo systemctl restart kubelet; \
+  sleep 10; \
+fi`); err != nil {
+		return "", "", fmt.Errorf("CRI-O recovery failed: %w\nOutput:\n%s", err, output)
+	}
+
 	reportStep("running kubeadm join (may take several minutes — pulling images and bootstrapping TLS)")
 	// Append --cri-socket to use CRI-O instead of defaulting to containerd
 	joinCmd := fmt.Sprintf("sudo timeout 600 %s --cri-socket=unix:///var/run/crio/crio.sock", netNodeConfig.Status.ClusterJoinCommand)
