@@ -84,6 +84,14 @@ report() {
 
 report "Bootstrap started"
 
+# ── Clean up previous provisioning state ──────────────────────────────────────
+# Remove any leftover CRI-O and kubelet state to avoid image cache corruption
+report "Cleaning up previous provisioning state"
+systemctl stop kubelet crio 2>/dev/null || true
+umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+umount -l /var/lib/crio 2>/dev/null || true
+rm -rf /var/lib/crio /run/crio /var/lib/containers/storage /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true
+
 # ── Idempotency guard ────────────────────────────────────────────────────────
 if [ -f /var/lib/node-bootstrap-complete ]; then
   report "Bootstrap already completed, skipping"
