@@ -194,14 +194,16 @@ net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
 				"sudo apt-get update",
 				"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https cri-tools",
 				// Fallback: if crictl isn't available after apt install, get it from GitHub
-				`if ! command -v crictl >/dev/null 2>&1; then \
-  CRICTL_VERSION=v1.34.0; \
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz && \
-  tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl && \
-  rm -f /tmp/crictl.tar.gz && \
-  chmod +x /usr/local/bin/crictl && \
-  ln -sf /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true; \
-fi`,
+				fmt.Sprintf(`if ! command -v crictl >/dev/null 2>&1; then \
+  CRICTL_VERSION=v%s; \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz 2>/dev/null || \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz -o /tmp/crictl.tar.gz; \
+  sudo tar xzf /tmp/crictl.tar.gz -C /usr/local/bin/ crictl; \
+  sudo chmod 0755 /usr/local/bin/crictl; \
+  rm -f /tmp/crictl.tar.gz; \
+  sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl; \
+fi; \
+crictl --version || (echo "crictl installation failed"; exit 1)`, repoVersion),
 			},
 		},
 		wgGroup,
