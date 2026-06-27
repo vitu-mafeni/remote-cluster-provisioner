@@ -128,6 +128,17 @@ $APT update
 report "Installing base packages"
 $APT install -y ca-certificates curl gnupg apt-transport-https lsof cri-tools
 
+# Fallback: if crictl isn't available after apt install, get it from GitHub
+if ! command -v crictl >/dev/null 2>&1; then
+  report "Installing crictl from GitHub (apt install failed or took time)"
+  CRICTL_VERSION=v1.34.0
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz
+  tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl
+  rm -f /tmp/crictl.tar.gz
+  chmod +x /usr/local/bin/crictl
+  ln -sf /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true
+fi
+
 report "Installing WireGuard"
 $APT install -y wireguard wireguard-tools iputils-ping
 
