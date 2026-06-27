@@ -128,15 +128,18 @@ mode: ipvs
 		fmt.Sprintf("CRICTL_VERSION=v%s", clean),
 		"sudo apt-get update",
 		"sudo apt-get install -y jq criu crun conmon cri-tools",
-		// Fallback: if crictl isn't available, install from GitHub
-		fmt.Sprintf(`if ! command -v crictl >/dev/null 2>&1; then \
-  CRICTL_VERSION=%s; \
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz && \
-  tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl && \
-  rm -f /tmp/crictl.tar.gz && \
-  chmod +x /usr/local/bin/crictl && \
-  ln -sf /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true; \
-fi`, "v1.34.0"),
+		// Ensure crictl is available in PATH for image pre-pull
+		// CRI-tools releases use minor version (e.g., v1.34, not v1.34.2)
+		fmt.Sprintf(`CRICTL_VERSION=v%s; \
+if ! command -v crictl >/dev/null 2>&1; then \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz 2>/dev/null || \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz -o /tmp/crictl.tar.gz; \
+  sudo tar xzf /tmp/crictl.tar.gz -C /usr/local/bin/ crictl; \
+  sudo chmod 0755 /usr/local/bin/crictl; \
+  rm -f /tmp/crictl.tar.gz; \
+  sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl; \
+fi; \
+crictl --version || (echo "crictl installation failed"; exit 1)`, repoVersion),
 		// crun from apt (typically 0.17 on Ubuntu 22.04) rejects OCI spec 1.1.0 with
 		// "unknown version specified". CRI-O 1.35 generates specs at 1.1.0, so we must
 		// install crun >= 1.0 from GitHub and pin CRI-O to use that exact path.
@@ -154,6 +157,8 @@ fi`, "v1.34.0"),
 		printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
 		| sudo tee /etc/crio/crio.conf.d/10-crun.conf`,
 		"sudo systemctl enable crio --now || { sudo journalctl -xeu crio.service --no-pager >&2; false; }",
+		// Fix storage directory permissions (CRI-O may create with restrictive permissions)
+		"sudo chmod 0711 /var/lib/crio /var/lib/containers/storage 2>/dev/null || true",
 
 		// Ensure criu runtime dependencies are installed (libnl, libcap, libbsd, libgnutls)
 		"sudo apt-get install -y libcap2 libnl-3-200 libbsd0 libgnutls30",
@@ -284,6 +289,12 @@ exit $RC )`,
 		"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
 		"kubectl taint nodes --all node-role.kubernetes.io/control-plane- || kubectl taint nodes --all node-role.kubernetes.io/master- || true",
 		fmt.Sprintf("kubectl label nodes --all hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
+		// Pre-pull core images with fresh metadata after kubeadm init to avoid stale image cache
+		`echo "Pre-pulling core Kubernetes images for cache freshness..." && \
+		for img in pause:3.10.1 coredns:1.11.3; do \
+		  sudo crictl pull registry.k8s.io/$img 2>/dev/null || echo "Pre-pull of $img completed"; \
+		done && \
+		echo "Core images pre-pulled"`,
 		"kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml",
 		"kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--iface=wg0\"}]'",
 		"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
@@ -424,15 +435,18 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
 		"sudo apt-get update",
 		"sudo apt-get install -y jq criu crun conmon cri-tools",
-		// Fallback: if crictl isn't available, install from GitHub
-		fmt.Sprintf(`if ! command -v crictl >/dev/null 2>&1; then \
-  CRICTL_VERSION=%s; \
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz && \
-  tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl && \
-  rm -f /tmp/crictl.tar.gz && \
-  chmod +x /usr/local/bin/crictl && \
-  ln -sf /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true; \
-fi`, "v1.34.0"),
+		// Ensure crictl is available in PATH for image pre-pull
+		// CRI-tools releases use minor version (e.g., v1.34, not v1.34.2)
+		fmt.Sprintf(`CRICTL_VERSION=v%s; \
+if ! command -v crictl >/dev/null 2>&1; then \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz 2>/dev/null || \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz -o /tmp/crictl.tar.gz; \
+  sudo tar xzf /tmp/crictl.tar.gz -C /usr/local/bin/ crictl; \
+  sudo chmod 0755 /usr/local/bin/crictl; \
+  rm -f /tmp/crictl.tar.gz; \
+  sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl; \
+fi; \
+crictl --version || (echo "crictl installation failed"; exit 1)`, repoVersion),
 		`CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null) && \
 		{ [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17 && \
 		sudo curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \

@@ -667,10 +667,22 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 			// see no running job and restart unnecessarily.  Only the consumer
 			// (the poll branch below) deletes the entry.
 
-			// When no explicit credentials are configured, clear any stale registry
-			// auth files that may exist on the node (e.g. from a previous docker login
-			// or a cloud image that ships with credentials baked in).
-			if credsCopy == "" {
+			// Configure registry credentials if provided
+			if credsCopy != "" {
+				// Write Docker auth config for crictl to use
+				parts := strings.Split(credsCopy, ":")
+				if len(parts) == 2 {
+					username, password := parts[0], parts[1]
+					// Create auth.json in proper format for crictl
+					authJSON := fmt.Sprintf(`{"auths":{"docker.io":{"username":"%s","password":"%s"}}}`,
+						strings.ReplaceAll(username, "\"", "\\\""),
+						strings.ReplaceAll(password, "\"", "\\\""))
+					cmd := fmt.Sprintf("echo '%s' | sudo tee /etc/containers/auth.json > /dev/null && sudo chmod 0600 /etc/containers/auth.json",
+						strings.ReplaceAll(authJSON, "'", "'\\''"))
+					_, _ = ssh.Run(sshClient, cmd)
+				}
+			} else {
+				// Clear stale registry auth files when no credentials configured
 				authFiles := []string{
 					"/root/.docker/config.json",
 					"/run/containers/0/auth.json",
@@ -688,14 +700,12 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 					continue
 				}
 				glog.Info("Pulling image", "image", img)
-				var cmd string
-				if credsCopy != "" {
-					// Wrap with timeout so a stalled pull (e.g. dead TCP without
-					// keepalive) doesn't block the goroutine indefinitely.
-					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull --creds %s %s", credsCopy, img)
-				} else {
-					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull %s", img)
-				}
+				// Use full path to crictl since sudo may not have the same PATH.
+				// Try /usr/local/bin first (from fallback install), then /usr/bin.
+				crictl := `CRICTL=$(command -v crictl 2>/dev/null || echo /usr/local/bin/crictl); [ -x "$CRICTL" ] || CRICTL=/usr/bin/crictl; sudo timeout 7200 "$CRICTL"`
+				// Credentials are configured via /etc/containers/auth.json if needed
+				// crictl will automatically use it for authentication
+				cmd := fmt.Sprintf("%s pull %s", crictl, img)
 				output, pullErr := ssh.Run(sshClient, cmd)
 				if pullErr != nil {
 					ch <- prepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
