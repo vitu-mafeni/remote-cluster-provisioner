@@ -373,19 +373,20 @@ echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"`,
 	// pulls stall or the API server becomes temporarily unreachable.
 	// ============================================================
 
-	// Ensure CRI-O is fresh before join — restart picks up config changes
-	reportStep("restarting CRI-O")
-	if output, err := sshhelper.Run(sshclient, "sudo systemctl restart crio"); err != nil {
+	// Always restart CRI-O here to pick up any config changes made above
+	// (e.g. new crun path). A passive "is-active || start" misses the case where
+	// CRI-O is active but using stale config from a previous failed provisioning run.
+	reportStep("restarting CRI-O and waiting for socket readiness")
+	if output, err := sshhelper.Run(sshclient, `sudo systemctl daemon-reload && sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`); err != nil {
 		return "", "", fmt.Errorf("failed to restart CRI-O: %w\nOutput:\n%s", err, output)
 	}
 
-	// Wait for CRI-O socket to be ready before join (up to 90s)
-	reportStep("waiting for CRI-O socket")
-	if output, err := sshhelper.Run(sshclient, `for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do \
+	// Wait for CRI-O socket to be ready before join (up to 60s)
+	if output, err := sshhelper.Run(sshclient, `for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
 test -S /var/run/crio/crio.sock && echo "CRI-O socket ready" && break; \
-echo "Waiting for CRI-O socket ($i/30)..."; sleep 3; \
+echo "Waiting for CRI-O socket ($i/20)..."; sleep 3; \
 done; \
-test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 50 >&2; false; }`); err != nil {
+test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`); err != nil {
 		return "", "", fmt.Errorf("CRI-O socket not ready: %w\nOutput:\n%s", err, output)
 	}
 
