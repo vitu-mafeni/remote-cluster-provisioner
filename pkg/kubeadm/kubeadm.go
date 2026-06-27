@@ -234,6 +234,22 @@ fi`, RuncVersion),
 		echo "Waiting for CRI-O socket ($i/20)..."; sleep 3; \
 		done; \
 		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
+		`echo "Checking CRI-O image cache consistency..."; \
+		if ! sudo systemctl is-active crio >/dev/null 2>&1 || ! test -S /var/run/crio/crio.sock; then \
+		  echo "CRI-O not responding, force-resetting image cache"; \
+		  sudo systemctl stop kubelet crio 2>/dev/null || true; \
+		  sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true; \
+		  sudo umount -l /var/lib/crio 2>/dev/null || true; \
+		  sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true; \
+		  sudo systemctl restart crio; \
+		  sleep 5; \
+		  for i in 1 2 3 4 5; do \
+		    test -S /var/run/crio/crio.sock && break; \
+		    sleep 3; \
+		  done; \
+		  sudo systemctl restart kubelet; \
+		  sleep 10; \
+		fi`,
 		`test -f /etc/kubernetes/admin.conf || ( \
 sudo kubeadm init --config /tmp/kubeadm-config.yaml; RC=$?; \
 if [ $RC -ne 0 ]; then \
@@ -497,6 +513,26 @@ fi`, RuncVersion),
 		echo "Waiting for CRI-O socket ($i/20)..."; sleep 3; \
 		done; \
 		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
+
+		// CRI-O recovery: when swapping binaries (especially custom CRI-O), the image cache
+		// can become inconsistent, causing containers to fail with "image not found" errors.
+		// Force a clean reset: stop services, unmount overlay storage, clear cache, restart.
+		`echo "Checking CRI-O image cache consistency..."; \
+		if ! sudo systemctl is-active crio >/dev/null 2>&1 || ! test -S /var/run/crio/crio.sock; then \
+		  echo "CRI-O not responding, force-resetting image cache"; \
+		  sudo systemctl stop kubelet crio 2>/dev/null || true; \
+		  sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true; \
+		  sudo umount -l /var/lib/crio 2>/dev/null || true; \
+		  sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true; \
+		  sudo systemctl restart crio; \
+		  sleep 5; \
+		  for i in 1 2 3 4 5; do \
+		    test -S /var/run/crio/crio.sock && break; \
+		    sleep 3; \
+		  done; \
+		  sudo systemctl restart kubelet; \
+		  sleep 10; \
+		fi`,
 
 		// Append --cri-socket to use CRI-O instead of defaulting to containerd
 		fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),

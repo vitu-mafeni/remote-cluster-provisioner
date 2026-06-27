@@ -298,6 +298,26 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
 done
 test -S /var/run/crio/crio.sock || { journalctl -xeu crio.service --no-pager -n 100 >&2; false; }
 
+# CRI-O recovery: when swapping binaries (especially custom CRI-O), the image cache
+# can become inconsistent, causing containers to fail with "image not found" errors.
+# Force a clean reset: stop services, unmount overlay storage, clear cache, restart.
+report "Checking CRI-O image cache consistency"
+if ! systemctl is-active crio >/dev/null 2>&1 || ! test -S /var/run/crio/crio.sock; then
+  report "CRI-O not responding, force-resetting image cache"
+  systemctl stop kubelet crio 2>/dev/null || true
+  umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+  umount -l /var/lib/crio 2>/dev/null || true
+  rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
+  systemctl restart crio
+  sleep 5
+  for i in 1 2 3 4 5; do
+    test -S /var/run/crio/crio.sock && break
+    sleep 3
+  done
+  systemctl restart kubelet
+  sleep 10
+fi
+
 report "Joining cluster"
 for attempt in 1 2 3 4 5; do
   # Append --cri-socket to use CRI-O instead of defaulting to containerd
