@@ -447,7 +447,8 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		// Set kubelet node IP before joining so the node registers with the correct address.
 		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, nodeIP),
 		"sudo systemctl daemon-reload",
-		fmt.Sprintf("sudo %s", joinCmd),
+		// Append --cri-socket to use CRI-O instead of defaulting to containerd
+		fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
 
 		// // =========================
 		// // Label this node
