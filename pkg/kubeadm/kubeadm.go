@@ -448,12 +448,15 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, nodeIP),
 		"sudo systemctl daemon-reload",
 
-		// Wait for CRI-O socket to be ready (up to 60s)
-		`for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
+		// Ensure CRI-O is fresh before join — restart picks up config changes
+		"sudo systemctl restart crio",
+
+		// Wait for CRI-O socket to be ready (up to 90s)
+		`for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do \
 		test -S /var/run/crio/crio.sock && echo "CRI-O socket ready" && break; \
-		echo "Waiting for CRI-O socket ($i/20)..."; sleep 3; \
+		echo "Waiting for CRI-O socket ($i/30)..."; sleep 3; \
 		done; \
-		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
+		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 50 >&2; false; }`,
 
 		// Append --cri-socket to use CRI-O instead of defaulting to containerd
 		fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
