@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	infrav1 "dcn.ssu.ac.kr/infra/api/v1" // Add the correct import path for infrav1
+	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/pkg/argocd"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
@@ -17,12 +17,123 @@ const (
 	CriuAsset   = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-device-restore-with-hook/criu"
 	CriuGitID   = "eece9e851"
 	RuncVersion = "v1.5.0"
+
+	crioSock = "unix:///var/run/crio/crio.sock"
 )
+
+// crioReadyCheck polls crictl until CRI-O responds over gRPC or times out after 90 s.
+// Socket existence alone is not sufficient — CRI-O can be mid-startup with a socket that
+// refuses connections.
+const crioReadyCheck = `for i in $(seq 1 30); do \
+sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info >/dev/null 2>&1 \
+  && echo "CRI-O ready" && break; \
+echo "Waiting for CRI-O ($i/30)..."; sleep 3; \
+done; \
+sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
+  || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`
+
+// crioBuildSteps returns the ordered shell commands that build conmon and CRI-O from
+// source, install them, and write all required runtime configuration.  The steps are
+// identical for control-plane and worker nodes.
+//
+// Key fixes vs the previous version:
+//   - sudo make install.systemd installs the source-built service file that points to
+//     /usr/local/bin/crio, preventing the "two binaries fighting" problem where the apt
+//     service file would start /usr/bin/crio instead of the custom binary.
+//   - /usr/bin/crio is symlinked to /usr/local/bin/crio as a belt-and-suspenders fallback.
+//   - conmon is symlinked to /usr/libexec/crio/conmon, which is CRI-O's hard-coded search
+//     path when it cannot find conmon via PATH.
+//   - crictl.yaml is written so crictl works without --runtime-endpoint.
+//   - CRI-O drop-in uses only [crio.runtime] — [crio.image] has no listen key and was
+//     silently breaking drop-in parsing.
+//   - CNI directories are created before CRI-O starts so the CNI plugin probe succeeds.
+func crioBuildSteps(repoVersion, clean string) []string {
+	return []string{
+		// ── Build deps ──────────────────────────────────────────────────────────────
+		"sudo apt-get install -y build-essential libgpgme-dev gcc xmlto asciidoc " +
+			"libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler " +
+			"python3-protobuf uuid-dev libbsd-dev libnftables-dev libcap-dev libnl-3-dev " +
+			"libnet1-dev libaio-dev libgnutls28-dev libdrm-dev --no-install-recommends",
+		"sudo dpkg --configure -a",
+		"sudo apt-get install -y git make pkg-config libassuan-dev libglib2.0-dev " +
+			"libc6-dev libgpg-error-dev libseccomp-dev libsystemd-dev libselinux1-dev " +
+			"libbtrfs-dev libudev-dev software-properties-common go-md2man runc crun",
+
+		// ── Go 1.26.4 (golang-go from apt is ≤1.21; go.mod requires 1.26.4) ────────
+		`GO_VER=1.26.4; \
+curl -fsSL https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz -o /tmp/go.tar.gz && \
+sudo rm -rf /usr/local/go && \
+sudo tar -C /usr/local -xzf /tmp/go.tar.gz && \
+rm -f /tmp/go.tar.gz && \
+/usr/local/go/bin/go version`,
+
+		// ── conmon from source ────────────────────────────────────────────────────────
+		// CRI-O has a hard-coded search list that includes /usr/libexec/crio/conmon;
+		// symlink the source-built binary there so CRI-O finds it without extra config.
+		`sudo rm -rf /tmp/conmon && \
+git clone https://github.com/containers/conmon /tmp/conmon && \
+cd /tmp/conmon && \
+PATH=/usr/local/go/bin:$PATH make && \
+sudo make install && \
+sudo mkdir -p /usr/libexec/crio && \
+sudo ln -sf /usr/local/bin/conmon /usr/libexec/crio/conmon && \
+rm -rf /tmp/conmon`,
+
+		// ── CRI-O from source ─────────────────────────────────────────────────────────
+		// make install        → /usr/local/bin/crio
+		// make install.config → /etc/crio/ defaults
+		// make install.systemd → /usr/local/lib/systemd/system/crio.service  (points to
+		//                         /usr/local/bin/crio, not the apt binary at /usr/bin/crio)
+		`sudo rm -rf /tmp/custom-crio && \
+git clone https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio \
+  -b 2026-02-03/support-restore-from-file && \
+cd /tmp/custom-crio && \
+PATH=/usr/local/go/bin:$PATH make && \
+sudo make install && \
+sudo make install.config && \
+sudo make install.systemd 2>/dev/null || true && \
+rm -rf /tmp/custom-crio`,
+
+		// Belt-and-suspenders: if the apt service file (/lib/systemd/system/crio.service)
+		// is used instead of the source-built one, ensure /usr/bin/crio also resolves to
+		// the custom binary so systemd ExecStart=/usr/bin/crio runs the right thing.
+		`sudo ln -sf /usr/local/bin/crio /usr/bin/crio`,
+		`sudo ln -sf /usr/local/bin/crio-status /usr/bin/crio-status 2>/dev/null || true`,
+
+		// ── crictl ────────────────────────────────────────────────────────────────────
+		fmt.Sprintf(`curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s/crictl-v%s-linux-amd64.tar.gz \
+  | sudo tar -C /usr/local/bin -xzf - crictl && \
+sudo chmod 0755 /usr/local/bin/crictl && \
+sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl`, clean, clean),
+
+		// ── CRI-O configuration ──────────────────────────────────────────────────────
+		// crictl.yaml — without this crictl falls back to runtime detection which can
+		// pick containerd or an empty socket.
+		`printf 'runtime-endpoint: unix:///var/run/crio/crio.sock\n` +
+			`image-endpoint: unix:///var/run/crio/crio.sock\n` +
+			`timeout: 30\n` +
+			`debug: false\n' | sudo tee /etc/crictl.yaml > /dev/null`,
+
+		// Drop-in: socket path + conmon path.
+		// Only [crio.runtime] has a listen key; [crio.image] does not — the old config
+		// with [crio.image] listen = "..." was silently ignored or broke parsing.
+		`sudo mkdir -p /etc/crio/crio.conf.d && \
+printf '[crio.runtime]\nlisten = "/var/run/crio/crio.sock"\nconmon = "/usr/local/bin/conmon"\n' \
+  | sudo tee /etc/crio/crio.conf.d/10-paths.conf > /dev/null`,
+
+		// Container image pull policy.
+		`sudo mkdir -p /etc/containers && \
+printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' \
+  | sudo tee /etc/containers/policy.json > /dev/null`,
+
+		// CNI directories must exist before CRI-O starts so the CNI plugin probe passes.
+		`sudo mkdir -p /etc/cni/net.d /opt/cni/bin`,
+	}
+}
 
 func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (string, error) {
 	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
 
-	// Resolve the control plane's VPN IP from wg0 first — needed for kubeadmConfig and kubelet args.
 	tunIP, err := GetTunIP(client)
 	if err != nil {
 		return "", fmt.Errorf("failed to get control plane wg0 IP: %w", err)
@@ -30,6 +141,11 @@ func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteClu
 	log.Printf("Control plane VPN IP: %s", tunIP)
 
 	clean := strings.TrimPrefix(cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion, "v")
+	parts := strings.Split(clean, ".")
+	if len(parts) < 2 {
+		return "", fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion)
+	}
+	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
 	kubeadmConfig := fmt.Sprintf(`
 apiVersion: kubeadm.k8s.io/v1beta4
@@ -84,31 +200,27 @@ kind: KubeProxyConfiguration
 mode: ipvs
 `, tunIP, clean, cluster.Spec.ClusterName)
 
-	parts := strings.Split(clean, ".")
-	if len(parts) < 2 {
-		return "", fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion)
-	}
-
-	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
-
 	steps := []string{
-		// Stop services; leave CRI-O storage intact so the custom binary can read its own metadata.
-		// Wiping /var/lib/containers/storage causes "image not known" desync and
-		// deleting /run/crio causes a directory-recreation race that produces "permission denied"
-		// on the socket — kubeadm reset handles the Kubernetes-side state.
+		// ── Phase 0: Cleanup (idempotent) ────────────────────────────────────────────
+		// Stop services first; then use kubeadm reset to clean Kubernetes state.
+		// Do NOT wipe /var/lib/containers/storage or /run/crio:
+		//   - storage wipe → "image not known" desync after kubelet restarts
+		//   - /run/crio wipe → directory-recreation race → "permission denied" on socket
 		"sudo systemctl stop kubelet 2>/dev/null || true",
 		"sudo systemctl stop crio 2>/dev/null || true",
 		"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
-		// "sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
+		"sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
 
+		// ── Phase 1: NFS server ───────────────────────────────────────────────────────
 		"sudo apt-get install -y nfs-kernel-server nfs-common",
 		"sudo mkdir -p /srv/nfs/k8s",
 		"sudo chown -R nobody:nogroup /srv/nfs/k8s",
 		"sudo chmod 755 /srv/nfs/k8s",
 		"echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports",
 		"sudo exportfs -ra",
-		"sudo systemctl enable nfs-kernel-server",
-		"sudo systemctl restart nfs-kernel-server",
+		"sudo systemctl enable --now nfs-kernel-server",
+
+		// ── Phase 2: System settings ──────────────────────────────────────────────────
 		"sudo swapoff -a",
 		`sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab`,
 		`echo -e "overlay\nbr_netfilter" | sudo tee /etc/modules-load.d/k8s.conf`,
@@ -116,138 +228,90 @@ mode: ipvs
 		"sudo modprobe br_netfilter",
 		`echo -e "net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
 		"sudo sysctl --system",
+
+		// ── Phase 3: APT repos ────────────────────────────────────────────────────────
 		"sudo apt-get update",
 		"sudo apt-get install -y ca-certificates software-properties-common curl gnupg apt-transport-https",
 		"sudo install -m 0755 -d /etc/apt/keyrings",
-
-		// add repositories
 		"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
-		"sudo mkdir -p /etc/apt/keyrings",
 		fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
 		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null`, repoVersion),
-
-		fmt.Sprintf(`sudo curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key |     sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
+		fmt.Sprintf(`sudo curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
 		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
+		"sudo apt-get update",
+	}
 
-		// install dependencies packages and custom cri-o
-		"sudo apt-get install -y build-essential libgpgme-dev pkg-config gcc xmlto build-essential asciidoc libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler python3-protobuf pkg-config uuid-dev libbsd-dev libnftables-dev libcap-dev libnl-3-dev libnet1-dev libaio-dev libgnutls28-dev libdrm-dev --no-install-recommends",
-		"sudo dpkg --configure -a",
-		"sudo apt-get install -y     git     gcc     make     pkg-config     libassuan-dev     libglib2.0-dev     libc6-dev     libgpgme-dev     libgpg-error-dev     libseccomp-dev     libsystemd-dev     libselinux1-dev     libbtrfs-dev     libudev-dev     software-properties-common     go-md2man     runc     crun",
+	// ── Phase 4: Build CRI-O (shared steps) ──────────────────────────────────────
+	steps = append(steps, crioBuildSteps(repoVersion, clean)...)
 
-		// go.mod requires go 1.26.4 — golang-go from apt is too old (≤1.21).
-		// Download the exact version from golang.org and install to /usr/local/go.
-		`GO_VER=1.26.4; \
-		curl -fsSL https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz -o /tmp/go.tar.gz && \
-		sudo rm -rf /usr/local/go && \
-		sudo tar -C /usr/local -xzf /tmp/go.tar.gz && \
-		rm -f /tmp/go.tar.gz && \
-		/usr/local/go/bin/go version`,
-
-		"sudo rm -rf /tmp/conmon && git clone https://github.com/containers/conmon /tmp/conmon && cd /tmp/conmon && PATH=/usr/local/go/bin:$PATH make && sudo make install && cd - && rm -rf /tmp/conmon",
-
-		// Each SSH step runs in its own shell — cd does not persist, so clone+build must
-		// be one chained command executed inside the repo directory.
-		// PATH must include /usr/local/go/bin so that make finds the correct Go version.
-		`sudo rm -rf /tmp/custom-crio && \
-		git clone https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio -b 2026-02-03/support-restore-from-file && \
-		cd /tmp/custom-crio && \
-		PATH=/usr/local/go/bin:$PATH make && \
-		sudo make install && \
-		sudo make install.config && \
-		rm -rf /tmp/custom-crio`,
-
-		`sudo mkdir -p /etc/crio/crio.conf.d && \
-		echo '[crio.runtime]
-		listen = "/var/run/crio/crio.sock"
-		stream_address = "127.0.0.1"
-		[crio.image]
-		listen = "/var/run/crio/crio.sock"' | sudo tee /etc/crio/crio.conf.d/00-sock-path.conf`,
-
-		fmt.Sprintf(`curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s/crictl-v%s-linux-amd64.tar.gz | sudo tar -C /usr/local/bin -xzf - crictl && \
-sudo chmod 0755 /usr/local/bin/crictl && \
-sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl`, clean, clean),
-
-		`sudo tee /etc/crictl.yaml >/dev/null <<EOF
-		runtime-endpoint: unix:///var/run/crio/crio.sock
-		image-endpoint: unix:///var/run/crio/crio.sock
-		timeout: 10
-		debug: false
-		EOF`,
-
+	steps = append(steps,
+		// ── Phase 5: Start CRI-O ─────────────────────────────────────────────────────
 		"sudo systemctl daemon-reload",
 		"sudo systemctl enable crio",
-		"sudo systemctl start crio",
-		"sudo systemctl status crio --no-pager || true",
+		// Wipe stale container/image state using the CUSTOM binary (now at /usr/bin/crio
+		// via symlink), so storage is cleaned in the format the custom binary understands.
+		"sudo crio wipe -f 2>/dev/null || true",
+		`sudo systemctl start crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
+		crioReadyCheck,
 
-		// repoVersion MUST be "1.35" so the packaged conmon/runc/config match the custom binary
-		// "sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg",
-		// fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
-		// | gpg --dearmor | sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
-
-		// fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
-		// https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
-		// | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
-
-		"sudo apt-get update",
-
-		"runc --version || true",
-
-		"sudo apt-get update",
+		// ── Phase 6: Install Kubernetes components ────────────────────────────────────
 		fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages", clean, clean, clean),
 		"sudo apt-mark hold kubelet kubeadm kubectl",
 		"sudo systemctl enable kubelet",
-		"sudo systemctl daemon-reload",
-		// Set kubelet node IP to VPN IP before init.
-		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, tunIP),
-		"sudo systemctl daemon-reload",
-		`sudo mkdir /var/lib/kubelet/plugins/kubernetes.io/empty-dir -f || true && \
-		sudo mkdir -p /etc/containers && \
-		echo '{"default":[{"type":"insecureAcceptAnything"}]}' \
-		| sudo tee /etc/containers/policy.json > /dev/null`,
-		fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF", kubeadmConfig),
-		// apt-get install kubelet may have auto-started kubelet; stop it so kubeadm init controls the lifecycle.
+		// apt may auto-start kubelet; stop it so kubeadm init owns the first start.
 		"sudo systemctl stop kubelet 2>/dev/null || true",
-		// One final restart to pick up all config (node-ip, containers policy, etc.) before kubeadm init.
-		// No restart after init — that would lose image metadata populated by kubeadm.
-		`sudo systemctl daemon-reload && sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
-		// Wait until CRI-O actually responds — socket existence is not enough.
-		`for i in $(seq 1 30); do \
-		sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info >/dev/null 2>&1 && echo "CRI-O ready" && break; \
-		echo "Waiting for CRI-O ($i/30)..."; sleep 3; \
-		done; \
-		sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
+		// Kubelet extra args: advertise VPN IP so the node registers with its WireGuard address.
+		fmt.Sprintf(`printf 'KUBELET_EXTRA_ARGS=--node-ip=%s\n' | sudo tee /etc/default/kubelet > /dev/null`, tunIP),
+		// Drop-in: kubelet must start after CRI-O is ready.
+		`sudo mkdir -p /etc/systemd/system/kubelet.service.d && \
+printf '[Unit]\nAfter=crio.service\nRequires=crio.service\n' \
+  | sudo tee /etc/systemd/system/kubelet.service.d/10-crio.conf > /dev/null`,
+		"sudo systemctl daemon-reload",
+
+		// ── Phase 7: kubeadm init ────────────────────────────────────────────────────
+		`sudo mkdir -p /var/lib/kubelet /etc/containers`,
+		fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF", kubeadmConfig),
+		// Verify CRI-O is still healthy before handing control to kubeadm.
+		`sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
+  || { sudo systemctl restart crio && sleep 5 && \
+       sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
+       || { sudo journalctl -xeu crio.service --no-pager >&2; false; }; }`,
 		`test -f /etc/kubernetes/admin.conf || ( \
 sudo kubeadm init --config /tmp/kubeadm-config.yaml; RC=$?; \
 if [ $RC -ne 0 ]; then \
-echo "=== crictl ps -a ===" >&2; \
-sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a >&2 2>&1 || true; \
-CIDS=$(sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a -q 2>/dev/null | head -6); \
-for CID in $CIDS; do \
-echo "=== container logs: $CID ===" >&2; \
-sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock logs --tail=50 "$CID" >&2 2>&1 || true; \
-done; \
-echo "=== kubelet journal ===" >&2; \
-sudo journalctl -xeu kubelet --no-pager -n 80 >&2 2>&1 || true; \
+  echo "=== crictl ps -a ===" >&2; \
+  sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a >&2 2>&1 || true; \
+  CIDS=$(sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a -q 2>/dev/null | head -6); \
+  for CID in $CIDS; do \
+    echo "=== container logs: $CID ===" >&2; \
+    sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock logs --tail=50 "$CID" >&2 2>&1 || true; \
+  done; \
+  echo "=== kubelet journal ===" >&2; \
+  sudo journalctl -xeu kubelet --no-pager -n 80 >&2 2>&1 || true; \
 fi; \
 exit $RC )`,
 		"mkdir -p $HOME/.kube",
 		"sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config",
 		"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
+
+		// ── Phase 8: Post-init ────────────────────────────────────────────────────────
 		"kubectl taint nodes --all node-role.kubernetes.io/control-plane- || kubectl taint nodes --all node-role.kubernetes.io/master- || true",
 		fmt.Sprintf("kubectl label nodes --all hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
+
+		// ── Phase 9: CNI (Flannel over WireGuard) ────────────────────────────────────
 		"kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml",
-		"kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--iface=wg0\"}]'",
+		`kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface=wg0"}]'`,
 		"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
+		// Wait for the control-plane node to be Ready before deploying addons.
+		"kubectl wait --for=condition=Ready nodes --all --timeout=180s",
+
+		// ── Phase 10: Addons ──────────────────────────────────────────────────────────
 		"kubectl create namespace argocd || true",
 		"kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
-
-		// fmt.Sprintf("kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/%s/deployments/static/nvidia-device-plugin.yml ", cluster.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion),
-		"rm /tmp/catalog/ -rf",
+		"rm -rf /tmp/catalog",
 		"git clone https://github.com/vitu-mafeni/catalog.git /tmp/catalog",
-
 		"kubectl apply -f /tmp/catalog/nephio/optional/flux-helm-controllers",
-		"kubectl apply -f /tmp/catalog/workloads/ml-platform/longhorn/",
-
+		// "kubectl apply -f /tmp/catalog/workloads/ml-platform/longhorn/",
 		`cat <<EOF | kubectl apply -f -
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
@@ -255,16 +319,10 @@ metadata:
   name: nvidia
 handler: nvidia
 EOF`,
-
-		// temporary, will be removed after the controller is containerized.
 		"rm -rf /tmp/remote-cluster-provisioner",
 		"git clone -b r2-1 https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
 		"kubectl apply -f /tmp/remote-cluster-provisioner/config/crd/bases/",
-
-		// "kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.36/deploy/local-path-storage.yaml",
-		// "kubectl patch storageclass local-path -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'",
-
-	}
+	)
 
 	for _, cmd := range steps {
 		output, err := sshhelper.Run(client, cmd)
@@ -277,38 +335,79 @@ EOF`,
 		return "", fmt.Errorf("ArgoCD configuration failed: %w", err)
 	}
 
-	// Generate a fresh join command valid for 24h.
-	// Falls back to re-generating a token if the original init token has expired.
+	if err := installNFSProvisioner(client, tunIP); err != nil {
+		return "", fmt.Errorf("NFS provisioner installation failed: %w", err)
+	}
+
 	joinCmd, err := getJoinCommand(client)
 	if err != nil {
 		return "", fmt.Errorf("failed to retrieve join command: %w", err)
 	}
 
-	log.Print("Control plane ready. Join command is available for worker nodes to join the cluster.")
+	log.Print("Control plane ready. Join command is available for worker nodes.")
 	return joinCmd, nil
 }
 
-// getJoinCommand generates a kubeadm join command for worker nodes.
-// It creates a new bootstrap token (valid forever) and prints the full join string.
+// installNFSProvisioner patches the NFS provisioner HelmRelease files in the catalog
+// with the control-plane NFS server address and applies them to the cluster.
+// Prerequisites: /tmp/catalog already cloned, FluxCD controllers deployed, kubectl configured.
+//
+// Both HelmRelease files in the provisioner directory are updated:
+//   - nfs.server        → nfsServerIP (the control-plane WireGuard IP)
+//   - nfs.path          → /srv/nfs/k8s
+//   - storageClass.defaultClass → true  (replaces false, or inserts if absent)
+func installNFSProvisioner(client *sshhelper.Client, nfsServerIP string) error {
+	log.Printf("Installing NFS provisioner (server: %s)", nfsServerIP)
+
+	nfsDir := "/tmp/catalog/workloads/ml-platform/nfs-provisioner"
+
+	steps := []string{
+		// HelmRelease resources target the storage namespace.
+		"kubectl create namespace storage 2>/dev/null || true",
+
+		// Patch every YAML file in the provisioner directory in-place.
+		//
+		// Escaping path through Go raw string → shell double-quote → sed:
+		//   \\  in raw string = two literal backslashes
+		//       shell double-quote collapses \\ → \
+		//       sed receives single \  (used as sed command prefix, e.g. a\ or \| address)
+		//   \\n in raw string = \\ + n
+		//       shell collapses \\ → \, n stays → sed receives \n (newline in append text)
+		fmt.Sprintf(`for f in %s/*.yaml %s/*.yml; do \
+  [ -f "$f" ] || continue; \
+  sed -i "s/server: .*/server: %s/" "$f"; \
+  sed -i "s|path: .*|path: /srv/nfs/k8s|" "$f"; \
+  sed -i "s/defaultClass: false/defaultClass: true/" "$f"; \
+  grep -q "defaultClass" "$f" || \
+    sed -i "\|path: /srv/nfs/k8s|a\\    storageClass:\\n      defaultClass: true" "$f"; \
+done`, nfsDir, nfsDir, nfsServerIP),
+
+		fmt.Sprintf("kubectl apply -f %s/", nfsDir),
+	}
+
+	for _, cmd := range steps {
+		output, err := sshhelper.Run(client, cmd)
+		if err != nil {
+			return fmt.Errorf("nfs provisioner install failed: %s\nOutput:\n%s", cmd, output)
+		}
+	}
+
+	log.Printf("NFS provisioner installed successfully")
+	return nil
+}
+
 func getJoinCommand(client *sshhelper.Client) (string, error) {
-	// Using --print-join-command gives us the full one-liner including
-	// the CA cert hash, which is safer than parsing `kubeadm init` output.
 	output, err := sshhelper.Run(client, "sudo kubeadm token create --print-join-command --ttl 0")
 	if err != nil {
 		return "", fmt.Errorf("kubeadm token create failed: %w\nOutput: %s", err, output)
 	}
-
 	joinCmd := strings.TrimSpace(output)
 	if joinCmd == "" {
 		return "", fmt.Errorf("kubeadm returned an empty join command")
 	}
-
 	return joinCmd, nil
 }
 
-// FOR WORKER NODES, we will run the join command in the controller and add the node to the cluster after provisioning, so no need to return join command for worker nodes here.
-// JoinWorkerNode installs all prerequisites on the worker and joins it to the cluster.
-// joinCmd is the full string returned by InitializeControlPlane (or getJoinCommand).
 func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string, clusterParent *infrav1.RemoteCluster) (error, string) {
 	log.Printf("Joining worker node %s to cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)
 
@@ -319,7 +418,6 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		return fmt.Errorf("clusterParent.Spec.NodeInfo.HardwareType must not be empty"), ""
 	}
 
-	// Resolve the worker's VPN IP from wg0.
 	nodeIP, err := GetTunIP(client)
 	if err != nil {
 		return fmt.Errorf("failed to get worker wg0 IP: %w", err), ""
@@ -327,155 +425,87 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 	log.Printf("Worker VPN IP: %s", nodeIP)
 
 	clean := strings.TrimPrefix(clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion, "v")
-
 	parts := strings.Split(clean, ".")
 	if len(parts) < 2 {
 		return fmt.Errorf("invalid kubernetes version: %s", clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion), ""
 	}
-
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
 	steps := []string{
-		// Stop services and reset kubernetes state.
-		// Do NOT wipe /var/lib/containers/storage, /var/lib/crio, or /run/crio:
-		//   - storage wipe → "image not known" desync between kubelet and CRI-O
-		//   - /run/crio wipe → directory-recreation race → "permission denied" on socket
-		// kubeadm reset handles /etc/kubernetes cleanup so re-runs don't fail on "file already exists".
+		// ── Phase 0: Cleanup (idempotent) ────────────────────────────────────────────
 		"sudo systemctl stop kubelet 2>/dev/null || true",
 		"sudo systemctl stop crio 2>/dev/null || true",
 		"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
 		"sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
 
-		// =========================
-		// Disable swap
-		// =========================
+		// ── Phase 1: System settings ──────────────────────────────────────────────────
 		"sudo swapoff -a",
 		`sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab`,
-
-		// =========================
-		// Kernel modules
-		// =========================
 		`echo -e "overlay\nbr_netfilter" | sudo tee /etc/modules-load.d/k8s.conf`,
 		"sudo modprobe overlay",
 		"sudo modprobe br_netfilter",
-
-		// =========================
-		// Sysctl configuration
-		// =========================
 		`echo -e "net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
 		"sudo sysctl --system",
 
-		// =========================
-		// Base packages
-		// =========================
+		// ── Phase 2: APT repos ────────────────────────────────────────────────────────
 		"sudo apt-get update",
 		"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https",
-
-		// =========================
-		// Install CRI-O
-		// =========================
-		// add repositories
+		// nfs-common provides the kernel NFS client and mount.nfs helper so the node
+		// can mount NFS volumes exported by the control-plane NFS server.
+		"sudo apt-get install -y nfs-common",
+		"sudo install -m 0755 -d /etc/apt/keyrings",
 		"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
-		"sudo mkdir -p /etc/apt/keyrings",
 		fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
 		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null`, repoVersion),
-
-		fmt.Sprintf(`sudo curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key |     sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
+		fmt.Sprintf(`sudo curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
 		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
+		"sudo apt-get update",
+	}
 
-		// install dependencies packages and custom cri-o
-		"sudo apt-get install -y build-essential libgpgme-dev pkg-config gcc xmlto build-essential asciidoc libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler python3-protobuf pkg-config uuid-dev libbsd-dev libnftables-dev libcap-dev libnl-3-dev libnet1-dev libaio-dev libgnutls28-dev libdrm-dev --no-install-recommends",
-		"sudo dpkg --configure -a",
-		"sudo apt-get install -y     git     gcc     make     pkg-config     libassuan-dev     libglib2.0-dev     libc6-dev     libgpgme-dev     libgpg-error-dev     libseccomp-dev     libsystemd-dev     libselinux1-dev     libbtrfs-dev     libudev-dev     software-properties-common     go-md2man     runc     crun",
+	// ── Phase 3: Build CRI-O (shared steps) ──────────────────────────────────────
+	steps = append(steps, crioBuildSteps(repoVersion, clean)...)
 
-		// go.mod requires go 1.26.4 — golang-go from apt is too old (≤1.21).
-		// Download the exact version from golang.org and install to /usr/local/go.
-		`GO_VER=1.26.4; \
-		curl -fsSL https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz -o /tmp/go.tar.gz && \
-		sudo rm -rf /usr/local/go && \
-		sudo tar -C /usr/local -xzf /tmp/go.tar.gz && \
-		rm -f /tmp/go.tar.gz && \
-		/usr/local/go/bin/go version`,
-
-		"sudo rm -rf /tmp/conmon && git clone https://github.com/containers/conmon /tmp/conmon && cd /tmp/conmon && PATH=/usr/local/go/bin:$PATH make && sudo make install && cd - && rm -rf /tmp/conmon",
-
-		// Each SSH step runs in its own shell — cd does not persist, so clone+build must
-		// be one chained command executed inside the repo directory.
-		// PATH must include /usr/local/go/bin so that make finds the correct Go version.
-		`sudo rm -rf /tmp/custom-crio && \
-		git clone https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio -b 2026-02-03/support-restore-from-file && \
-		cd /tmp/custom-crio && \
-		PATH=/usr/local/go/bin:$PATH make && \
-		sudo make install && \
-		sudo make install.config && \
-		rm -rf /tmp/custom-crio`,
-		`sudo mkdir -p /etc/crio/crio.conf.d && \
-		echo '[crio.runtime]
-		listen = "/var/run/crio/crio.sock"
-		stream_address = "127.0.0.1"
-		[crio.image]
-		listen = "/var/run/crio/crio.sock"' | sudo tee /etc/crio/crio.conf.d/00-sock-path.conf`,
-
-		fmt.Sprintf(`curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s/crictl-v%s-linux-amd64.tar.gz | sudo tar -C /usr/local/bin -xzf - crictl && \
-sudo chmod 0755 /usr/local/bin/crictl && \
-sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl`, clean, clean),
-
-		`sudo tee /etc/crictl.yaml >/dev/null <<EOF
-		runtime-endpoint: unix:///var/run/crio/crio.sock
-		image-endpoint: unix:///var/run/crio/crio.sock
-		timeout: 10
-		debug: false
-		EOF`,
-
-		`sudo mkdir -p /etc/containers && \
-		echo '{"default":[{"type":"insecureAcceptAnything"}]}' \
-		| sudo tee /etc/containers/policy.json > /dev/null`,
-
+	steps = append(steps,
+		// ── Phase 4: Start CRI-O ─────────────────────────────────────────────────────
 		"sudo systemctl daemon-reload",
 		"sudo systemctl enable crio",
-		"sudo systemctl start crio",
-		"sudo systemctl status crio --no-pager || true",
+		"sudo crio wipe -f 2>/dev/null || true",
+		`sudo systemctl start crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
+		crioReadyCheck,
 
-		"runc --version || true",
-
+		// ── Phase 5: Install Kubernetes components ────────────────────────────────────
 		"sudo apt-get update",
-		"sudo mkdir /var/lib/kubelet/plugins/kubernetes.io/empty-dir -f || true",
 		fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages --allow-downgrades", clean, clean, clean),
 		"sudo apt-mark hold kubelet kubeadm kubectl",
 		"sudo systemctl enable kubelet",
-		"sudo systemctl stop kubelet",
+		"sudo systemctl stop kubelet 2>/dev/null || true",
+		fmt.Sprintf(`printf 'KUBELET_EXTRA_ARGS=--node-ip=%s\n' | sudo tee /etc/default/kubelet > /dev/null`, nodeIP),
+		`sudo mkdir -p /etc/systemd/system/kubelet.service.d && \
+printf '[Unit]\nAfter=crio.service\nRequires=crio.service\n' \
+  | sudo tee /etc/systemd/system/kubelet.service.d/10-crio.conf > /dev/null`,
 		"sudo systemctl daemon-reload",
+		`sudo mkdir -p /var/lib/kubelet /etc/containers`,
+	)
 
-		// =========================
-		// Join the cluster
-		// =========================
-		// Set kubelet node IP before joining so the node registers with the correct address.
-		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, nodeIP),
-		"sudo systemctl daemon-reload",
-	}
-
+	// ── Phase 6: GPU CDI config ───────────────────────────────────────────────────
 	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 		steps = append(steps,
 			"sudo mkdir -p /etc/cdi /var/run/cdi /etc/crio/crio.conf.d",
-			`test -f /etc/crio/crio.conf.d/99-cdi.conf || echo '[crio.runtime]
-enable_cdi = true
-cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/99-cdi.conf`,
+			`test -f /etc/crio/crio.conf.d/99-cdi.conf || \
+printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]\n' \
+  | sudo tee /etc/crio/crio.conf.d/99-cdi.conf > /dev/null`,
 		)
 	}
 
 	steps = append(steps,
-		// One final CRI-O restart to pick up all config (kubelet node-ip, CDI, etc.)
-		// before kubeadm join. No restart after join — that would lose image metadata.
-		`sudo systemctl daemon-reload && sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
-		// Wait until CRI-O actually responds — socket existence is not enough.
-		// Replace your crictl info verification loops with an explicit endpoint check:
-		`for i in $(seq 1 30); do \
-		sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info >/dev/null 2>&1 && echo "CRI-O ready" && break; \
-		echo "Waiting for CRI-O ($i/30)..."; sleep 3; \
-		done; \
-		sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
+		// ── Phase 7: Final CRI-O restart (picks up CDI config) ───────────────────────
+		// This is the ONLY restart after initial start; no restart after kubeadm join.
+		`sudo systemctl daemon-reload && \
+sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
+		crioReadyCheck,
 
-		// Join the cluster — kubeadm pulls all images here; do not restart CRI-O after this.
+		// ── Phase 8: kubeadm join ─────────────────────────────────────────────────────
+		// kubeadm pulls all control-plane images here; do not restart CRI-O after this.
 		fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
 	)
 
@@ -486,17 +516,14 @@ cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/9
 		}
 	}
 
-	// Label the worker from the control plane, where kubectl is configured.
-	// node whose InternalIP matches the worker's host address.
-	// We print each node's name repeated alongside every address it has, then grep
-	// for the target IP — this handles nodes with multiple addresses correctly.
-	// After kubeadm join, kubelet takes a few seconds to register the node with the API server.
-	// Retry the address lookup for up to 90 seconds before giving up.
+	// Resolve the node name by matching the worker's VPN IP in the node address table.
+	// kubelet takes a few seconds to register after kubeadm join; retry for up to 90 s.
 	var rawNodeOutput string
 	nodeName := ""
 	for attempt := 0; attempt < 45; attempt++ {
 		var queryErr error
-		rawNodeOutput, queryErr = sshhelper.Run(cpClient, `kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n | .status.addresses[].address | [$n, .] | @tsv'`)
+		rawNodeOutput, queryErr = sshhelper.Run(cpClient,
+			`kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n | .status.addresses[].address | [$n, .] | @tsv'`)
 		if queryErr != nil {
 			return fmt.Errorf("failed to list nodes: %w\nOutput:\n%s", queryErr, rawNodeOutput), ""
 		}
@@ -517,7 +544,6 @@ cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/9
 		return fmt.Errorf("failed to resolve node name for host %s vpn ip: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput), ""
 	}
 
-	// cluster.Spec.Host is the node ip as registered in the cluster.
 	labelAndTaintCmd := fmt.Sprintf(
 		"kubectl label node %s hardware-type=%s gpu=on --overwrite && kubectl taint node %s hardware-type=gpu:PreferNoSchedule",
 		nodeName, cluster.Spec.NodeInfo.HardwareType, nodeName,
@@ -531,7 +557,6 @@ cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/9
 }
 
 // GetTunIP returns the IPv4 address of the wg0 interface on the remote host.
-// It is used to register nodes with their VPN IP rather than their LAN IP.
 func GetTunIP(client *sshhelper.Client) (string, error) {
 	output, err := sshhelper.Run(client, `ip -4 addr show wg0 | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'`)
 	if err != nil {
@@ -558,49 +583,22 @@ func InstallNvidiaContainerToolkit1(client *sshhelper.Client, cluster *infrav1.R
 	nvidiaToolkitVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
 
 	steps := []string{
-		// =========================
-		// Prerequisites
-		// =========================
 		"sudo apt-get update",
 		"sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
-
-		// =========================
-		// NVIDIA repository + GPG key
-		// =========================
-		// Add GPG key
 		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
-
-		// Add repository
 		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
 sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
 sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
-
-		// Enable experimental packages
 		"sudo sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list",
-
 		"sudo apt-get update",
-
-		// =========================
-		// Install toolkit (pinned version)
-		// =========================
-		fmt.Sprintf(`sudo apt-get install  --allow-downgrades -y \
+		fmt.Sprintf(`sudo apt-get install --allow-downgrades -y \
 nvidia-container-toolkit=%s \
 nvidia-container-toolkit-base=%s \
 libnvidia-container-tools=%s \
 libnvidia-container1=%s`,
-			nvidiaToolkitVersion,
-			nvidiaToolkitVersion,
-			nvidiaToolkitVersion,
-			nvidiaToolkitVersion,
-		),
-
-		// =========================
-		// Configure CRI-O runtime
-		// =========================
+			nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion),
 		"sudo nvidia-ctk runtime configure --runtime=crio",
 		"sudo systemctl restart crio",
-
-		// Sanity check
 		"sudo nvidia-ctk --version",
 	}
 
@@ -615,90 +613,41 @@ libnvidia-container1=%s`,
 	return nil
 }
 
-// InstallNvidiaDrivers installs the NVIDIA drivers on a GPU node.
-// It should be called after InstallNvidiaContainerToolkit.
+// InstallNvidiaDrivers11 installs the NVIDIA drivers on a GPU node.
 // A reboot is typically required after driver installation for the drivers to take effect.
 func InstallNvidiaDrivers11(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
-	// if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
-	// 	log.Printf("Skipping NVIDIA driver install — node %s is not a GPU node", cluster.Spec.Host)
-	// 	return nil
-	// }
-
 	log.Printf("Installing NVIDIA drivers on GPU node %s", cluster.Spec.Host)
 
 	nvidiaDriverVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion
 	nvidiaToolkitVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
 
 	steps := []string{
-		// =========================
-		// Prerequisites
-		// =========================
 		"sudo apt-get update",
 		"sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
-
-		// =========================
-		// NVIDIA container toolkit repository + GPG key
-		// =========================
 		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
 		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
 sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
 sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
 		"sudo sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list",
 		"sudo apt-get update",
-
-		// =========================
-		// Install container toolkit (pinned version)
-		// =========================
-		fmt.Sprintf(`sudo apt-get install  --allow-downgrades -y \
+		fmt.Sprintf(`sudo apt-get install --allow-downgrades -y \
 nvidia-container-toolkit=%s \
 nvidia-container-toolkit-base=%s \
 libnvidia-container-tools=%s \
 libnvidia-container1=%s`,
-			nvidiaToolkitVersion,
-			nvidiaToolkitVersion,
-			nvidiaToolkitVersion,
-			nvidiaToolkitVersion,
-		),
-
-		// Configure CRI-O to use NVIDIA runtime
+			nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion),
 		"sudo nvidia-ctk runtime configure --runtime=crio",
 		"sudo systemctl restart crio",
-
-		// =========================
-		// Install NVIDIA GPU drivers
-		// =========================
-		// List available GPU drivers (informational, non-fatal)
 		"sudo ubuntu-drivers list --gpgpu || true",
-
-		// Kernel headers are required for DKMS to build modules for the current kernel.
 		"sudo apt-get install -y linux-headers-$(uname -r) linux-headers-generic",
-
-		// Install display + compute driver
 		fmt.Sprintf("sudo ubuntu-drivers install nvidia:%s", nvidiaDriverVersion),
-
-		// Install server-grade GPU driver
 		fmt.Sprintf("sudo ubuntu-drivers install --gpgpu nvidia:%s-server", nvidiaDriverVersion),
-
-		// Install the DKMS package so modules are rebuilt if the kernel is ever updated.
-		// ubuntu-drivers installs the no-dkms precompiled variant by default, which only
-		// covers the kernel running at install time.
 		fmt.Sprintf("sudo apt-get install -y nvidia-dkms-%s-server", nvidiaDriverVersion),
-
-		// Install nvidia-utils for tools like nvidia-smi
 		fmt.Sprintf("sudo apt-get install -y nvidia-utils-%s-server", nvidiaDriverVersion),
-
-		// Sanity checks
 		"nvidia-smi || true",
 		"sudo nvidia-ctk --version",
-
-		// =========================
-		// Configure CRI-O NVIDIA runtime
-		// Only write and restart if the config is missing or different.
-		// =========================
 		`sudo rm -rf /etc/crio/crio.conf.d`,
 		`sudo mkdir -p /etc/crio/crio.conf.d`,
-
-		// Write the expected config to a temp file for comparison
 		`sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null <<'EOFCONF'
 [crio]
 
@@ -710,26 +659,13 @@ libnvidia-container1=%s`,
       [crio.runtime.runtimes.nvidia]
         runtime_path = "/usr/bin/nvidia-container-runtime"
         runtime_type = "oci"
-	  [crio.runtime.runtimes.runc]
+      [crio.runtime.runtimes.runc]
         runtime_path = "/usr/sbin/runc"
         runtime_type = "oci"
 EOFCONF`,
-
-		// // Apply config and restart CRI-O only if missing or different
-		// `if [ ! -f /etc/crio/crio.conf.d/99-nvidia.conf ] || ! diff -q /tmp/99-nvidia.conf /etc/crio/crio.conf.d/99-nvidia.conf > /dev/null 2>&1; then sudo cp /tmp/99-nvidia.conf /etc/crio/crio.conf.d/99-nvidia.conf && sudo systemctl restart crio && echo "CRI-O restarted with updated NVIDIA runtime config"; else echo "CRI-O NVIDIA runtime config already up to date — skipping"; fi`,
-
-		// // Verify NVIDIA is the default runtime
-		// `sudo crictl info | python3 -m json.tool | grep '"DefaultRuntime"' || true`,
-		// Remove monitor_path ONLY from 99-nvidia.conf — it is deprecated for
-		// non-default runtimes in CRI-O >= 1.28. The base 10-crio.conf legitimately
-		// uses monitor_path for crun/runc and must not be modified.
-		`sudo sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf`,
-		// CRI-O requires conmon in $PATH for monitor fields translation.
-		// It is installed at /usr/libexec/crio/conmon but not symlinked by default.
-		`sudo ln -sf /usr/libexec/crio/conmon /usr/local/bin/conmon`,
+		`sudo sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf 2>/dev/null || true`,
+		`sudo ln -sf /usr/libexec/crio/conmon /usr/local/bin/conmon 2>/dev/null || true`,
 		"sudo systemctl restart crio",
-
-		// Verify NVIDIA is the default runtime
 		`sudo crictl info | python3 -m json.tool | grep '"DefaultRuntime"' || true`,
 	}
 
@@ -745,8 +681,7 @@ EOFCONF`,
 }
 
 // GenerateCDI generates the CDI spec for the NVIDIA GPUs on the node.
-// Must be called after the node has rebooted post driver installation so that
-// the NVIDIA kernel module is loaded and NVML can enumerate devices.
+// Must be called after the node has rebooted post driver installation.
 func GenerateCDI(client *sshhelper.Client) error {
 	steps := []string{
 		"sudo mkdir -p /etc/cdi",
