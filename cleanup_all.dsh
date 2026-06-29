@@ -16,10 +16,13 @@ sleep 30
 echo "Cleaning up worker node..."
 ssh ubuntu@192.168.30.87 << 'WORKER_CLEANUP'
   echo "Running cleanup on worker node..."
-
+  
+  sudo fuser -k 6443/tcp 2>/dev/null || true
+  sudo rm -rf /tmp/catalog/ /tmp/kubeadm-config.yaml /tmp/remote-cluster-provisioner/ || true
   # Stop kubelet and services
   sudo systemctl stop kubelet || true
   sudo systemctl stop crio || true
+  sudo crio wipe -f || true
   sudo systemctl disable crio || true
   sudo systemctl disable kubelet || true
 
@@ -48,6 +51,9 @@ ssh ubuntu@192.168.30.87 << 'WORKER_CLEANUP'
   sudo rm -f /usr/bin/criu
 
   # Remove CRI-O config and storage
+  sudo umount -R /var/lib/containers/storage/overlay || true
+  sudo rm -rf /var/lib/containers/storage
+  sudo rm -rf /var/lib/containers/cache
   sudo rm -rf /etc/crio
   sudo rm -rf /etc/cni
   sudo rm -rf /opt/cni
