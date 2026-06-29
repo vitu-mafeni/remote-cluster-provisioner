@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1" // Add the correct import path for infrav1
 	"dcn.ssu.ac.kr/infra/pkg/argocd"
@@ -91,11 +92,14 @@ mode: ipvs
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
 	steps := []string{
-		// Clean up any leftover state from previous provisioning runs to avoid image cache corruption
-		"sudo systemctl stop kubelet crio 2>/dev/null || true",
-		"sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true",
-		"sudo umount -l /var/lib/crio 2>/dev/null || true",
-		"sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true",
+		// Stop services; leave CRI-O storage intact so the custom binary can read its own metadata.
+		// Wiping /var/lib/containers/storage causes "image not known" desync and
+		// deleting /run/crio causes a directory-recreation race that produces "permission denied"
+		// on the socket — kubeadm reset handles the Kubernetes-side state.
+		"sudo systemctl stop kubelet 2>/dev/null || true",
+		"sudo systemctl stop crio 2>/dev/null || true",
+		"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
+		// "sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
 
 		"sudo apt-get install -y nfs-kernel-server nfs-common",
 		"sudo mkdir -p /srv/nfs/k8s",
@@ -113,126 +117,81 @@ mode: ipvs
 		`echo -e "net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
 		"sudo sysctl --system",
 		"sudo apt-get update",
-		"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https",
+		"sudo apt-get install -y ca-certificates software-properties-common curl gnupg apt-transport-https",
 		"sudo install -m 0755 -d /etc/apt/keyrings",
 
-		// custom cri-o
-
-		// repoVersion MUST be "1.35" so the packaged conmon/runc/config match the custom binary
-		"sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg",
-		fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
-		| gpg --dearmor | sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
-		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
-		https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
-		| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
-		fmt.Sprintf("CRICTL_VERSION=v%s", clean),
-		"sudo apt-get update",
-		"sudo apt-get install -y jq criu crun conmon cri-tools",
-		// Ensure crictl is available in PATH for image pre-pull
-		// CRI-tools releases use minor version (e.g., v1.34, not v1.34.2)
-		fmt.Sprintf(`CRICTL_VERSION=v%s; \
-if ! command -v crictl >/dev/null 2>&1; then \
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz 2>/dev/null || \
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz -o /tmp/crictl.tar.gz; \
-  sudo tar xzf /tmp/crictl.tar.gz -C /usr/local/bin/ crictl; \
-  sudo chmod 0755 /usr/local/bin/crictl; \
-  rm -f /tmp/crictl.tar.gz; \
-  sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl; \
-fi; \
-crictl --version || (echo "crictl installation failed"; exit 1)`, repoVersion),
-		// crun from apt (typically 0.17 on Ubuntu 22.04) rejects OCI spec 1.1.0 with
-		// "unknown version specified". CRI-O 1.35 generates specs at 1.1.0, so we must
-		// install crun >= 1.0 from GitHub and pin CRI-O to use that exact path.
-		`CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null) && \
-		{ [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17 && \
-		sudo curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \
-		  -o /usr/local/bin/crun && \
-		sudo chmod 0755 /usr/local/bin/crun && \
-		sudo cp -f /usr/local/bin/crun /usr/bin/crun && \
-		crun --version`,
-		"sudo apt-get install -y cri-o",
-		// Always point CRI-O at the GitHub-sourced crun so the apt version (which may
-		// be on PATH before /usr/local/bin) is never used.
-		`sudo mkdir -p /etc/crio/crio.conf.d && \
-		printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
-		| sudo tee /etc/crio/crio.conf.d/10-crun.conf`,
-		"sudo systemctl enable crio --now || { sudo journalctl -xeu crio.service --no-pager >&2; false; }",
-		// Fix storage directory permissions (CRI-O may create with restrictive permissions)
-		"sudo chmod 0711 /var/lib/crio /var/lib/containers/storage 2>/dev/null || true",
-
-		// Ensure criu runtime dependencies are installed (libnl, libcap, libbsd, libgnutls)
-		"sudo apt-get install -y libcap2 libnl-3-200 libbsd0 libgnutls30",
-
-		// --- Install custom criu (device-restore-with-hook), idempotent on GitID ---
-		fmt.Sprintf(`WANT="%s"; \
-CRIU_BIN=$(command -v criu || echo /usr/sbin/criu); \
-HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}'); \
-if [ "$HAVE" = "$WANT" ]; then \
-  echo "custom criu $WANT already at $CRIU_BIN, skipping"; \
-else \
-  curl -fsSL %s -o /tmp/criu && \
-  chmod 0755 /tmp/criu && \
-  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}') && \
-  [ "$GOT" = "$WANT" ] && \
-  sudo install -m 0755 /tmp/criu "$CRIU_BIN" && \
-  rm -f /tmp/criu && \
-  echo "installed custom criu $WANT at $CRIU_BIN"; \
-fi`, CriuGitID, CriuAsset),
-		"criu --version || true",
-		// Grant CAP_CHECKPOINT_RESTORE capability so criu can run
-		"sudo setcap cap_checkpoint_restore+eip /usr/sbin/criu || true",
-		"criu check 2>&1 | head -1 || true",
-
-		// --- Install latest runc, idempotent on version ---
-		fmt.Sprintf(`WANT=%[1]s; \
-RUNC_BIN=$(command -v runc || echo /usr/local/sbin/runc); \
-HAVE=$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}'); \
-if [ "$HAVE" = "$WANT" ]; then \
-  echo "runc $WANT already installed at $RUNC_BIN, skipping"; \
-else \
-  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.amd64 -o /tmp/runc && \
-  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.sha256sum -o /tmp/runc.sha256sum && \
-  WSHA=$(awk '/ runc\.amd64$/{print $1}' /tmp/runc.sha256sum) && \
-  GSHA=$(sha256sum /tmp/runc | awk '{print $1}') && \
-  [ -n "$WSHA" ] && [ "$WSHA" = "$GSHA" ] && \
-  sudo install -m 0755 /tmp/runc "$RUNC_BIN" && \
-  rm -f /tmp/runc /tmp/runc.sha256sum && \
-  echo "installed runc $WANT at $RUNC_BIN"; \
-fi`, RuncVersion),
-		"runc --version || true",
-
-		// --- swap in the custom restore-from-file binary, idempotent on commit ---
-		fmt.Sprintf(`WANT=%s; \
-		HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit); \
-		if [ "$HAVE" = "$WANT" ]; then \
-		echo "custom crio $WANT already installed, skipping"; \
-		else \
-		curl -fsSL %s -o /tmp/crio && \
-		chmod 0755 /tmp/crio && \
-		GOT=$(/tmp/crio version --json | jq -r .gitCommit) && \
-		[ "$GOT" = "$WANT" ] && \
-		sudo systemctl stop crio && \
-		sudo install -m 0755 /tmp/crio /usr/bin/crio && \
-		sudo systemctl daemon-reload && \
-		sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; } && \
-		rm -f /tmp/crio; \
-		fi`, CrioCommit, CrioAsset),
-
-		// the binary was built with PREFIX=/usr/local, so it looks for the CRIU device
-		// restorer at /usr/local/libexec; the package ships it under /usr/libexec
-		`test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
-		sudo install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
-		/usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
-		echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"`,
-
-		"sudo crio version || true",
-		"sudo crictl info || true",
-		"sudo systemctl status crio --no-pager || true",
-
+		// add repositories
 		"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
 		"sudo mkdir -p /etc/apt/keyrings",
 		fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
 		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null`, repoVersion),
+
+		fmt.Sprintf(`sudo curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key |     sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
+		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
+
+		// install dependencies packages and custom cri-o
+		"sudo apt-get install -y build-essential libgpgme-dev pkg-config gcc xmlto build-essential asciidoc libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler python3-protobuf pkg-config uuid-dev libbsd-dev libnftables-dev libcap-dev libnl-3-dev libnet1-dev libaio-dev libgnutls28-dev libdrm-dev --no-install-recommends",
+		"sudo dpkg --configure -a",
+		"sudo apt-get install -y     git     gcc     make     pkg-config     libassuan-dev     libglib2.0-dev     libc6-dev     libgpgme-dev     libgpg-error-dev     libseccomp-dev     libsystemd-dev     libselinux1-dev     libbtrfs-dev     libudev-dev     software-properties-common     go-md2man     runc     crun",
+
+		// go.mod requires go 1.26.4 — golang-go from apt is too old (≤1.21).
+		// Download the exact version from golang.org and install to /usr/local/go.
+		`GO_VER=1.26.4; \
+		curl -fsSL https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz -o /tmp/go.tar.gz && \
+		sudo rm -rf /usr/local/go && \
+		sudo tar -C /usr/local -xzf /tmp/go.tar.gz && \
+		rm -f /tmp/go.tar.gz && \
+		/usr/local/go/bin/go version`,
+
+		"sudo rm -rf /tmp/conmon && git clone https://github.com/containers/conmon /tmp/conmon && cd /tmp/conmon && PATH=/usr/local/go/bin:$PATH make && sudo make install && cd - && rm -rf /tmp/conmon",
+
+		// Each SSH step runs in its own shell — cd does not persist, so clone+build must
+		// be one chained command executed inside the repo directory.
+		// PATH must include /usr/local/go/bin so that make finds the correct Go version.
+		`sudo rm -rf /tmp/custom-crio && \
+		git clone https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio -b 2026-02-03/support-restore-from-file && \
+		cd /tmp/custom-crio && \
+		PATH=/usr/local/go/bin:$PATH make && \
+		sudo make install && \
+		sudo make install.config && \
+		rm -rf /tmp/custom-crio`,
+
+		`sudo mkdir -p /etc/crio/crio.conf.d && \
+		echo '[crio.runtime]
+		listen = "/var/run/crio/crio.sock"
+		stream_address = "127.0.0.1"
+		[crio.image]
+		listen = "/var/run/crio/crio.sock"' | sudo tee /etc/crio/crio.conf.d/00-sock-path.conf`,
+
+		fmt.Sprintf(`curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s/crictl-v%s-linux-amd64.tar.gz | sudo tar -C /usr/local/bin -xzf - crictl && \
+sudo chmod 0755 /usr/local/bin/crictl && \
+sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl`, clean, clean),
+
+		`sudo tee /etc/crictl.yaml >/dev/null <<EOF
+		runtime-endpoint: unix:///var/run/crio/crio.sock
+		image-endpoint: unix:///var/run/crio/crio.sock
+		timeout: 10
+		debug: false
+		EOF`,
+
+		"sudo systemctl daemon-reload",
+		"sudo systemctl enable crio",
+		"sudo systemctl start crio",
+		"sudo systemctl status crio --no-pager || true",
+
+		// repoVersion MUST be "1.35" so the packaged conmon/runc/config match the custom binary
+		// "sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg",
+		// fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
+		// | gpg --dearmor | sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
+
+		// fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
+		// https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
+		// | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
+
+		"sudo apt-get update",
+
+		"runc --version || true",
+
 		"sudo apt-get update",
 		fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages", clean, clean, clean),
 		"sudo apt-mark hold kubelet kubeadm kubectl",
@@ -241,35 +200,22 @@ fi`, RuncVersion),
 		// Set kubelet node IP to VPN IP before init.
 		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, tunIP),
 		"sudo systemctl daemon-reload",
-		`sudo mkdir -p /etc/containers && \
+		`sudo mkdir /var/lib/kubelet/plugins/kubernetes.io/empty-dir -f || true && \
+		sudo mkdir -p /etc/containers && \
 		echo '{"default":[{"type":"insecureAcceptAnything"}]}' \
 		| sudo tee /etc/containers/policy.json > /dev/null`,
 		fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF", kubeadmConfig),
-		// Always restart CRI-O here to pick up any config changes made above
-		// (e.g. new crun path). A passive "is-active || start" misses the case where
-		// CRI-O is active but using stale config from a previous failed provisioning run.
+		// apt-get install kubelet may have auto-started kubelet; stop it so kubeadm init controls the lifecycle.
+		"sudo systemctl stop kubelet 2>/dev/null || true",
+		// One final restart to pick up all config (node-ip, containers policy, etc.) before kubeadm init.
+		// No restart after init — that would lose image metadata populated by kubeadm.
 		`sudo systemctl daemon-reload && sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
-		`for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
-		test -S /var/run/crio/crio.sock && echo "CRI-O socket ready" && break; \
-		echo "Waiting for CRI-O socket ($i/20)..."; sleep 3; \
+		// Wait until CRI-O actually responds — socket existence is not enough.
+		`for i in $(seq 1 30); do \
+		sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info >/dev/null 2>&1 && echo "CRI-O ready" && break; \
+		echo "Waiting for CRI-O ($i/30)..."; sleep 3; \
 		done; \
-		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
-		`echo "Checking CRI-O image cache consistency..."; \
-		if ! sudo systemctl is-active crio >/dev/null 2>&1 || ! test -S /var/run/crio/crio.sock; then \
-		  echo "CRI-O not responding, force-resetting image cache"; \
-		  sudo systemctl stop kubelet crio 2>/dev/null || true; \
-		  sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true; \
-		  sudo umount -l /var/lib/crio 2>/dev/null || true; \
-		  sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true; \
-		  sudo systemctl restart crio; \
-		  sleep 5; \
-		  for i in 1 2 3 4 5; do \
-		    test -S /var/run/crio/crio.sock && break; \
-		    sleep 3; \
-		  done; \
-		  sudo systemctl restart kubelet; \
-		  sleep 10; \
-		fi`,
+		sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
 		`test -f /etc/kubernetes/admin.conf || ( \
 sudo kubeadm init --config /tmp/kubeadm-config.yaml; RC=$?; \
 if [ $RC -ne 0 ]; then \
@@ -289,23 +235,19 @@ exit $RC )`,
 		"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
 		"kubectl taint nodes --all node-role.kubernetes.io/control-plane- || kubectl taint nodes --all node-role.kubernetes.io/master- || true",
 		fmt.Sprintf("kubectl label nodes --all hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
-		// Pre-pull core images with fresh metadata after kubeadm init to avoid stale image cache
-		`echo "Pre-pulling core Kubernetes images for cache freshness..." && \
-		for img in pause:3.10.1 coredns:1.11.3; do \
-		  sudo crictl pull registry.k8s.io/$img 2>/dev/null || echo "Pre-pull of $img completed"; \
-		done && \
-		echo "Core images pre-pulled"`,
-		"kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml",
+		"kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml",
 		"kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--iface=wg0\"}]'",
 		"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
 		"kubectl create namespace argocd || true",
 		"kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml",
 
-		fmt.Sprintf("kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/%s/deployments/static/nvidia-device-plugin.yml ", cluster.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion),
+		// fmt.Sprintf("kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/%s/deployments/static/nvidia-device-plugin.yml ", cluster.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion),
 		"rm /tmp/catalog/ -rf",
 		"git clone https://github.com/vitu-mafeni/catalog.git /tmp/catalog",
 
 		"kubectl apply -f /tmp/catalog/nephio/optional/flux-helm-controllers",
+		"kubectl apply -f /tmp/catalog/workloads/ml-platform/longhorn/",
+
 		`cat <<EOF | kubectl apply -f -
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
@@ -319,8 +261,9 @@ EOF`,
 		"git clone -b r2-1 https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
 		"kubectl apply -f /tmp/remote-cluster-provisioner/config/crd/bases/",
 
-		"kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.36/deploy/local-path-storage.yaml",
-		"kubectl patch storageclass local-path -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'",
+		// "kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.36/deploy/local-path-storage.yaml",
+		// "kubectl patch storageclass local-path -p '{\"metadata\": {\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'",
+
 	}
 
 	for _, cmd := range steps {
@@ -393,11 +336,15 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
 	steps := []string{
-		// Clean up any leftover state from previous provisioning runs to avoid image cache corruption
-		"sudo systemctl stop kubelet crio 2>/dev/null || true",
-		"sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true",
-		"sudo umount -l /var/lib/crio 2>/dev/null || true",
-		"sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true",
+		// Stop services and reset kubernetes state.
+		// Do NOT wipe /var/lib/containers/storage, /var/lib/crio, or /run/crio:
+		//   - storage wipe → "image not known" desync between kubelet and CRI-O
+		//   - /run/crio wipe → directory-recreation race → "permission denied" on socket
+		// kubeadm reset handles /etc/kubernetes cleanup so re-runs don't fail on "file already exists".
+		"sudo systemctl stop kubelet 2>/dev/null || true",
+		"sudo systemctl stop crio 2>/dev/null || true",
+		"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
+		"sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
 
 		// =========================
 		// Disable swap
@@ -427,118 +374,76 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		// =========================
 		// Install CRI-O
 		// =========================
-		"sudo rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg",
-		fmt.Sprintf(`curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
-		| gpg --dearmor | sudo tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
-		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
-		https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
-		| sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
-		"sudo apt-get update",
-		"sudo apt-get install -y jq criu crun conmon cri-tools",
-		// Ensure crictl is available in PATH for image pre-pull
-		// CRI-tools releases use minor version (e.g., v1.34, not v1.34.2)
-		fmt.Sprintf(`CRICTL_VERSION=v%s; \
-if ! command -v crictl >/dev/null 2>&1; then \
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz 2>/dev/null || \
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz -o /tmp/crictl.tar.gz; \
-  sudo tar xzf /tmp/crictl.tar.gz -C /usr/local/bin/ crictl; \
-  sudo chmod 0755 /usr/local/bin/crictl; \
-  rm -f /tmp/crictl.tar.gz; \
-  sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl; \
-fi; \
-crictl --version || (echo "crictl installation failed"; exit 1)`, repoVersion),
-		`CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null) && \
-		{ [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17 && \
-		sudo curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \
-		  -o /usr/local/bin/crun && \
-		sudo chmod 0755 /usr/local/bin/crun && \
-		crun --version`,
-		"sudo apt-get install -y cri-o",
-		// Hardcode /usr/local/bin/crun — do NOT use command -v crun because that may
-		// resolve to /usr/bin/crun (old apt crun) if /usr/bin precedes /usr/local/bin in PATH.
-		`sudo mkdir -p /etc/crio/crio.conf.d && \
-		printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
-		| sudo tee /etc/crio/crio.conf.d/10-crun.conf`,
-		"sudo systemctl enable crio --now || { sudo journalctl -xeu crio.service --no-pager >&2; false; }",
-
-		// Ensure criu runtime dependencies are installed (libnl, libcap, libbsd, libgnutls)
-		"sudo apt-get install -y libcap2 libnl-3-200 libbsd0 libgnutls30",
-
-		// --- Install custom criu (device-restore-with-hook), idempotent on GitID ---
-		fmt.Sprintf(`WANT="%s"; \
-CRIU_BIN=$(command -v criu || echo /usr/sbin/criu); \
-HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}'); \
-if [ "$HAVE" = "$WANT" ]; then \
-  echo "custom criu $WANT already at $CRIU_BIN, skipping"; \
-else \
-  curl -fsSL %s -o /tmp/criu && \
-  chmod 0755 /tmp/criu && \
-  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}') && \
-  [ "$GOT" = "$WANT" ] && \
-  sudo install -m 0755 /tmp/criu "$CRIU_BIN" && \
-  rm -f /tmp/criu && \
-  echo "installed custom criu $WANT at $CRIU_BIN"; \
-fi`, CriuGitID, CriuAsset),
-		"criu --version || true",
-		// Grant CAP_CHECKPOINT_RESTORE capability so criu can run
-		"sudo setcap cap_checkpoint_restore+eip /usr/sbin/criu || true",
-		"criu check 2>&1 | head -1 || true",
-
-		// --- Install latest runc, idempotent on version ---
-		fmt.Sprintf(`WANT=%[1]s; \
-RUNC_BIN=$(command -v runc || echo /usr/local/sbin/runc); \
-HAVE=$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}'); \
-if [ "$HAVE" = "$WANT" ]; then \
-  echo "runc $WANT already installed at $RUNC_BIN, skipping"; \
-else \
-  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.amd64 -o /tmp/runc && \
-  curl -fsSL https://github.com/opencontainers/runc/releases/download/%[1]s/runc.sha256sum -o /tmp/runc.sha256sum && \
-  WSHA=$(awk '/ runc\.amd64$/{print $1}' /tmp/runc.sha256sum) && \
-  GSHA=$(sha256sum /tmp/runc | awk '{print $1}') && \
-  [ -n "$WSHA" ] && [ "$WSHA" = "$GSHA" ] && \
-  sudo install -m 0755 /tmp/runc "$RUNC_BIN" && \
-  rm -f /tmp/runc /tmp/runc.sha256sum && \
-  echo "installed runc $WANT at $RUNC_BIN"; \
-fi`, RuncVersion),
-		"runc --version || true",
-
-		// swap in the custom restore-from-file binary, idempotent on commit
-		fmt.Sprintf(`WANT=%s; \
-		HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit); \
-		if [ "$HAVE" = "$WANT" ]; then \
-		echo "custom crio $WANT already installed, skipping"; \
-		else \
-		curl -fsSL %s -o /tmp/crio && \
-		chmod 0755 /tmp/crio && \
-		GOT=$(/tmp/crio version --json | jq -r .gitCommit) && \
-		[ "$GOT" = "$WANT" ] && \
-		sudo systemctl stop crio && \
-		sudo install -m 0755 /tmp/crio /usr/bin/crio && \
-		sudo systemctl daemon-reload && \
-		sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; } && \
-		rm -f /tmp/crio; \
-		fi`, CrioCommit, CrioAsset),
-
-		`test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
-		sudo install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
-		/usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
-		echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"`,
-
-		"sudo crio version || true",
-		"sudo crictl info || true",
-		"sudo systemctl status crio --no-pager || true",
-
-		// =========================
-		// Kubernetes repository + packages
-		// =========================
+		// add repositories
 		"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
 		"sudo mkdir -p /etc/apt/keyrings",
 		fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
 		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list > /dev/null`, repoVersion),
+
+		fmt.Sprintf(`sudo curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key |     sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null`, repoVersion),
+		fmt.Sprintf(`echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" | sudo tee /etc/apt/sources.list.d/cri-o.list > /dev/null`, repoVersion),
+
+		// install dependencies packages and custom cri-o
+		"sudo apt-get install -y build-essential libgpgme-dev pkg-config gcc xmlto build-essential asciidoc libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler python3-protobuf pkg-config uuid-dev libbsd-dev libnftables-dev libcap-dev libnl-3-dev libnet1-dev libaio-dev libgnutls28-dev libdrm-dev --no-install-recommends",
+		"sudo dpkg --configure -a",
+		"sudo apt-get install -y     git     gcc     make     pkg-config     libassuan-dev     libglib2.0-dev     libc6-dev     libgpgme-dev     libgpg-error-dev     libseccomp-dev     libsystemd-dev     libselinux1-dev     libbtrfs-dev     libudev-dev     software-properties-common     go-md2man     runc     crun",
+
+		// go.mod requires go 1.26.4 — golang-go from apt is too old (≤1.21).
+		// Download the exact version from golang.org and install to /usr/local/go.
+		`GO_VER=1.26.4; \
+		curl -fsSL https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz -o /tmp/go.tar.gz && \
+		sudo rm -rf /usr/local/go && \
+		sudo tar -C /usr/local -xzf /tmp/go.tar.gz && \
+		rm -f /tmp/go.tar.gz && \
+		/usr/local/go/bin/go version`,
+
+		"sudo rm -rf /tmp/conmon && git clone https://github.com/containers/conmon /tmp/conmon && cd /tmp/conmon && PATH=/usr/local/go/bin:$PATH make && sudo make install && cd - && rm -rf /tmp/conmon",
+
+		// Each SSH step runs in its own shell — cd does not persist, so clone+build must
+		// be one chained command executed inside the repo directory.
+		// PATH must include /usr/local/go/bin so that make finds the correct Go version.
+		`sudo rm -rf /tmp/custom-crio && \
+		git clone https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio -b 2026-02-03/support-restore-from-file && \
+		cd /tmp/custom-crio && \
+		PATH=/usr/local/go/bin:$PATH make && \
+		sudo make install && \
+		sudo make install.config && \
+		rm -rf /tmp/custom-crio`,
+		`sudo mkdir -p /etc/crio/crio.conf.d && \
+		echo '[crio.runtime]
+		listen = "/var/run/crio/crio.sock"
+		stream_address = "127.0.0.1"
+		[crio.image]
+		listen = "/var/run/crio/crio.sock"' | sudo tee /etc/crio/crio.conf.d/00-sock-path.conf`,
+
+		fmt.Sprintf(`curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s/crictl-v%s-linux-amd64.tar.gz | sudo tar -C /usr/local/bin -xzf - crictl && \
+sudo chmod 0755 /usr/local/bin/crictl && \
+sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl`, clean, clean),
+
+		`sudo tee /etc/crictl.yaml >/dev/null <<EOF
+		runtime-endpoint: unix:///var/run/crio/crio.sock
+		image-endpoint: unix:///var/run/crio/crio.sock
+		timeout: 10
+		debug: false
+		EOF`,
+
+		`sudo mkdir -p /etc/containers && \
+		echo '{"default":[{"type":"insecureAcceptAnything"}]}' \
+		| sudo tee /etc/containers/policy.json > /dev/null`,
+
+		"sudo systemctl daemon-reload",
+		"sudo systemctl enable crio",
+		"sudo systemctl start crio",
+		"sudo systemctl status crio --no-pager || true",
+
+		"runc --version || true",
+
 		"sudo apt-get update",
+		"sudo mkdir /var/lib/kubelet/plugins/kubernetes.io/empty-dir -f || true",
 		fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages --allow-downgrades", clean, clean, clean),
 		"sudo apt-mark hold kubelet kubeadm kubectl",
 		"sudo systemctl enable kubelet",
+		"sudo systemctl stop kubelet",
 		"sudo systemctl daemon-reload",
 
 		// =========================
@@ -547,63 +452,32 @@ fi`, RuncVersion),
 		// Set kubelet node IP before joining so the node registers with the correct address.
 		fmt.Sprintf(`echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' | sudo tee /etc/default/kubelet`, nodeIP),
 		"sudo systemctl daemon-reload",
-
-		// Always restart CRI-O here to pick up any config changes made above
-		// (e.g. new crun path). A passive "is-active || start" misses the case where
-		// CRI-O is active but using stale config from a previous failed provisioning run.
-		`sudo systemctl daemon-reload && sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
-		`for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do \
-		test -S /var/run/crio/crio.sock && echo "CRI-O socket ready" && break; \
-		echo "Waiting for CRI-O socket ($i/20)..."; sleep 3; \
-		done; \
-		test -S /var/run/crio/crio.sock || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
-
-		// CRI-O recovery: when swapping binaries (especially custom CRI-O), the image cache
-		// can become inconsistent, causing containers to fail with "image not found" errors.
-		// Force a clean reset: stop services, unmount overlay storage, clear cache, restart.
-		`echo "Checking CRI-O image cache consistency..."; \
-		if ! sudo systemctl is-active crio >/dev/null 2>&1 || ! test -S /var/run/crio/crio.sock; then \
-		  echo "CRI-O not responding, force-resetting image cache"; \
-		  sudo systemctl stop kubelet crio 2>/dev/null || true; \
-		  sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true; \
-		  sudo umount -l /var/lib/crio 2>/dev/null || true; \
-		  sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true; \
-		  sudo systemctl restart crio; \
-		  sleep 5; \
-		  for i in 1 2 3 4 5; do \
-		    test -S /var/run/crio/crio.sock && break; \
-		    sleep 3; \
-		  done; \
-		  sudo systemctl restart kubelet; \
-		  sleep 10; \
-		fi`,
-
-		// Append --cri-socket to use CRI-O instead of defaulting to containerd
-		fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
-
-		// // =========================
-		// // Label this node
-		// // =========================
-		// fmt.Sprintf("kubectl label nodes --all hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
 	}
 
-	// =========================
-	// GPU node: enable CDI in CRI-O (required by Hami DRA driver)
-	// =========================
 	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
-		gpuSteps := []string{
-			// Create CDI directories
-			"sudo mkdir -p /etc/cdi /var/run/cdi",
-			// Write CRI-O CDI config drop-in and restart only if it doesn't already exist.
-			// The inner subshell writes the file and restarts crio; the outer test skips both if already present.
-			`test -f /etc/crio/crio.conf.d/99-cdi.conf || (echo '[crio.runtime]
+		steps = append(steps,
+			"sudo mkdir -p /etc/cdi /var/run/cdi /etc/crio/crio.conf.d",
+			`test -f /etc/crio/crio.conf.d/99-cdi.conf || echo '[crio.runtime]
 enable_cdi = true
-cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/99-cdi.conf && sudo systemctl restart crio)`,
-			// Verify CDI is active
-			"sudo crictl info | grep -i cdi || true",
-		}
-		steps = append(steps, gpuSteps...)
+cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/99-cdi.conf`,
+		)
 	}
+
+	steps = append(steps,
+		// One final CRI-O restart to pick up all config (kubelet node-ip, CDI, etc.)
+		// before kubeadm join. No restart after join — that would lose image metadata.
+		`sudo systemctl daemon-reload && sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
+		// Wait until CRI-O actually responds — socket existence is not enough.
+		// Replace your crictl info verification loops with an explicit endpoint check:
+		`for i in $(seq 1 30); do \
+		sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info >/dev/null 2>&1 && echo "CRI-O ready" && break; \
+		echo "Waiting for CRI-O ($i/30)..."; sleep 3; \
+		done; \
+		sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`,
+
+		// Join the cluster — kubeadm pulls all images here; do not restart CRI-O after this.
+		fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
+	)
 
 	for _, cmd := range steps {
 		output, err := sshhelper.Run(client, cmd)
@@ -616,22 +490,28 @@ cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]' | sudo tee /etc/crio/crio.conf.d/9
 	// node whose InternalIP matches the worker's host address.
 	// We print each node's name repeated alongside every address it has, then grep
 	// for the target IP — this handles nodes with multiple addresses correctly.
-	// Dump all node names and addresses so we can match by IP or hostname.
-	// Log the raw output first to help debug mismatches.
-	rawNodeOutput, err := sshhelper.Run(cpClient, `kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n | .status.addresses[].address | [$n, .] | @tsv'`)
-	if err != nil {
-		return fmt.Errorf("failed to list nodes: %w\nOutput:\n%s", err, rawNodeOutput), ""
-	}
-	// log.Printf("Node address table for cluster %s:\n%s", cluster.Spec.ClusterName, rawNodeOutput)
-
-	// Find the node name whose address column matches cluster.Spec.Host.
+	// After kubeadm join, kubelet takes a few seconds to register the node with the API server.
+	// Retry the address lookup for up to 90 seconds before giving up.
+	var rawNodeOutput string
 	nodeName := ""
-	for _, line := range strings.Split(strings.TrimSpace(rawNodeOutput), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[1] == nodeIP {
-			nodeName = fields[0]
+	for attempt := 0; attempt < 45; attempt++ {
+		var queryErr error
+		rawNodeOutput, queryErr = sshhelper.Run(cpClient, `kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n | .status.addresses[].address | [$n, .] | @tsv'`)
+		if queryErr != nil {
+			return fmt.Errorf("failed to list nodes: %w\nOutput:\n%s", queryErr, rawNodeOutput), ""
+		}
+		for _, line := range strings.Split(strings.TrimSpace(rawNodeOutput), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 && fields[1] == nodeIP {
+				nodeName = fields[0]
+				break
+			}
+		}
+		if nodeName != "" {
 			break
 		}
+		log.Printf("Worker node %s not yet visible in kubectl get nodes (attempt %d/45), retrying in 2s...", nodeIP, attempt+1)
+		time.Sleep(2 * time.Second)
 	}
 	if nodeName == "" {
 		return fmt.Errorf("failed to resolve node name for host %s vpn ip: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput), ""
@@ -667,7 +547,7 @@ func GetTunIP(client *sshhelper.Client) (string, error) {
 // InstallNvidiaContainerToolkit installs the NVIDIA container toolkit on a GPU node
 // and configures CRI-O to use it. This should be called after JoinWorkerNode for
 // nodes where cluster.Spec.NodeInfo.HardwareType == "gpu".
-func InstallNvidiaContainerToolkit(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
+func InstallNvidiaContainerToolkit1(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
 	if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 		log.Printf("Skipping NVIDIA container toolkit install — node %s is not a GPU node", cluster.Spec.Host)
 		return nil
@@ -738,7 +618,7 @@ libnvidia-container1=%s`,
 // InstallNvidiaDrivers installs the NVIDIA drivers on a GPU node.
 // It should be called after InstallNvidiaContainerToolkit.
 // A reboot is typically required after driver installation for the drivers to take effect.
-func InstallNvidiaDrivers(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
+func InstallNvidiaDrivers11(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
 	// if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 	// 	log.Printf("Skipping NVIDIA driver install — node %s is not a GPU node", cluster.Spec.Host)
 	// 	return nil
@@ -819,16 +699,19 @@ libnvidia-container1=%s`,
 		`sudo mkdir -p /etc/crio/crio.conf.d`,
 
 		// Write the expected config to a temp file for comparison
-		`sudo tee /etc/crio/crio.conf.d/99-nvidia.conf > /dev/null <<'EOFCONF'
+		`sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null <<'EOFCONF'
 [crio]
 
   [crio.runtime]
-    default_runtime = "nvidia"
+    default_runtime = "runc"
 
     [crio.runtime.runtimes]
 
       [crio.runtime.runtimes.nvidia]
         runtime_path = "/usr/bin/nvidia-container-runtime"
+        runtime_type = "oci"
+	  [crio.runtime.runtimes.runc]
+        runtime_path = "/usr/sbin/runc"
         runtime_type = "oci"
 EOFCONF`,
 

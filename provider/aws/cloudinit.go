@@ -273,6 +273,17 @@ if [ "$HAVE" != "$WANT" ]; then
     rm -f /tmp/crio
   fi
 fi
+
+# Wipe ALL storage after binary swap — custom binary uses go.podman.io/storage,
+# packaged binary uses github.com/containers/storage; old metadata is unreadable.
+report "Rebuilding CRI-O image metadata cache"
+systemctl stop crio
+umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
+systemctl daemon-reload
+systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
+sleep 3
+
 test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
   install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
   /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
