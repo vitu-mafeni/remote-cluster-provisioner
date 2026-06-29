@@ -393,6 +393,13 @@ func (r *RemoteClusterReconciler) reconcilePackageVariants(ctx context.Context, 
 		return r.fail(ctx, cluster, "CorePackageVariantsFailed", fmt.Errorf("creating core PackageVariants: %w", err))
 	}
 
+	// delay to allow Porch to sync the new cluster repo before creating overlay PackageVariants
+	// (otherwise Porch will fail to find the overlay packages in the new repo)
+	// sleep will block the reconcile loop, but this is a one-time delay and the cluster is already in Ready phase
+	log.Info("Waiting for Porch to sync the new cluster repo before creating overlay PackageVariants",
+		"duration", 30*time.Second)
+	time.Sleep(30 * time.Second)
+
 	if err := r.createOverlaysPlusPostInstallPackageVariants(ctx, cluster); err != nil {
 		return r.fail(ctx, cluster, "OverlayPackageVariantsFailed", fmt.Errorf("creating overlay PackageVariants: %w", err))
 	}
@@ -486,9 +493,9 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
 		}
 		if cluster.Annotations[annotationNvidiaInstalled] != "true" {
-			if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster, clusterParent); err != nil {
-				return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
-			}
+			// if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster, clusterParent); err != nil {
+			// 	return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
+			// }
 
 			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
 				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking NVIDIA installed: %w", err)
@@ -516,7 +523,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 				defer rebootClient.Conn.Close()
 				// Error is ignored: the connection resets when the node starts
 				// rebooting, which looks like a failure to ssh.Run.
-				_, _ = ssh.Run(rebootClient, "sudo reboot")
+				// _, _ = ssh.Run(rebootClient, "sudo reboot")
 			}()
 			return ctrl.Result{RequeueAfter: postRebootWait}, nil
 		}
@@ -692,6 +699,14 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 					_, _ = ssh.Run(sshClient, fmt.Sprintf("sudo rm -f %s", f))
 				}
 				glog.Info("Cleared stale registry auth files before anonymous pull")
+			}
+
+			// Wait for CRI-O socket to be ready before pulling — the socket may not
+			// exist yet if CRI-O just started after a binary swap or storage wipe.
+			waitCmd := `for i in $(seq 1 60); do [ -S /var/run/crio/crio.sock ] && break; echo "waiting for crio socket ($i/60)..."; sleep 3; done; [ -S /var/run/crio/crio.sock ] || { sudo systemctl start crio; sleep 5; }`
+			if out, err := ssh.Run(sshClient, waitCmd); err != nil {
+				ch <- prepullJobResult{err: fmt.Errorf("waiting for CRI-O socket: %w\nOutput:\n%s", err, out)}
+				return
 			}
 
 			for _, img := range imagesCopy {
@@ -1394,6 +1409,37 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		// 		"approval.nephio.org/policy": "initial",
 		// 	},
 		// },
+		// {
+		// 	name: "longhorn-storage-provisioner-variant",
+		// 	upstream: packageRef{
+		// 		pkg:      "longhorn-storage-provisioner",
+		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+		// 		revision: cluster.Spec.GitConfig.PackageRevision,
+		// 	},
+		// 	downstream: packageRef{
+		// 		pkg:  "longhorn-storage-provisioner",
+		// 		repo: cluster.Spec.ClusterName,
+		// 	},
+		// 	annotations: map[string]interface{}{
+		// 		"approval.nephio.org/policy": "initial",
+		// 	},
+		// },
+
+		{
+			name: "gpu-operator-variant",
+			upstream: packageRef{
+				pkg:      "gpu-operator",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "gpu-operator",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
 
 		{
 			name: "keycloak-variant",
