@@ -1162,6 +1162,7 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	_ = r.Status().Update(ctx, np)
 
 	// ── Remove Kubernetes node ──────────────────────────────────────────────
+	nodeDeleted := false
 	if np.Status.NodeName != "" {
 		node := &corev1.Node{}
 		if err := r.Get(ctx, types.NamespacedName{Name: np.Status.NodeName}, node); err == nil {
@@ -1193,6 +1194,28 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 			} else {
 				log.Info("Node already terminating — finalizer removal will complete deletion", "node", np.Status.NodeName)
 			}
+		} else if apierrors.IsNotFound(err) {
+			nodeDeleted = true
+			log.Info("Node confirmed deleted from cluster", "node", np.Status.NodeName)
+		}
+	} else {
+		nodeDeleted = true
+	}
+
+	// ── Wait for node deletion confirmation before cleaning up AWS resources ──
+	if !nodeDeleted {
+		log.Info("Waiting for node to be deleted from cluster before cleaning up cloud resources")
+		return ctrl.Result{Requeue: true, RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// ── Clean up node-related secrets ────────────────────────────────────────
+	sshKeySecret := &corev1.Secret{}
+	sshKeyName := np.Name + "-ssh-key"
+	if err := r.Get(ctx, types.NamespacedName{Name: sshKeyName, Namespace: np.Namespace}, sshKeySecret); err == nil {
+		if err := r.Delete(ctx, sshKeySecret); client.IgnoreNotFound(err) != nil {
+			log.Error(err, "deleting SSH key secret", "secret", sshKeyName)
+		} else {
+			log.Info("Deleted SSH key secret", "secret", sshKeyName)
 		}
 	}
 

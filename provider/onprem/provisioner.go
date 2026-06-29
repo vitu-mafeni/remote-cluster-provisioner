@@ -228,6 +228,8 @@ sudo curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER
 sudo chmod 0755 /usr/local/bin/crun && \
 sudo cp -f /usr/local/bin/crun /usr/bin/crun && \
 crun --version`,
+				// Force-purge any broken dpkg record before installing fresh (matches control-plane clean state).
+				"sudo dpkg --purge --force-all cri-o 2>/dev/null || true",
 				"sudo apt-get install -y cri-o",
 				// Hardcode /usr/local/bin/crun — do NOT use command -v crun because that may
 				// resolve to /usr/bin/crun (old apt crun) if /usr/bin precedes /usr/local/bin in PATH.
@@ -292,6 +294,14 @@ sudo systemctl daemon-reload && \
 sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; } && \
 rm -f /tmp/crio; \
 fi`, kubeadm.CrioCommit, kubeadm.CrioAsset),
+				// Wipe ALL storage after binary swap — custom binary uses go.podman.io/storage,
+				// packaged binary uses github.com/containers/storage; old metadata is unreadable.
+				`sudo systemctl stop crio && \
+sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true && \
+sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true && \
+sudo systemctl daemon-reload && \
+sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; } && \
+sleep 3`,
 				`test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
 sudo install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
 /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
