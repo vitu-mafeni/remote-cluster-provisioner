@@ -106,7 +106,7 @@ type: Opaque
 stringData:
   id_rsa: |
     -----BEGIN RSA PRIVATE KEY-----
-   HCNAGE ME
+CHANGE ME TO YOUR PRIVATE KEY
     -----END RSA PRIVATE KEY-----
 ---
 # Secret
@@ -118,4 +118,4 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: CHANGE ME
+  password: CHANGE ME TO YOUR DOCKERHUB PASSWORD

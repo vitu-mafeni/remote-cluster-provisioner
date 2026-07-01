@@ -749,9 +749,6 @@ libnvidia-container1=%s`,
 
     [crio.runtime.runtimes]
 
-      [crio.runtime.runtimes.nvidia]
-        runtime_path = "/usr/bin/nvidia-container-runtime"
-        runtime_type = "oci"
       [crio.runtime.runtimes.runc]
         runtime_path = "/usr/sbin/runc"
         runtime_type = "oci"
