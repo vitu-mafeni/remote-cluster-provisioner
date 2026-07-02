@@ -1280,61 +1280,45 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 	log := logf.FromContext(ctx)
 
 	netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
-	if err := r.List(ctx, netConfigList); err != nil || len(netConfigList.Items) == 0 {
+	if err := r.List(ctx, netConfigList); err != nil {
+		return fmt.Errorf("listing NodeProvisionNetConfigs for VPN cleanup: %w", err)
+	}
+	if len(netConfigList.Items) == 0 {
+		log.Info("No NodeProvisionNetConfig found — skipping VPN peer cleanup")
 		return nil
 	}
 	netConfig := &netConfigList.Items[0]
 
 	// ── 1. Resolve public key and VPN IP from CR status ─────────────────────
+	// Do this BEFORE connecting to the VPN server so we still have the peer key
+	// on retry even if the server connection previously failed and we have not
+	// yet updated (cleared) the NetConfig status.
 	var peerPublicKey string
-	var resolvedVpnIP string // IP from the peer entry — valid even when np.Status.VpnIP was never written
-	newPeers := make([]mlv1alpha1.VPNPeerStatus, 0, len(netConfig.Status.VPNPeers))
+	var resolvedVpnIP string
 	for _, p := range netConfig.Status.VPNPeers {
 		if p.NodeName == np.Name || p.VPNIP == np.Status.VpnIP {
 			peerPublicKey = p.PublicKey
 			resolvedVpnIP = p.VPNIP
-		} else {
-			newPeers = append(newPeers, p)
+			break
 		}
 	}
 
-	// Best-effort IP to release: prefer the peer-entry IP, fall back to status fields.
-	ipToRelease := resolvedVpnIP
-	if ipToRelease == "" {
-		ipToRelease = np.Status.VpnIP
+	vpnIP := resolvedVpnIP
+	if vpnIP == "" {
+		vpnIP = np.Status.VpnIP
 	}
-	if ipToRelease == "" {
-		ipToRelease = np.Status.IPAddress
-	}
-
-	// Release IP from used list — only match non-empty IPs to avoid spuriously
-	// removing unrelated entries when the IP was never written to np.Status.
-	newIPs := make([]string, 0, len(netConfig.Status.UsedIPAddresses))
-	for _, ip := range netConfig.Status.UsedIPAddresses {
-		if ipToRelease != "" && ip == ipToRelease {
-			continue
-		}
-		newIPs = append(newIPs, ip)
-	}
-	netConfig.Status.VPNPeers = newPeers
-	netConfig.Status.UsedIPAddresses = newIPs
-	if err := r.Status().Update(ctx, netConfig); err != nil {
-		return fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
+	if vpnIP == "" {
+		vpnIP = np.Status.IPAddress
 	}
 
-	// ── 2. Connect to VPN server — always, so we can use the live fallback ───
+	// ── 2. Connect to VPN server ─────────────────────────────────────────────
 	vpnClient, err := r.getVPNServerSSHClient(ctx, netConfig)
 	if err != nil {
-		log.Error(err, "connecting to VPN server for peer removal — peer may remain on server")
-		return nil
+		return fmt.Errorf("connecting to VPN server for peer removal: %w", err)
 	}
 	defer vpnClient.Conn.Close()
 
 	// ── 3. Fallback: look up public key from live server when CR has no record ─
-	vpnIP := np.Status.VpnIP
-	if vpnIP == "" {
-		vpnIP = np.Status.IPAddress
-	}
 	if peerPublicKey == "" && vpnIP != "" {
 		serverPeers, lookupErr := remotenodeprovision.ReadVPNServerPeers(vpnClient)
 		if lookupErr != nil {
@@ -1351,19 +1335,16 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 			log.Info("No peer found in CR status or on VPN server for this node — nothing to remove",
 				"vpnIP", vpnIP)
 		}
-		return nil
-	}
+		// Still fall through to release the IP from the NetConfig status below.
+	} else {
+		// ── 4. Remove from running WireGuard config ───────────────────────────
+		removeCmd := fmt.Sprintf("sudo wg set wg0 peer %s remove", peerPublicKey)
+		if _, err := ssh.Run(vpnClient, removeCmd); err != nil {
+			log.Error(err, "removing WireGuard peer from running config", "publicKey", peerPublicKey)
+		}
 
-	// ── 4. Remove from running WireGuard config ───────────────────────────────
-	removeCmd := fmt.Sprintf("sudo wg set wg0 peer %s remove", peerPublicKey)
-	if _, err := ssh.Run(vpnClient, removeCmd); err != nil {
-		log.Error(err, "removing WireGuard peer from running config", "publicKey", peerPublicKey)
-	}
-
-	// ── 5. Remove block from persisted wg0.conf ───────────────────────────────
-	// Uses the same awk buffering as registerVPNPeer so the removal is correct
-	// regardless of the field order within the [Peer] block.
-	cleanCmd := fmt.Sprintf(`
+		// ── 5. Remove block from persisted wg0.conf ──────────────────────────
+		cleanCmd := fmt.Sprintf(`
 sudo awk -v our_key="%s" '
   /^\[Peer\]/ {
     in_peer=1; buf=$0"\n"; has_key=0; next
@@ -1382,13 +1363,38 @@ sudo awk -v our_key="%s" '
   END { if (in_peer && !has_key) printf "%%s", buf }
 ' /etc/wireguard/wg0.conf 2>/dev/null | sudo tee /etc/wireguard/wg0.conf.tmp > /dev/null &&
 sudo mv /etc/wireguard/wg0.conf.tmp /etc/wireguard/wg0.conf 2>/dev/null || true`,
-		peerPublicKey,
-	)
-	if _, err := ssh.Run(vpnClient, cleanCmd); err != nil {
-		log.Error(err, "removing peer block from wg0.conf on VPN server")
+			peerPublicKey,
+		)
+		if _, err := ssh.Run(vpnClient, cleanCmd); err != nil {
+			log.Error(err, "removing peer block from wg0.conf on VPN server")
+		}
+
+		log.Info("Removed VPN peer from server", "publicKey", peerPublicKey, "vpnIP", vpnIP)
 	}
 
-	log.Info("Removed VPN peer", "publicKey", peerPublicKey, "vpnIP", vpnIP)
+	// ── 6. Release IP and peer entry from NetConfig status ───────────────────
+	// Done AFTER the server removal so a retry still has the peer key available
+	// if the server step fails and the controller restarts.
+	newPeers := make([]mlv1alpha1.VPNPeerStatus, 0, len(netConfig.Status.VPNPeers))
+	for _, p := range netConfig.Status.VPNPeers {
+		if p.NodeName == np.Name || p.VPNIP == vpnIP {
+			continue
+		}
+		newPeers = append(newPeers, p)
+	}
+	newIPs := make([]string, 0, len(netConfig.Status.UsedIPAddresses))
+	for _, ip := range netConfig.Status.UsedIPAddresses {
+		if vpnIP != "" && ip == vpnIP {
+			continue
+		}
+		newIPs = append(newIPs, ip)
+	}
+	netConfig.Status.VPNPeers = newPeers
+	netConfig.Status.UsedIPAddresses = newIPs
+	if err := r.Status().Update(ctx, netConfig); err != nil {
+		return fmt.Errorf("updating NodeProvisionNetConfig status after VPN peer removal: %w", err)
+	}
+
 	return nil
 }
 

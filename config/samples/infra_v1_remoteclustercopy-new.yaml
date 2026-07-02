@@ -49,6 +49,12 @@ spec:
     # Public IP of VPN server
     vpnServerPublicIP: "13.215.206.108"
 
+    # SSH port on the VPN server (default: 22)
+    vpnServerSSHPort: 22
+
+    # SSH username on the VPN server (default: ubuntu)
+    vpnServerSSHUsername: "ubuntu"
+
     vpnSshCredentialsRef:
       name: "vpn-server-secret"
       namespace: "default"
@@ -116,4 +122,4 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: CHANGE ME TO YOUR DOCKERHUB PASSWORD
+  password: "CHANGE ME TO YOUR DOCKERHUB PASSWORD"

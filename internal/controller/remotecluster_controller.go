@@ -1017,6 +1017,15 @@ data:
 			imagePrepullsYAML += fmt.Sprintf("    imagePullSecretRef:\n      name: \"%s\"\n", ref.Name)
 		}
 
+		vpnServerSSHPort := cluster.Spec.VPNConfig.VPNServerSSHPort
+		if vpnServerSSHPort == 0 {
+			vpnServerSSHPort = 22
+		}
+		vpnServerSSHUsername := cluster.Spec.VPNConfig.VPNServerSSHUsername
+		if vpnServerSSHUsername == "" {
+			vpnServerSSHUsername = "ubuntu"
+		}
+
 		netConfigYAML := fmt.Sprintf(`
 apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
 kind: NodeProvisionNetConfig
@@ -1033,6 +1042,8 @@ spec:
 %s  vpnRange: %s
   vpnServerPublicConfig:
     publicIP: %s
+    sshPort: %d
+    sshUsername: %s
     vpnSshCredentialsRef:
       name: %s
       namespace: %s
@@ -1047,6 +1058,8 @@ spec:
 			imagePrepullsYAML,
 			vpnCIDR,
 			cluster.Spec.VPNConfig.VPNServerPublicIP,
+			vpnServerSSHPort,
+			vpnServerSSHUsername,
 			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
 			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
 		)
@@ -1938,16 +1951,24 @@ func (r *RemoteClusterReconciler) removeVPNPeer(ctx context.Context, cluster *in
 
 	cred := strings.TrimSpace(string(credBytes))
 	vpnHost := cluster.Spec.VPNConfig.VPNServerPublicIP
+	vpnPort := cluster.Spec.VPNConfig.VPNServerSSHPort
+	if vpnPort == 0 {
+		vpnPort = 22
+	}
+	vpnUser := cluster.Spec.VPNConfig.VPNServerSSHUsername
+	if vpnUser == "" {
+		vpnUser = "ubuntu"
+	}
 
 	var vpnClient *ssh.Client
 	var err error
 	if strings.HasPrefix(cred, "-----BEGIN") {
-		vpnClient, err = ssh.ConnectWithPrivateKey(vpnHost, 22, "ubuntu", cred)
+		vpnClient, err = ssh.ConnectWithPrivateKey(vpnHost, vpnPort, vpnUser, cred)
 	} else {
-		vpnClient, err = ssh.Connect(vpnHost, 22, "ubuntu", cred)
+		vpnClient, err = ssh.Connect(vpnHost, vpnPort, vpnUser, cred)
 	}
 	if err != nil {
-		return fmt.Errorf("SSH to VPN server %s: %w", vpnHost, err)
+		return fmt.Errorf("SSH to VPN server %s:%d as %s: %w", vpnHost, vpnPort, vpnUser, err)
 	}
 	defer vpnClient.Conn.Close()
 
