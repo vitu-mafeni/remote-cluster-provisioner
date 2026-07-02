@@ -140,6 +140,10 @@ spec:
                     type: string
                   vpnServerPublicIP:
                     type: string
+                  vpnServerSSHPort:
+                    type: integer
+                  vpnServerSSHUsername:
+                    type: string
                   vpnSshCredentialsRef:
                     properties:
                       key:
