@@ -47,7 +47,7 @@ sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
 //   - CRI-O drop-in uses only [crio.runtime] — [crio.image] has no listen key and was
 //     silently breaking drop-in parsing.
 //   - CNI directories are created before CRI-O starts so the CNI plugin probe succeeds.
-func crioBuildSteps(repoVersion, clean string) []string {
+func crioBuildSteps(clean string) []string {
 	return []string{
 		// ── Build deps ──────────────────────────────────────────────────────────────
 		"sudo apt-get install -y build-essential libgpgme-dev gcc xmlto asciidoc " +
@@ -128,6 +128,18 @@ printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' \
 
 		// CNI directories must exist before CRI-O starts so the CNI plugin probe passes.
 		`sudo mkdir -p /etc/cni/net.d /opt/cni/bin`,
+
+		// CRIU configuration for checkpoint/restore support.
+		// Remove any stale file first, then write fresh config.
+		`sudo rm -f /etc/criu/runc.conf && \
+sudo mkdir -p /etc/criu && \
+printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+  | sudo tee /etc/criu/runc.conf > /dev/null`,
+
+		// CRI-O runc runtime drop-in: declare runc as the default OCI runtime.
+		`sudo mkdir -p /etc/crio/crio.conf.d && \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/sbin/runc"\n        runtime_type = "oci"\n' \
+  | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
 	}
 }
 
@@ -310,7 +322,7 @@ mode: ipvs
 		}},
 
 		// ── Phase 4: CRI-O build ─────────────────────────────────────────────────────
-		{Name: "CRI-O Build", Steps: crioBuildSteps(repoVersion, clean)},
+		{Name: "CRI-O Build", Steps: crioBuildSteps(clean)},
 
 		// ── Phase 5: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
@@ -563,7 +575,7 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 		}},
 
 		// ── Phase 3: CRI-O build ─────────────────────────────────────────────────────
-		{Name: "CRI-O Build", Steps: crioBuildSteps(repoVersion, clean)},
+		{Name: "CRI-O Build", Steps: crioBuildSteps(clean)},
 
 		// ── Phase 4: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{

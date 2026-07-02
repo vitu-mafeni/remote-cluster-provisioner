@@ -1208,23 +1208,7 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 		return ctrl.Result{Requeue: true, RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// ── Clean up node-related secrets ────────────────────────────────────────
-	sshKeySecret := &corev1.Secret{}
-	sshKeyName := np.Name + "-ssh-key"
-	if err := r.Get(ctx, types.NamespacedName{Name: sshKeyName, Namespace: np.Namespace}, sshKeySecret); err == nil {
-		if err := r.Delete(ctx, sshKeySecret); client.IgnoreNotFound(err) != nil {
-			log.Error(err, "deleting SSH key secret", "secret", sshKeyName)
-		} else {
-			log.Info("Deleted SSH key secret", "secret", sshKeyName)
-		}
-	}
-
-	// ── Remove VPN peer ─────────────────────────────────────────────────────
-	if err := r.cleanupVPNPeer(ctx, np); err != nil {
-		log.Error(err, "cleaning up VPN peer (continuing)")
-	}
-
-	// ── Provider-specific cleanup ────────────────────────────────────────────
+	// ── Provider-specific cleanup (must happen before secrets are deleted) ──────
 	switch np.Spec.Provider {
 	case mlv1alpha1.CloudProviderAWS:
 		if np.Status.InstanceID != "" {
@@ -1255,6 +1239,22 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 		}
 	case mlv1alpha1.CloudProviderOnPrem:
 		r.cleanupOnPremNode(ctx, np)
+	}
+
+	// ── Remove VPN peer ─────────────────────────────────────────────────────
+	if err := r.cleanupVPNPeer(ctx, np); err != nil {
+		log.Error(err, "cleaning up VPN peer (continuing)")
+	}
+
+	// ── Clean up node-related secrets (after cloud resources are gone) ────────
+	sshKeySecret := &corev1.Secret{}
+	sshKeyName := np.Name + "-ssh-key"
+	if err := r.Get(ctx, types.NamespacedName{Name: sshKeyName, Namespace: np.Namespace}, sshKeySecret); err == nil {
+		if err := r.Delete(ctx, sshKeySecret); client.IgnoreNotFound(err) != nil {
+			log.Error(err, "deleting SSH key secret", "secret", sshKeyName)
+		} else {
+			log.Info("Deleted SSH key secret", "secret", sshKeyName)
+		}
 	}
 
 	controllerutil.RemoveFinalizer(np, nodeProvisionFinalizer)
