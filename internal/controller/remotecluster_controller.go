@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +77,12 @@ type RemoteClusterReconciler struct {
 	// controlPlaneJobs holds in-flight control-plane init goroutines.
 	// Key: "namespace/name", Value: <-chan controlPlaneJobResult
 	controlPlaneJobs sync.Map
+
+	// controlPlaneProgress tracks the last phase index completed by an in-flight
+	// control-plane goroutine.  Key: "namespace/name", Value: int.
+	// The reconcile loop reads this when the goroutine finishes and persists it
+	// to the CR annotation so retries can resume from the right phase.
+	controlPlaneProgress sync.Map
 }
 
 const (
@@ -94,6 +101,26 @@ const (
 	// annotationImagesPrepulled marks that all images in spec.nodeInfo.softwareConfig.imagePrepulls
 	// have been successfully pulled on the worker node.
 	annotationImagesPrepulled = "infra.dcn.ssu.ac.kr/images-prepulled"
+
+	// annotationLastCompletedPhaseCP / Worker persist the last successfully completed
+	// provision phase index so that retries can resume from the failed phase rather
+	// than restarting from scratch.  Value is a decimal integer; -1 means nothing yet.
+	annotationLastCompletedPhaseCP     = "infra.dcn.ssu.ac.kr/last-completed-phase-cp"
+	annotationLastCompletedPhaseWorker = "infra.dcn.ssu.ac.kr/last-completed-phase-worker"
+
+	// annotationCPInitComplete is set to "true" once InitializeControlPlane succeeds
+	// and the join command is cached in annotationJoinCmdCache.  If the subsequent
+	// post-init steps (createClusterRepo, setStatus) fail, the next reconcile detects
+	// this annotation and skips re-running kubeadm, retrying only the post-init work.
+	annotationCPInitComplete = "infra.dcn.ssu.ac.kr/cp-init-complete"
+	// annotationJoinCmdCache holds the kubeadm join command between the goroutine
+	// completing and it being written to cluster.Status.JoinCommand.
+	annotationJoinCmdCache = "infra.dcn.ssu.ac.kr/join-cmd-cache"
+	// annotationNodeProvisionCreated is set to "true" after handleCreateUpdateNodeProvisionConfig
+	// succeeds for the control-plane.  The phaseReady reconcile path checks this and
+	// re-runs the step if missing, recovering clusters that reached Ready before the
+	// NodeProvisionNetConfig was created.
+	annotationNodeProvisionCreated = "infra.dcn.ssu.ac.kr/node-provision-created"
 
 	phaseProvisioning = "Provisioning"
 	phaseReady        = "Ready"
@@ -172,6 +199,27 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.reconcileProvisioning(ctx, cluster)
 	case phaseReady:
 		if cluster.Spec.NodeInfo.NodeType == "control-plane" {
+			// If NodeProvisionNetConfig was not created (e.g. it failed after setStatus
+			// already flipped to Ready in a previous run), re-run it now via SSH before
+			// proceeding to PackageVariants.
+			if cluster.Annotations[annotationNodeProvisionCreated] != "true" {
+				log.Info("NodeProvisionNetConfig not yet created; running now")
+				sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+				defer cancel()
+				sshClient, err := r.getSSHClient(sshCtx, cluster)
+				if err != nil {
+					return r.fail(ctx, cluster, "SSHConnectionFailed",
+						fmt.Errorf("SSH for NodeProvisionNetConfig: %w", err))
+				}
+				defer func() { _ = sshClient.Conn.Close() }()
+				if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, cluster, sshClient, cluster.Spec.VPNConfig.IP, "create"); err != nil {
+					return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed",
+						fmt.Errorf("creating NodeProvisionNetConfig: %w", err))
+				}
+				if patchErr := r.patchAnnotation(ctx, cluster, annotationNodeProvisionCreated, "true"); patchErr != nil {
+					log.Error(patchErr, "Failed to stamp node-provision-created annotation")
+				}
+			}
 			if cluster.Annotations[annotationPkgVariantsCreated] == "true" {
 				log.Info("Cluster fully ready — no action required")
 				return ctrl.Result{}, nil
@@ -290,10 +338,30 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 		return ctrl.Result{RequeueAfter: repoReadyWait}, nil
 	}
 
+	// If InitializeControlPlane already succeeded but the post-init steps (createClusterRepo,
+	// setStatus) failed, skip re-running kubeadm and only retry those steps.
+	// The join command is cached in annotationJoinCmdCache while JoinCommand is not yet
+	// in the status (it is only written there after ALL post-init steps succeed).
+	if cluster.Annotations[annotationCPInitComplete] == "true" && cluster.Status.JoinCommand == "" {
+		log.Info("Control plane kubeadm init already done; retrying post-init steps only")
+		return r.completeControlPlane(ctx, cluster, cluster.Annotations[annotationJoinCmdCache])
+	}
+
 	key := cluster.Namespace + "/" + cluster.Name
 
 	v, running := r.controlPlaneJobs.Load(key)
 	if !running {
+		// Determine which phase to start from.  On the first attempt the annotation
+		// is absent so startPhase is 0 (full run).  On a retry after failure the
+		// annotation holds the last completed phase index and we start from the next one.
+		startPhase := 0
+		if s, ok := cluster.Annotations[annotationLastCompletedPhaseCP]; ok {
+			if n, err := strconv.Atoi(s); err == nil && n >= 0 {
+				startPhase = n + 1
+				log.Info("Resuming control-plane init from phase", "startPhase", startPhase)
+			}
+		}
+
 		// Spawn a fresh goroutine.  Open a dedicated SSH connection that the
 		// goroutine owns for its entire lifetime.
 		sshClient, err := r.getSSHClient(ctx, cluster)
@@ -309,11 +377,13 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 
 		go func() {
 			defer sshClient.Conn.Close()
-			joinCommand, err := kubeadm.InitializeControlPlane(sshClient, clusterCopy)
+			joinCommand, err := kubeadm.InitializeControlPlane(sshClient, clusterCopy, startPhase, func(phaseIdx int) {
+				r.controlPlaneProgress.Store(key, phaseIdx)
+			})
 			ch <- controlPlaneJobResult{joinCommand: joinCommand, err: err}
 		}()
 
-		log.Info("Control plane init goroutine started")
+		log.Info("Control plane init goroutine started", "startPhase", startPhase)
 		return ctrl.Result{RequeueAfter: controlPlanePollInterval}, nil
 	}
 
@@ -322,45 +392,48 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 	select {
 	case res := <-ch:
 		r.controlPlaneJobs.Delete(key)
+
+		// Persist the last completed phase to the annotation regardless of
+		// success/failure so the next reconcile can resume from there.
+		if lastPhase, ok := r.controlPlaneProgress.LoadAndDelete(key); ok {
+			phaseStr := strconv.Itoa(lastPhase.(int))
+			if patchErr := r.patchAnnotation(ctx, cluster, annotationLastCompletedPhaseCP, phaseStr); patchErr != nil {
+				log.Error(patchErr, "Failed to persist control-plane phase progress")
+			}
+		}
+
 		if res.err != nil {
 			return r.fail(ctx, cluster, "ControlPlaneInitFailed",
 				fmt.Errorf("initializing control plane: %w", res.err))
 		}
+
 		log.Info("Control plane init completed", "joinCommand", res.joinCommand != "")
 
-		// Open a short-lived SSH connection for post-init steps (repo creation,
-		// NodeProvisionNetConfig).  These are quick compared to init itself.
-		sshClient, err := r.getSSHClient(ctx, cluster)
-		if err != nil {
-			return r.fail(ctx, cluster, "SSHConnectionFailed",
-				fmt.Errorf("post-init SSH connection to %s: %w", cluster.Spec.Host, err))
-		}
-		defer sshClient.Conn.Close()
-
-		if err := r.createClusterRepo(ctx, cluster); err != nil {
-			return r.fail(ctx, cluster, "ClusterRepoFailed",
-				fmt.Errorf("creating cluster repo: %w", err))
+		// Persist init-complete + join command BEFORE attempting post-init steps.
+		// If createClusterRepo or setStatus fails below, the next reconcile detects
+		// annotationCPInitComplete and retries only the post-init steps, not kubeadm.
+		if patchErr := r.patchAnnotations(ctx, cluster, map[string]string{
+			annotationLastCompletedPhaseCP: "-1",
+			annotationCPInitComplete:       "true",
+			annotationJoinCmdCache:         res.joinCommand,
+		}); patchErr != nil {
+			log.Error(patchErr, "Failed to persist cp-init-complete annotation")
 		}
 
-		// Refresh to avoid resource-version conflicts before the status write.
-		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("refreshing cluster before status update: %w", err)
-		}
-		cluster.Status.JoinCommand = res.joinCommand
-		if err := r.setStatus(ctx, cluster, phaseReady, "Provisioned", "Cluster provisioned successfully", false); err != nil {
-			return ctrl.Result{}, fmt.Errorf("updating status to Ready: %w", err)
-		}
-
-		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, cluster, sshClient, cluster.Spec.VPNConfig.IP, "create"); err != nil {
-			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed",
-				fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
-		}
-
-		log.Info("Control plane provisioned; waiting for cluster repo before creating PackageVariants",
-			"requeueAfter", repoReadyWait)
-		return ctrl.Result{RequeueAfter: repoReadyWait}, nil
+		return r.completeControlPlane(ctx, cluster, res.joinCommand)
 
 	default:
+		// Goroutine still running.  Flush any phase progress it has accumulated
+		// to the CR annotation so that a controller restart can resume from the
+		// right phase rather than re-running everything from scratch.
+		if lastPhase, ok := r.controlPlaneProgress.Load(key); ok {
+			phaseStr := strconv.Itoa(lastPhase.(int))
+			if current := cluster.Annotations[annotationLastCompletedPhaseCP]; current != phaseStr {
+				if patchErr := r.patchAnnotation(ctx, cluster, annotationLastCompletedPhaseCP, phaseStr); patchErr != nil {
+					log.Error(patchErr, "Failed to flush control-plane phase progress during poll")
+				}
+			}
+		}
 		log.Info("Control plane init in progress, requeueing")
 		return ctrl.Result{RequeueAfter: controlPlanePollInterval}, nil
 	}
@@ -392,6 +465,13 @@ func (r *RemoteClusterReconciler) reconcilePackageVariants(ctx context.Context, 
 	if err := r.createCorePackageVariants(ctx, cluster); err != nil {
 		return r.fail(ctx, cluster, "CorePackageVariantsFailed", fmt.Errorf("creating core PackageVariants: %w", err))
 	}
+
+	// delay to allow Porch to sync the new cluster repo before creating overlay PackageVariants
+	// (otherwise Porch will fail to find the overlay packages in the new repo)
+	// sleep will block the reconcile loop, but this is a one-time delay and the cluster is already in Ready phase
+	log.Info("Waiting for Porch to sync the new cluster repo before creating overlay PackageVariants",
+		"duration", 30*time.Second)
+	time.Sleep(30 * time.Second)
 
 	if err := r.createOverlaysPlusPostInstallPackageVariants(ctx, cluster); err != nil {
 		return r.fail(ctx, cluster, "OverlayPackageVariantsFailed", fmt.Errorf("creating overlay PackageVariants: %w", err))
@@ -435,9 +515,24 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		}
 		defer func() { _ = sshClientCP.Conn.Close() }()
 
-		// if err, nodeIP := kubeadm.JoinWorkerNode(sshClient, sshClientCP, cluster, clusterParent.Status.JoinCommand); err != nil {
-		// 	return r.fail(ctx, cluster, "WorkerJoinFailed", fmt.Errorf("joining worker node to cluster: %w", err))
-		// }
+		// Determine which phase to start from for this worker.
+		// On the first attempt the annotation is absent → startPhase=0 (full run).
+		// On retry after failure the annotation holds the last completed phase index.
+		workerStartPhase := 0
+		if s, ok := cluster.Annotations[annotationLastCompletedPhaseWorker]; ok {
+			if n, parseErr := strconv.Atoi(s); parseErr == nil && n >= 0 {
+				workerStartPhase = n + 1
+				log.Info("Resuming worker join from phase", "startPhase", workerStartPhase)
+			}
+		}
+
+		// Progress callback: persists the last completed phase to the CR annotation
+		// after each phase so a retry can skip already-done work.
+		onWorkerPhaseComplete := func(phaseIdx int) {
+			if patchErr := r.patchAnnotation(ctx, cluster, annotationLastCompletedPhaseWorker, strconv.Itoa(phaseIdx)); patchErr != nil {
+				log.Error(patchErr, "Failed to persist worker phase progress", "phase", phaseIdx)
+			}
+		}
 
 		err, nodeIP := kubeadm.JoinWorkerNode(
 			sshClient,
@@ -445,24 +540,26 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			cluster,
 			clusterParent.Status.JoinCommand,
 			clusterParent,
+			workerStartPhase,
+			onWorkerPhaseComplete,
 		)
 		if err != nil {
 			return r.fail(
 				ctx,
 				cluster,
 				"WorkerJoinFailed",
-				fmt.Errorf(
-					"joining worker node to cluster: %w",
-					err,
-				),
+				fmt.Errorf("joining worker node to cluster: %w", err),
 			)
 		}
 
-		// Refresh, stamp the joined annotation, then update status — all in one pass.
+		// Refresh, stamp the joined annotation, clear the phase-resume annotation,
+		// then update status — all in one pass.
 		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("refreshing cluster before status update: %w", err)
 		}
-		ensureAnnotations(cluster)[annotationWorkerJoined] = "true"
+		anns := ensureAnnotations(cluster)
+		anns[annotationWorkerJoined] = "true"
+		anns[annotationLastCompletedPhaseWorker] = "-1" // clear so a future reprovision starts fresh
 		if err := r.Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, fmt.Errorf("marking worker as joined: %w", err)
 		}
@@ -486,9 +583,9 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
 		}
 		if cluster.Annotations[annotationNvidiaInstalled] != "true" {
-			if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster, clusterParent); err != nil {
-				return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
-			}
+			// if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster, clusterParent); err != nil {
+			// 	return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
+			// }
 
 			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
 				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking NVIDIA installed: %w", err)
@@ -516,7 +613,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 				defer rebootClient.Conn.Close()
 				// Error is ignored: the connection resets when the node starts
 				// rebooting, which looks like a failure to ssh.Run.
-				_, _ = ssh.Run(rebootClient, "sudo reboot")
+				// _, _ = ssh.Run(rebootClient, "sudo reboot")
 			}()
 			return ctrl.Result{RequeueAfter: postRebootWait}, nil
 		}
@@ -667,10 +764,22 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 			// see no running job and restart unnecessarily.  Only the consumer
 			// (the poll branch below) deletes the entry.
 
-			// When no explicit credentials are configured, clear any stale registry
-			// auth files that may exist on the node (e.g. from a previous docker login
-			// or a cloud image that ships with credentials baked in).
-			if credsCopy == "" {
+			// Configure registry credentials if provided
+			if credsCopy != "" {
+				// Write Docker auth config for crictl to use
+				parts := strings.Split(credsCopy, ":")
+				if len(parts) == 2 {
+					username, password := parts[0], parts[1]
+					// Create auth.json in proper format for crictl
+					authJSON := fmt.Sprintf(`{"auths":{"docker.io":{"username":"%s","password":"%s"}}}`,
+						strings.ReplaceAll(username, "\"", "\\\""),
+						strings.ReplaceAll(password, "\"", "\\\""))
+					cmd := fmt.Sprintf("echo '%s' | sudo tee /etc/containers/auth.json > /dev/null && sudo chmod 0600 /etc/containers/auth.json",
+						strings.ReplaceAll(authJSON, "'", "'\\''"))
+					_, _ = ssh.Run(sshClient, cmd)
+				}
+			} else {
+				// Clear stale registry auth files when no credentials configured
 				authFiles := []string{
 					"/root/.docker/config.json",
 					"/run/containers/0/auth.json",
@@ -682,20 +791,26 @@ func (r *RemoteClusterReconciler) reconcileImagePrepull(
 				glog.Info("Cleared stale registry auth files before anonymous pull")
 			}
 
+			// Wait for CRI-O socket to be ready before pulling — the socket may not
+			// exist yet if CRI-O just started after a binary swap or storage wipe.
+			waitCmd := `for i in $(seq 1 60); do [ -S /var/run/crio/crio.sock ] && break; echo "waiting for crio socket ($i/60)..."; sleep 3; done; [ -S /var/run/crio/crio.sock ] || { sudo systemctl start crio; sleep 5; }`
+			if out, err := ssh.Run(sshClient, waitCmd); err != nil {
+				ch <- prepullJobResult{err: fmt.Errorf("waiting for CRI-O socket: %w\nOutput:\n%s", err, out)}
+				return
+			}
+
 			for _, img := range imagesCopy {
 				img = strings.TrimSpace(img)
 				if img == "" {
 					continue
 				}
 				glog.Info("Pulling image", "image", img)
-				var cmd string
-				if credsCopy != "" {
-					// Wrap with timeout so a stalled pull (e.g. dead TCP without
-					// keepalive) doesn't block the goroutine indefinitely.
-					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull --creds %s %s", credsCopy, img)
-				} else {
-					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull %s", img)
-				}
+				// Use full path to crictl since sudo may not have the same PATH.
+				// Try /usr/local/bin first (from fallback install), then /usr/bin.
+				crictl := `CRICTL=$(command -v crictl 2>/dev/null || echo /usr/local/bin/crictl); [ -x "$CRICTL" ] || CRICTL=/usr/bin/crictl; sudo timeout 7200 "$CRICTL"`
+				// Credentials are configured via /etc/containers/auth.json if needed
+				// crictl will automatically use it for authentication
+				cmd := fmt.Sprintf("%s pull %s", crictl, img)
 				output, pullErr := ssh.Run(sshClient, cmd)
 				if pullErr != nil {
 					ch <- prepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
@@ -1030,6 +1145,100 @@ func (r *RemoteClusterReconciler) fail(
 	logf.FromContext(ctx).Error(err, "RemoteCluster failed", "cluster", cluster.Name, "reason", reason)
 	_ = r.setStatus(ctx, cluster, phaseFailed, reason, err.Error(), true)
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
+}
+
+// completeControlPlane runs the post-kubeadm steps: createClusterRepo, status update,
+// and NodeProvisionNetConfig.  It is called both when the goroutine first completes and
+// when the controller restarts after those steps previously failed (detected via
+// annotationCPInitComplete == "true").
+func (r *RemoteClusterReconciler) completeControlPlane(
+	ctx context.Context,
+	cluster *infrav1.RemoteCluster,
+	joinCommand string,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx).WithValues("cluster", cluster.Name)
+
+	sshClient, err := r.getSSHClient(ctx, cluster)
+	if err != nil {
+		return r.fail(ctx, cluster, "SSHConnectionFailed",
+			fmt.Errorf("post-init SSH connection to %s: %w", cluster.Spec.Host, err))
+	}
+	defer sshClient.Conn.Close()
+
+	if err := r.createClusterRepo(ctx, cluster); err != nil {
+		return r.fail(ctx, cluster, "ClusterRepoFailed",
+			fmt.Errorf("creating cluster repo: %w", err))
+	}
+
+	// Run NodeProvisionNetConfig BEFORE flipping phase to Ready so that if it
+	// fails, r.fail() can still override the phase (no stale-resourceVersion race).
+	if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, cluster, sshClient, cluster.Spec.VPNConfig.IP, "create"); err != nil {
+		return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed",
+			fmt.Errorf("creating NodeProvisionNetConfig: %w", err))
+	}
+	if patchErr := r.patchAnnotation(ctx, cluster, annotationNodeProvisionCreated, "true"); patchErr != nil {
+		log.Error(patchErr, "Failed to stamp node-provision-created annotation")
+	}
+
+	// All side-effects done — now flip to Ready and persist the join command.
+	// Refresh to avoid resource-version conflicts before the status write.
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("refreshing cluster before status update: %w", err)
+	}
+	cluster.Status.JoinCommand = joinCommand
+	if err := r.setStatus(ctx, cluster, phaseReady, "Provisioned", "Cluster provisioned successfully", false); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating status to Ready: %w", err)
+	}
+
+	// All post-init steps succeeded — clear the init-complete flag so that
+	// a future full reprovision is not confused into thinking init is done.
+	if patchErr := r.patchAnnotations(ctx, cluster, map[string]string{
+		annotationCPInitComplete: "",
+		annotationJoinCmdCache:   "",
+	}); patchErr != nil {
+		log.Error(patchErr, "Failed to clear cp-init-complete annotation")
+	}
+
+	log.Info("Control plane provisioned; waiting for cluster repo before creating PackageVariants",
+		"requeueAfter", repoReadyWait)
+	return ctrl.Result{RequeueAfter: repoReadyWait}, nil
+}
+
+// patchAnnotation sets a single annotation on the cluster object using a merge patch.
+// It re-fetches the latest resource version before patching to avoid conflicts.
+func (r *RemoteClusterReconciler) patchAnnotation(ctx context.Context, cluster *infrav1.RemoteCluster, key, value string) error {
+	// Re-fetch so we have the current resourceVersion before patching.
+	fresh := &infrav1.RemoteCluster{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), fresh); err != nil {
+		return fmt.Errorf("re-fetching cluster for annotation patch: %w", err)
+	}
+	patch := client.MergeFrom(fresh.DeepCopy())
+	if fresh.Annotations == nil {
+		fresh.SetAnnotations(map[string]string{})
+	}
+	fresh.Annotations[key] = value
+	return r.Patch(ctx, fresh, patch)
+}
+
+// patchAnnotations sets multiple annotations in a single merge patch, re-fetching
+// the latest resource version first.  An empty value removes the annotation key.
+func (r *RemoteClusterReconciler) patchAnnotations(ctx context.Context, cluster *infrav1.RemoteCluster, kv map[string]string) error {
+	fresh := &infrav1.RemoteCluster{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), fresh); err != nil {
+		return fmt.Errorf("re-fetching cluster for annotation patch: %w", err)
+	}
+	patch := client.MergeFrom(fresh.DeepCopy())
+	if fresh.Annotations == nil {
+		fresh.SetAnnotations(map[string]string{})
+	}
+	for k, v := range kv {
+		if v == "" {
+			delete(fresh.Annotations, k)
+		} else {
+			fresh.Annotations[k] = v
+		}
+	}
+	return r.Patch(ctx, fresh, patch)
 }
 
 // ensureFinalizer adds the finalizer if absent; returns true when it was added (caller must Update).
@@ -1384,22 +1593,22 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		// 		"approval.nephio.org/policy": "initial",
 		// 	},
 		// },
+		// {
+		// 	name: "longhorn-storage-provisioner-variant",
+		// 	upstream: packageRef{
+		// 		pkg:      "longhorn-storage-provisioner",
+		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+		// 		revision: cluster.Spec.GitConfig.PackageRevision,
+		// 	},
+		// 	downstream: packageRef{
+		// 		pkg:  "longhorn-storage-provisioner",
+		// 		repo: cluster.Spec.ClusterName,
+		// 	},
+		// 	annotations: map[string]interface{}{
+		// 		"approval.nephio.org/policy": "initial",
+		// 	},
+		// },
 
-		{
-			name: "keycloak-variant",
-			upstream: packageRef{
-				pkg:      "keycloak",
-				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-				revision: cluster.Spec.GitConfig.PackageRevision,
-			},
-			downstream: packageRef{
-				pkg:  "keycloak",
-				repo: cluster.Spec.ClusterName,
-			},
-			annotations: map[string]interface{}{
-				"approval.nephio.org/policy": "initial",
-			},
-		},
 		{
 			name: "nfs-provisioner-variant",
 			upstream: packageRef{
@@ -1428,6 +1637,23 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				"approval.nephio.org/policy": "initial",
 			},
 		},
+
+		{
+			name: "keycloak-variant",
+			upstream: packageRef{
+				pkg:      "keycloak",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "keycloak",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
+
 		{
 			name: "hami-variant",
 			upstream: packageRef{
@@ -1484,6 +1710,22 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 			},
 			downstream: packageRef{
 				pkg:  "jupyter-hub",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
+
+		{
+			name: "gpu-operator-variant",
+			upstream: packageRef{
+				pkg:      "gpu-operator",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "gpu-operator",
 				repo: cluster.Spec.ClusterName,
 			},
 			annotations: map[string]interface{}{

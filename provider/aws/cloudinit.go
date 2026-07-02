@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+
+	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 )
 
 // CloudInitParams holds all values needed to render the bootstrap user-data script.
@@ -82,6 +84,17 @@ report() {
 
 report "Bootstrap started"
 
+# ── Clean up previous provisioning state ──────────────────────────────────────
+# Remove any leftover CRI-O and kubelet state to avoid image cache corruption
+report "Cleaning up previous provisioning state"
+systemctl stop kubelet crio 2>/dev/null || true
+umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+umount -l /var/lib/crio 2>/dev/null || true
+rm -rf /var/lib/crio /run/crio /var/lib/containers/storage /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true
+
+# Store Kubernetes version for crictl installation
+K8S_VERSION=v%s
+
 # ── Idempotency guard ────────────────────────────────────────────────────────
 if [ -f /var/lib/node-bootstrap-complete ]; then
   report "Bootstrap already completed, skipping"
@@ -116,7 +129,20 @@ report "Running apt-get update"
 $APT update
 
 report "Installing base packages"
-$APT install -y ca-certificates curl gnupg apt-transport-https lsof
+$APT install -y ca-certificates curl gnupg apt-transport-https lsof cri-tools
+
+# Ensure crictl is in PATH for controller image pre-pull
+# CRI-tools releases use minor version (e.g., v1.34, not v1.34.2)
+if ! command -v crictl >/dev/null 2>&1; then
+  report "Installing crictl from GitHub"
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$K8S_VERSION/crictl-${K8S_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz 2>/dev/null || \
+  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz -o /tmp/crictl.tar.gz
+  sudo tar xzf /tmp/crictl.tar.gz -C /usr/local/bin/ crictl
+  sudo chmod 0755 /usr/local/bin/crictl
+  rm -f /tmp/crictl.tar.gz
+  sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl
+fi
+crictl --version 2>/dev/null || { report "ERROR: crictl not found"; exit 1; }
 
 report "Installing WireGuard"
 $APT install -y wireguard wireguard-tools iputils-ping
@@ -172,19 +198,102 @@ report "VPN tunnel established"
 # ── CRI-O ────────────────────────────────────────────────────────────────────
 report "Installing CRI-O"
 if ! which crio > /dev/null 2>&1; then
-  mkdir -p /etc/apt/keyrings
   rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg
   curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
-    | gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
-https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
+    | gpg --dearmor | tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null
+  echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
     > /etc/apt/sources.list.d/cri-o.list
   $APT update
-  $APT install -y cri-o
+  $APT install -y jq criu crun conmon cri-o
+  CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null)
+  { [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17
+  curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \
+    -o /usr/local/bin/crun
+  chmod 0755 /usr/local/bin/crun
+  cp -f /usr/local/bin/crun /usr/bin/crun
+  crun --version
+  mkdir -p /etc/crio/crio.conf.d
+  printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
+    > /etc/crio/crio.conf.d/10-crun.conf
+  systemctl enable crio --now || { journalctl -xeu crio.service --no-pager >&2; false; }
 fi
-systemctl enable crio --now
-systemctl restart crio
+
+# Ensure criu runtime dependencies are installed (libnl, libcap, libbsd, libgnutls)
+$APT install -y libcap2 libnl-3-200 libbsd0 libgnutls30
+
+# Swap in custom criu (device-restore-with-hook), idempotent on GitID
+WANT="%s"
+CRIU_BIN=$(command -v criu || echo /usr/sbin/criu)
+HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}')
+if [ "$HAVE" = "$WANT" ]; then
+  echo "custom criu $WANT already at $CRIU_BIN, skipping"
+else
+  curl -fsSL %s -o /tmp/criu
+  chmod 0755 /tmp/criu
+  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}')
+  [ "$GOT" = "$WANT" ] && \
+  install -m 0755 /tmp/criu "$CRIU_BIN" && \
+  rm -f /tmp/criu && \
+  echo "installed custom criu $WANT at $CRIU_BIN"
+fi
+criu --version || true
+# Grant CAP_CHECKPOINT_RESTORE capability so criu can run
+sudo setcap cap_checkpoint_restore+eip /usr/sbin/criu || true
+criu check 2>&1 | head -1 || true
+
+# Install latest runc, idempotent on version
+WANT="%s"
+RUNC_BIN=$(command -v runc || echo /usr/local/sbin/runc)
+HAVE=$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}')
+if [ "$HAVE" = "$WANT" ]; then
+  echo "runc $WANT already installed at $RUNC_BIN, skipping"
+else
+  curl -fsSL https://github.com/opencontainers/runc/releases/download/$WANT/runc.amd64 -o /tmp/runc
+  curl -fsSL https://github.com/opencontainers/runc/releases/download/$WANT/runc.sha256sum -o /tmp/runc.sha256sum
+  WSHA=$(awk '/ runc\.amd64$/{print $1}' /tmp/runc.sha256sum)
+  GSHA=$(sha256sum /tmp/runc | awk '{print $1}')
+  [ -n "$WSHA" ] && [ "$WSHA" = "$GSHA" ] && \
+  install -m 0755 /tmp/runc "$RUNC_BIN" && \
+  rm -f /tmp/runc /tmp/runc.sha256sum && \
+  echo "installed runc $WANT at $RUNC_BIN"
+fi
+runc --version || true
+
+WANT=%s
+HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit)
+if [ "$HAVE" != "$WANT" ]; then
+  curl -fsSL %s -o /tmp/crio
+  chmod 0755 /tmp/crio
+  GOT=$(/tmp/crio version --json | jq -r .gitCommit)
+  if [ "$GOT" = "$WANT" ]; then
+    systemctl stop crio
+    install -m 0755 /tmp/crio /usr/bin/crio
+    systemctl daemon-reload
+    systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
+    rm -f /tmp/crio
+  fi
+fi
+
+# Wipe ALL storage after binary swap — custom binary uses go.podman.io/storage,
+# packaged binary uses github.com/containers/storage; old metadata is unreadable.
+report "Rebuilding CRI-O image metadata cache"
+systemctl stop crio
+umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
+systemctl daemon-reload
+systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
+sleep 3
+
+test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
+  install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
+  /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
+  echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"
+systemctl enable crio --now || { journalctl -xeu crio.service --no-pager >&2; false; }
+systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
 report "CRI-O installed"
+
+# Fix storage directory permissions (CRI-O may create with restrictive permissions)
+sudo chmod 0711 /var/lib/crio /var/lib/containers/storage 2>/dev/null || true
 
 # ── Kubernetes packages ──────────────────────────────────────────────────────
 report "Installing Kubernetes packages"
@@ -209,9 +318,48 @@ systemctl daemon-reload
 systemctl restart kubelet
 
 # ── Join cluster ─────────────────────────────────────────────────────────────
+# Always restart CRI-O here to pick up any config changes made above
+# (e.g. new crun path). A passive "is-active || start" misses the case where
+# CRI-O is active but using stale config from a previous failed provisioning run.
+report "Restarting CRI-O and waiting for socket readiness"
+systemctl daemon-reload
+systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
+
+# Wait for CRI-O socket to be ready (up to 60s)
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if test -S /var/run/crio/crio.sock; then
+    report "CRI-O socket ready"
+    break
+  fi
+  echo "Waiting for CRI-O socket ($i/20)..."
+  sleep 3
+done
+test -S /var/run/crio/crio.sock || { journalctl -xeu crio.service --no-pager -n 100 >&2; false; }
+
+# CRI-O recovery: when swapping binaries (especially custom CRI-O), the image cache
+# can become inconsistent, causing containers to fail with "image not found" errors.
+# Force a clean reset: stop services, unmount overlay storage, clear cache, restart.
+report "Checking CRI-O image cache consistency"
+if ! systemctl is-active crio >/dev/null 2>&1 || ! test -S /var/run/crio/crio.sock; then
+  report "CRI-O not responding, force-resetting image cache"
+  systemctl stop kubelet crio 2>/dev/null || true
+  umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+  umount -l /var/lib/crio 2>/dev/null || true
+  rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
+  systemctl restart crio
+  sleep 5
+  for i in 1 2 3 4 5; do
+    test -S /var/run/crio/crio.sock && break
+    sleep 3
+  done
+  systemctl restart kubelet
+  sleep 10
+fi
+
 report "Joining cluster"
 for attempt in 1 2 3 4 5; do
-  if %s; then
+  # Append --cri-socket to use CRI-O instead of defaulting to containerd
+  if %s --cri-socket=unix:///var/run/crio/crio.sock; then
     report "Cluster join succeeded"
     break
   fi
@@ -226,7 +374,12 @@ done
 touch /var/lib/node-bootstrap-complete
 report "Bootstrap complete"
 `, nopasswdBlock,
-		wgConf, p.CRIOVersion, p.CRIOVersion,
+		p.KubernetesVersion,
+		wgConf,
+		p.CRIOVersion, p.CRIOVersion,
+		kubeadm.CriuGitID, kubeadm.CriuAsset,
+		kubeadm.RuncVersion,
+		kubeadm.CrioCommit, kubeadm.CrioAsset,
 		p.KubernetesMinorVersion, p.KubernetesMinorVersion,
 		p.KubernetesVersion, p.KubernetesVersion, p.KubernetesVersion,
 		p.VpnIP,
