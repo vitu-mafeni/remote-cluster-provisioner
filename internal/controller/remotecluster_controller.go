@@ -89,6 +89,17 @@ const (
 	remoteClusterFinalizer = "infra.dcn.ssu.ac.kr/remotecluster-finalizer"
 	remoteClusterLabelKey  = "infra.dcn.ssu.ac.kr/remotecluster"
 
+	// authSecretFinalizer is placed on the SSH credential secret referenced by
+	// spec.auth so that it cannot be deleted while the RemoteCluster exists.
+	// It is removed at the end of handleDelete, after all SSH cleanup is done.
+	authSecretFinalizer = "infra.dcn.ssu.ac.kr/remotecluster-ssh-auth"
+
+	// vpnSecretFinalizer is placed on the VPN SSH credential secret referenced by
+	// spec.vpnConfig.vpnSSHCredentialsRef so that it cannot be deleted while the
+	// RemoteCluster exists.  It is removed at the end of handleDelete, after the
+	// VPN peer removal step has completed.
+	vpnSecretFinalizer = "infra.dcn.ssu.ac.kr/remotecluster-vpn-ssh-auth"
+
 	// annotationPkgVariantsCreated marks that PackageVariants have been successfully
 	// created for this control-plane cluster, so they are not re-created on every reconcile.
 	annotationPkgVariantsCreated = "infra.dcn.ssu.ac.kr/package-variants-created"
@@ -125,6 +136,13 @@ const (
 	phaseProvisioning = "Provisioning"
 	phaseReady        = "Ready"
 	phaseFailed       = "Failed"
+
+	// controllerAuthSuffix is appended to the RemoteCluster name to form the
+	// controller-owned copy of the SSH credential secret.  An owner reference
+	// ties it to the CR so it is GC'd automatically after the finalizer is
+	// removed.  During deletion the controller falls back to this copy when
+	// the user-managed secret has already been deleted.
+	controllerAuthSuffix = "-controller-auth"
 
 	// repoReadyWait is the time to wait after creating the cluster repo before
 	// creating PackageVariants, giving Porch time to sync the new repository.
@@ -192,6 +210,28 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// so without an explicit requeue the controller would never reach
 		// reconcileProvisioning after a brand-new resource is created.
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Protect the SSH credential secret with a finalizer so it cannot be
+	// deleted while this RemoteCluster exists.  Also keep a controller-owned
+	// copy as a second layer of defence (e.g. in case the finalizer was
+	// somehow bypassed on an existing cluster).
+	if authSecret, err := r.getAuthSecret(ctx, cluster); err == nil {
+		if err := r.ensureAuthSecretFinalizer(ctx, cluster, authSecret); err != nil {
+			log.Error(err, "adding finalizer to SSH credential secret (non-fatal)")
+		}
+		if err := r.ensureControllerAuthSecret(ctx, cluster, authSecret); err != nil {
+			log.Error(err, "persisting SSH credential copy (non-fatal)")
+		}
+	}
+
+	// Protect the VPN SSH credential secret the same way.
+	if cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
+		if vpnSecret, err := r.getVPNSecret(ctx, cluster); err == nil {
+			if err := r.ensureVPNSecretFinalizer(ctx, cluster, vpnSecret); err != nil {
+				log.Error(err, "adding finalizer to VPN SSH credential secret (non-fatal)")
+			}
+		}
 	}
 
 	switch cluster.Status.Phase {
@@ -1274,6 +1314,184 @@ func (r *RemoteClusterReconciler) findControlPlane(ctx context.Context, cluster 
 	return nil, nil
 }
 
+// ensureAuthSecretFinalizer adds authSecretFinalizer to the referenced SSH
+// credential secret.  This prevents the secret from being deleted while the
+// RemoteCluster exists, ensuring the controller can always SSH to the node
+// during deletion cleanup.
+func (r *RemoteClusterReconciler) ensureAuthSecretFinalizer(ctx context.Context, cluster *infrav1.RemoteCluster, secret *corev1.Secret) error {
+	if controllerutil.ContainsFinalizer(secret, authSecretFinalizer) {
+		return nil
+	}
+	patch := client.MergeFrom(secret.DeepCopy())
+	controllerutil.AddFinalizer(secret, authSecretFinalizer)
+	return r.Patch(ctx, secret, patch)
+}
+
+// removeAuthSecretFinalizer removes authSecretFinalizer from the SSH credential
+// secret.  Called at the end of handleDelete after all SSH work is complete.
+func (r *RemoteClusterReconciler) removeAuthSecretFinalizer(ctx context.Context, cluster *infrav1.RemoteCluster) {
+	log := logf.FromContext(ctx)
+
+	// Try user-managed secret first; fall back to controller copy.
+	secret, err := r.getAuthSecret(ctx, cluster)
+	if err != nil {
+		secret2, err2 := r.getControllerAuthSecret(ctx, cluster)
+		if err2 != nil {
+			log.Info("Auth secret already gone — nothing to unfinalise")
+			return
+		}
+		secret = secret2
+	}
+
+	if !controllerutil.ContainsFinalizer(secret, authSecretFinalizer) {
+		return
+	}
+	patch := client.MergeFrom(secret.DeepCopy())
+	controllerutil.RemoveFinalizer(secret, authSecretFinalizer)
+	if err := r.Patch(ctx, secret, patch); err != nil {
+		log.Error(err, "removing auth-secret finalizer", "secret", secret.Name)
+	}
+}
+
+// getVPNSecret fetches the VPN SSH credential secret referenced by
+// spec.vpnConfig.vpnSSHCredentialsRef.
+func (r *RemoteClusterReconciler) getVPNSecret(ctx context.Context, cluster *infrav1.RemoteCluster) (*corev1.Secret, error) {
+	ref := cluster.Spec.VPNConfig.VPNSSHCredentialsRef
+	if ref.Name == "" {
+		return nil, fmt.Errorf("no VPN SSH credentials configured in spec.vpnConfig.vpnSSHCredentialsRef")
+	}
+	ns := ref.NameSpace
+	if ns == "" {
+		ns = cluster.Namespace
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ns}, secret); err != nil {
+		return nil, err
+	}
+	return secret, nil
+}
+
+// ensureVPNSecretFinalizer adds vpnSecretFinalizer to the VPN SSH credential
+// secret so it cannot be deleted while the RemoteCluster exists.
+func (r *RemoteClusterReconciler) ensureVPNSecretFinalizer(ctx context.Context, cluster *infrav1.RemoteCluster, secret *corev1.Secret) error {
+	if controllerutil.ContainsFinalizer(secret, vpnSecretFinalizer) {
+		return nil
+	}
+	patch := client.MergeFrom(secret.DeepCopy())
+	controllerutil.AddFinalizer(secret, vpnSecretFinalizer)
+	return r.Patch(ctx, secret, patch)
+}
+
+// removeVPNSecretFinalizer removes vpnSecretFinalizer from the VPN SSH credential
+// secret.  Called at the end of handleDelete after the VPN peer removal step.
+func (r *RemoteClusterReconciler) removeVPNSecretFinalizer(ctx context.Context, cluster *infrav1.RemoteCluster) {
+	log := logf.FromContext(ctx)
+
+	if cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" {
+		return
+	}
+
+	secret, err := r.getVPNSecret(ctx, cluster)
+	if err != nil {
+		log.Info("VPN SSH secret already gone — nothing to unfinalise",
+			"secret", cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name)
+		return
+	}
+
+	if !controllerutil.ContainsFinalizer(secret, vpnSecretFinalizer) {
+		return
+	}
+	patch := client.MergeFrom(secret.DeepCopy())
+	controllerutil.RemoveFinalizer(secret, vpnSecretFinalizer)
+	if err := r.Patch(ctx, secret, patch); err != nil {
+		log.Error(err, "removing vpn-secret finalizer", "secret", secret.Name)
+	}
+}
+
+// getAuthSecret fetches the user-managed SSH credential secret for the cluster.
+func (r *RemoteClusterReconciler) getAuthSecret(ctx context.Context, cluster *infrav1.RemoteCluster) (*corev1.Secret, error) {
+	var name string
+	if cluster.Spec.Auth.SSHPrivateKeySecretRef != nil {
+		name = cluster.Spec.Auth.SSHPrivateKeySecretRef.Name
+	} else if cluster.Spec.Auth.PasswordSecretRef != nil {
+		name = cluster.Spec.Auth.PasswordSecretRef.Name
+	} else {
+		return nil, fmt.Errorf("no SSH auth credentials configured in spec.auth")
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, secret); err != nil {
+		return nil, err
+	}
+	return secret, nil
+}
+
+// getControllerAuthSecret retrieves the controller-owned copy of the SSH
+// credential secret (name = <cluster.Name> + controllerAuthSuffix).
+func (r *RemoteClusterReconciler) getControllerAuthSecret(ctx context.Context, cluster *infrav1.RemoteCluster) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      cluster.Name + controllerAuthSuffix,
+		Namespace: cluster.Namespace,
+	}, secret); err != nil {
+		return nil, err
+	}
+	return secret, nil
+}
+
+// ensureControllerAuthSecret creates or updates a controller-owned copy of the
+// user SSH credential secret.  An owner reference on the RemoteCluster CR
+// ensures the copy is GC'd automatically once the CR's finalizer is removed,
+// so it is never orphaned.
+func (r *RemoteClusterReconciler) ensureControllerAuthSecret(ctx context.Context, cluster *infrav1.RemoteCluster, userSecret *corev1.Secret) error {
+	copyName := cluster.Name + controllerAuthSuffix
+
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: copyName, Namespace: cluster.Namespace}, existing)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("getting controller auth secret: %w", err)
+	}
+
+	desired := &corev1.Secret{}
+	desired.Name = copyName
+	desired.Namespace = cluster.Namespace
+	desired.Type = userSecret.Type
+	desired.Data = userSecret.Data
+
+	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference on controller auth secret: %w", err)
+	}
+
+	if apierrors.IsNotFound(err) {
+		if createErr := r.Create(ctx, desired); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
+			return fmt.Errorf("creating controller auth secret: %w", createErr)
+		}
+		return nil
+	}
+
+	// Update only when the data has changed.
+	if !secretDataEqual(existing.Data, userSecret.Data) {
+		existing.Data = userSecret.Data
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("updating controller auth secret: %w", err)
+		}
+	}
+	return nil
+}
+
+// secretDataEqual returns true when two secret data maps have identical keys and values.
+func secretDataEqual(a, b map[string][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok || string(va) != string(vb) {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *infrav1.RemoteCluster) (*ssh.Client, error) {
 	var secretRef *infrav1.SecretKeyReference
 	if cluster.Spec.Auth.SSHPrivateKeySecretRef != nil {
@@ -1289,12 +1507,30 @@ func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *inf
 		Name:      secretRef.Name,
 		Namespace: cluster.Namespace,
 	}, secret); err != nil {
-		return nil, fmt.Errorf("fetching SSH credential secret %q: %w", secretRef.Name, err)
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("fetching SSH credential secret %q: %w", secretRef.Name, err)
+		}
+		// User-managed secret is gone — fall back to the controller-owned copy.
+		ctrlSecret, ctrlErr := r.getControllerAuthSecret(ctx, cluster)
+		if ctrlErr != nil {
+			return nil, fmt.Errorf("fetching SSH credential secret %q (and controller copy %q): %w",
+				secretRef.Name, cluster.Name+controllerAuthSuffix, err)
+		}
+		logf.FromContext(ctx).Info("User SSH secret not found, falling back to controller copy",
+			"userSecret", secretRef.Name)
+		secret = ctrlSecret
 	}
 
 	credentialBytes, ok := secret.Data[secretRef.Key]
 	if !ok {
-		return nil, fmt.Errorf("key %q not found in secret %q", secretRef.Key, secretRef.Name)
+		// Key may be empty for secrets with a single entry; pick the only value.
+		if secretRef.Key == "" && len(secret.Data) == 1 {
+			for _, v := range secret.Data {
+				credentialBytes = v
+			}
+		} else {
+			return nil, fmt.Errorf("key %q not found in secret %q", secretRef.Key, secretRef.Name)
+		}
 	}
 
 	var host string
@@ -1491,26 +1727,295 @@ func (r *RemoteClusterReconciler) ensureNephioToken(
 
 func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *infrav1.RemoteCluster) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	log.Info("Cleaning up resources for RemoteCluster", "remotecluster", cluster.Name)
+	log.Info("Deprovisioning RemoteCluster", "name", cluster.Name, "nodeType", cluster.Spec.NodeInfo.NodeType)
 
-	if err := r.deleteClusterResources(ctx, cluster); err != nil {
-		return ctrl.Result{}, err
+	if !controllerutil.ContainsFinalizer(cluster, remoteClusterFinalizer) {
+		return ctrl.Result{}, nil
 	}
 
+	// Step 1: If worker, drain and remove the node from the Kubernetes cluster
+	// before wiping it so workloads migrate away gracefully.
+	if cluster.Spec.NodeInfo.NodeType == "worker" {
+		r.drainWorkerFromCP(ctx, cluster)
+	}
+
+	// Step 2: SSH to the node — kubeadm reset, purge packages, remove configs,
+	// bring down WireGuard.  Best-effort: if the node is already unreachable
+	// we still proceed so the finalizer can be removed.
+	if err := r.resetNodeViaSSH(ctx, cluster); err != nil {
+		log.Error(err, "node SSH reset incomplete (continuing with cleanup)")
+	}
+
+	// Step 3: Remove the WireGuard peer from the VPN server.
+	if cluster.Spec.VPNConfig.IP != "" && cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
+		if err := r.removeVPNPeer(ctx, cluster); err != nil {
+			log.Error(err, "VPN peer removal incomplete (continuing)")
+		}
+	}
+
+	// Step 4: Delete management-cluster resources (Porch repo, Nephio tokens,
+	// PackageVariants).  Errors are logged but do not block finalizer removal.
+	if err := r.deleteClusterResources(ctx, cluster); err != nil {
+		log.Error(err, "deleting management-cluster resources (continuing)")
+	}
+
+	// Step 5: Release the auth and VPN SSH secrets (remove our finalizers) so
+	// that any pending deletions of user-managed secrets can now proceed.
+	// This runs after all SSH work is done so both secrets are available throughout.
+	r.removeAuthSecretFinalizer(ctx, cluster)
+	r.removeVPNSecretFinalizer(ctx, cluster)
+
+	// Step 6: Remove the RemoteCluster finalizer — lets the API server GC the CR.
 	controllerutil.RemoveFinalizer(cluster, remoteClusterFinalizer)
 	if err := r.Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
 	}
-
-	// TODO: implement SSH-based kubeadm reset using cluster credentials.
-	uninstallK8sRemoteCluster(ctx, cluster)
-
+	log.Info("RemoteCluster cleanup complete", "name", cluster.Name)
 	return ctrl.Result{}, nil
 }
 
-// uninstallK8sRemoteCluster is a stub for running `kubeadm reset` on the remote node via SSH.
-func uninstallK8sRemoteCluster(ctx context.Context, cluster *infrav1.RemoteCluster) {
-	logf.FromContext(ctx).Info("Uninstalling Kubernetes on remote cluster via SSH", "host", cluster.Spec.Host)
+// drainWorkerFromCP gracefully evicts workloads from the worker node by running
+// kubectl drain + kubectl delete node on the control-plane.  Best-effort.
+func (r *RemoteClusterReconciler) drainWorkerFromCP(ctx context.Context, cluster *infrav1.RemoteCluster) {
+	log := logf.FromContext(ctx)
+
+	// Determine the Kubernetes node name: try the actual OS hostname via SSH,
+	// fall back to the cluster name which is typically the provisioned hostname.
+	nodeName := cluster.Spec.ClusterName
+	if nodeClient, err := r.getSSHClient(ctx, cluster); err == nil {
+		if out, err := sshhelper.Run(nodeClient, "hostname"); err == nil {
+			if h := strings.TrimSpace(out); h != "" {
+				nodeName = h
+			}
+		}
+		nodeClient.Conn.Close()
+	}
+
+	cp, err := r.findControlPlane(ctx, cluster)
+	if err != nil || cp == nil {
+		log.Info("Control-plane not found — skipping kubectl drain", "fallbackNodeName", nodeName)
+		return
+	}
+	cpClient, err := r.getSSHClient(ctx, cp)
+	if err != nil {
+		log.Error(err, "Cannot SSH to control-plane for drain (continuing without drain)")
+		return
+	}
+	defer cpClient.Conn.Close()
+
+	log.Info("Draining worker from control-plane", "nodeName", nodeName)
+	drainCmd := fmt.Sprintf(
+		"kubectl drain %s --ignore-daemonsets --delete-emptydir-data --force --timeout=120s 2>/dev/null || true",
+		nodeName,
+	)
+	if out, err := sshhelper.Run(cpClient, drainCmd); err != nil {
+		log.Error(err, "kubectl drain encountered errors", "output", out)
+	}
+	deleteCmd := fmt.Sprintf("kubectl delete node %s --ignore-not-found 2>/dev/null || true", nodeName)
+	if out, err := sshhelper.Run(cpClient, deleteCmd); err != nil {
+		log.Error(err, "kubectl delete node encountered errors", "output", out)
+	}
+}
+
+// resetNodeViaSSH SSHes to the node and runs kubeadm reset, purges all
+// installed packages (k8s, cri-o, criu, wireguard), removes config files and
+// custom binaries, and brings the WireGuard tunnel down.
+func (r *RemoteClusterReconciler) resetNodeViaSSH(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	log := logf.FromContext(ctx)
+
+	sshClient, err := r.getSSHClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("SSH connect for node reset: %w", err)
+	}
+	defer sshClient.Conn.Close()
+
+	log.Info("Resetting node via SSH", "host", cluster.Spec.Host)
+
+	const resetScript = `
+# kubeadm reset cleans up apiserver/etcd/kubelet state, CNI config, and iptables rules.
+if command -v kubeadm >/dev/null 2>&1; then
+  sudo kubeadm reset --force 2>/dev/null || true
+fi
+
+# Stop and disable services before purging packages.
+sudo systemctl stop kubelet crio 2>/dev/null || true
+sudo systemctl disable kubelet crio 2>/dev/null || true
+
+# Unmount any lingering container overlay mounts.
+sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+
+# Purge Kubernetes packages.
+sudo apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
+sudo apt-get purge -y kubelet kubeadm kubectl 2>/dev/null || true
+
+# Purge CRI-O and related container runtime packages.
+sudo apt-get purge -y cri-o criu crun conmon 2>/dev/null || true
+
+# Remove Kubernetes state directories.
+sudo rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd 2>/dev/null || true
+
+# Remove CRI-O runtime state and the entire config tree (includes
+# 999-runc.conf, 10-crun.conf, crio.conf, and any leftover dpkg conffiles).
+sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
+sudo rm -rf /etc/crio 2>/dev/null || true
+
+# Remove CRIU config directory (runc.conf and anything else under /etc/criu).
+sudo rm -rf /etc/criu 2>/dev/null || true
+
+sudo rm -f  /etc/modules-load.d/k8s.conf /etc/sysctl.d/k8s.conf 2>/dev/null || true
+sudo rm -f  /etc/apt/sources.list.d/kubernetes.list /etc/apt/sources.list.d/cri-o.list 2>/dev/null || true
+sudo rm -f  /etc/apt/keyrings/kubernetes-apt-keyring.gpg /etc/apt/keyrings/cri-o-apt-keyring.gpg 2>/dev/null || true
+
+# Remove custom binaries installed during provisioning.
+sudo rm -f /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true
+sudo rm -f /usr/local/bin/crun   /usr/bin/crun   2>/dev/null || true
+sudo rm -f /usr/sbin/runc /usr/local/sbin/runc   2>/dev/null || true
+sudo rm -f /usr/sbin/criu                         2>/dev/null || true
+sudo rm -f /usr/bin/crio                          2>/dev/null || true
+sudo rm -f /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || true
+
+# Remove the bootstrap-complete marker so re-provisioning is not skipped.
+sudo rm -f /var/lib/node-bootstrap-complete 2>/dev/null || true
+
+sudo apt-get autoremove -y 2>/dev/null || true
+
+# WireGuard teardown runs in the background after a short delay so this SSH
+# session (which routes over the VPN IP) can exit cleanly first.
+# The controller removes the peer from the VPN server in the next step, which
+# permanently severs the tunnel from the server side.
+nohup sudo bash -c '
+  sleep 3
+  systemctl stop    wg-quick@wg0 2>/dev/null || true
+  wg-quick down wg0              2>/dev/null || true
+  systemctl disable wg-quick@wg0 2>/dev/null || true
+  rm -f /etc/wireguard/wg0.conf  2>/dev/null || true
+  apt-get purge -y wireguard wireguard-tools 2>/dev/null || true
+' >/dev/null 2>&1 &
+
+echo "node reset complete"
+`
+	out, err := sshhelper.Run(sshClient, resetScript)
+	if err != nil {
+		log.Error(err, "node reset script reported errors", "output", out)
+		return fmt.Errorf("node reset: %w", err)
+	}
+	log.Info("Node reset complete")
+	return nil
+}
+
+// removeVPNPeer SSHes to the WireGuard VPN server and removes the peer whose
+// AllowedIP matches cluster.Spec.VPNConfig.IP from both the running config and
+// the persisted wg0.conf.
+func (r *RemoteClusterReconciler) removeVPNPeer(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	log := logf.FromContext(ctx)
+
+	vpnIP := cluster.Spec.VPNConfig.IP
+	credRef := cluster.Spec.VPNConfig.VPNSSHCredentialsRef
+
+	vpnSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      credRef.Name,
+		Namespace: credRef.NameSpace,
+	}, vpnSecret); err != nil {
+		return fmt.Errorf("fetching VPN server SSH secret %q: %w", credRef.Name, err)
+	}
+
+	var credBytes []byte
+	if credRef.Key != "" {
+		var ok bool
+		credBytes, ok = vpnSecret.Data[credRef.Key]
+		if !ok {
+			return fmt.Errorf("key %q not found in secret %q", credRef.Key, credRef.Name)
+		}
+	} else {
+		if len(vpnSecret.Data) != 1 {
+			return fmt.Errorf("secret %q has %d keys; set vpnSshCredentialsRef.key to pick one", credRef.Name, len(vpnSecret.Data))
+		}
+		for _, v := range vpnSecret.Data {
+			credBytes = v
+		}
+	}
+
+	cred := strings.TrimSpace(string(credBytes))
+	vpnHost := cluster.Spec.VPNConfig.VPNServerPublicIP
+
+	var vpnClient *ssh.Client
+	var err error
+	if strings.HasPrefix(cred, "-----BEGIN") {
+		vpnClient, err = ssh.ConnectWithPrivateKey(vpnHost, 22, "ubuntu", cred)
+	} else {
+		vpnClient, err = ssh.Connect(vpnHost, 22, "ubuntu", cred)
+	}
+	if err != nil {
+		return fmt.Errorf("SSH to VPN server %s: %w", vpnHost, err)
+	}
+	defer vpnClient.Conn.Close()
+
+	// Discover the peer's public key from the live WireGuard state.
+	dumpOut, err := sshhelper.Run(vpnClient, "sudo wg show wg0 dump 2>/dev/null || true")
+	if err != nil {
+		return fmt.Errorf("reading WireGuard peer table: %w", err)
+	}
+
+	peerKey := ""
+	for i, line := range strings.Split(strings.TrimSpace(dumpOut), "\n") {
+		if i == 0 || line == "" {
+			continue // first line is the interface entry
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		for _, cidr := range strings.Split(fields[3], ",") {
+			ip := strings.SplitN(strings.TrimSpace(cidr), "/", 2)[0]
+			if ip == vpnIP {
+				peerKey = fields[0]
+				break
+			}
+		}
+		if peerKey != "" {
+			break
+		}
+	}
+
+	if peerKey == "" {
+		log.Info("WireGuard peer not found on VPN server (already removed)", "vpnIP", vpnIP)
+		return nil
+	}
+
+	// Remove from the running WireGuard interface.
+	if out, err := sshhelper.Run(vpnClient, fmt.Sprintf("sudo wg set wg0 peer %s remove", peerKey)); err != nil {
+		log.Error(err, "removing peer from running WireGuard config", "output", out)
+	}
+
+	// Remove the matching [Peer] block from /etc/wireguard/wg0.conf so the
+	// peer is not re-added on VPN server restart.
+	removeFromConf := fmt.Sprintf(`
+WG_CONF=/etc/wireguard/wg0.conf
+if sudo test -f "$WG_CONF"; then
+  sudo awk -v our_key="%s" '
+    /^\[Peer\]/ { in_peer=1; buf=$0"\n"; has_key=0; next }
+    in_peer {
+      buf=buf $0 "\n"
+      if ($0 ~ "PublicKey" && index($0, our_key)) has_key=1
+      if (/^[[:space:]]*$/ || /^\[/) {
+        if (!has_key) printf "%%s", buf
+        if (/^\[/) { in_peer=0; buf=$0"\n"; has_key=0 } else { in_peer=0; buf="" }
+        next
+      }
+      next
+    }
+    { print }
+    END { if (in_peer && !has_key) printf "%%s", buf }
+  ' "$WG_CONF" | sudo tee "${WG_CONF}.tmp" > /dev/null && sudo mv "${WG_CONF}.tmp" "$WG_CONF"
+fi`, peerKey)
+
+	if out, err := sshhelper.Run(vpnClient, removeFromConf); err != nil {
+		log.Error(err, "removing peer block from wg0.conf", "output", out)
+	}
+
+	log.Info("Removed WireGuard peer from VPN server", "vpnIP", vpnIP)
+	return nil
 }
 
 func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cluster *infrav1.RemoteCluster) error {
