@@ -306,6 +306,18 @@ sleep 3`,
 sudo install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
 /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
 echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"`,
+
+				// CRIU configuration (matches crioBuildSteps in kubeadm.go)
+				`sudo rm -f /etc/criu/runc.conf && \
+sudo mkdir -p /etc/criu && \
+printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+  | sudo tee /etc/criu/runc.conf > /dev/null`,
+
+				// CRI-O runc runtime drop-in — declares runc as the default OCI runtime
+				`sudo mkdir -p /etc/crio/crio.conf.d && \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/sbin/runc"\n        runtime_type = "oci"\n' \
+  | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
+
 				"sudo crio version || true",
 				"sudo crictl info || true",
 				"sudo systemctl status crio --no-pager || true",
