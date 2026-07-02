@@ -290,6 +290,18 @@ test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
   echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"
 systemctl enable crio --now || { journalctl -xeu crio.service --no-pager >&2; false; }
 systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
+
+# CRIU configuration (matches crioBuildSteps in kubeadm.go)
+rm -f /etc/criu/runc.conf
+mkdir -p /etc/criu
+printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+  | tee /etc/criu/runc.conf > /dev/null
+
+# CRI-O runc runtime drop-in — declares runc as the default OCI runtime
+mkdir -p /etc/crio/crio.conf.d
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/sbin/runc"\n        runtime_type = "oci"\n' \
+  | tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null
+
 report "CRI-O installed"
 
 # Fix storage directory permissions (CRI-O may create with restrictive permissions)
