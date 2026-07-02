@@ -26,8 +26,8 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
-	onprem "dcn.ssu.ac.kr/infra/provider/onprem"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
+	onprem "dcn.ssu.ac.kr/infra/provider/onprem"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -132,7 +132,11 @@ func ProvisionEC2Node(
 	log.Printf("[INFO] NodeProvision/%s: AWS validation successful", name)
 
 	// ── Allocate VPN IP ────────────────────────────────────────────────────
-	vpnIP, err := onprem.GetNextAvailableIP(
+	// AllocateVPNIP cross-checks both the CR's UsedIPAddresses and the live
+	// WireGuard peer list on the server, so the chosen IP is guaranteed free
+	// in both sources even if they have drifted.
+	vpnIP, err := onprem.AllocateVPNIP(
+		vpnServerClient,
 		*netNodeConfig.Spec.VPNRange,
 		netNodeConfig.Status.UsedIPAddresses,
 	)
@@ -191,13 +195,18 @@ func ProvisionEC2Node(
 		CRIOVersion:            crioVersion,
 		NodeName:               name,
 		Labels:                 labels,
+		SSHUsername:            nodeProvision.Spec.SSHUsernameOverride,
 	})
 
 	// ── Create EC2 instance ────────────────────────────────────────────────
+	// vpnResult carries VPN allocation data so the caller can persist it even
+	// if EC2 launch fails — preventing orphaned peers on retry.
+	vpnResult := &ProvisionResult{VpnIP: vpnIP, PublicKey: publicKey}
+
 	creds := ResolveAWSCredentials(secret)
 	ec2Client, err := newEC2Client(ctx, nodeProvision.Spec.Region, creds)
 	if err != nil {
-		return nil, fmt.Errorf("creating EC2 client: %w", err)
+		return vpnResult, fmt.Errorf("creating EC2 client: %w", err)
 	}
 
 	log.Printf("[INFO] NodeProvision/%s: Creating EC2 instance (type=%s region=%s)",
@@ -206,10 +215,10 @@ func ProvisionEC2Node(
 	input := buildRunInstancesInput(nodeProvision, userDataB64)
 	runOut, err := ec2Client.RunInstances(ctx, input)
 	if err != nil {
-		return nil, fmt.Errorf("launching EC2 instance: %w", err)
+		return vpnResult, fmt.Errorf("launching EC2 instance: %w", err)
 	}
 	if len(runOut.Instances) == 0 {
-		return nil, fmt.Errorf("RunInstances returned no instances")
+		return vpnResult, fmt.Errorf("RunInstances returned no instances")
 	}
 
 	instanceID := awssdk.ToString(runOut.Instances[0].InstanceId)
@@ -636,13 +645,30 @@ func ValidateInstanceTypeAvailability(ctx context.Context, region, instanceType 
 // helpers
 // ────────────────────────────────────────────────────────────────────────────
 
+const defaultRootVolumeSizeGB = 50
+
 func buildRunInstancesInput(np *mlv1alpha1.NodeProvision, userDataB64 string) *ec2.RunInstancesInput {
+	rootVolumeGB := int32(defaultRootVolumeSizeGB)
+	if np.Spec.AWSConfig != nil && np.Spec.AWSConfig.RootVolumeSizeGB > 0 {
+		rootVolumeGB = np.Spec.AWSConfig.RootVolumeSizeGB
+	}
+
 	input := &ec2.RunInstancesInput{
 		ImageId:      awssdk.String(np.Spec.AWSConfig.AMI),
 		InstanceType: types.InstanceType(np.Spec.InstanceType),
 		MinCount:     awssdk.Int32(1),
 		MaxCount:     awssdk.Int32(1),
 		UserData:     awssdk.String(userDataB64),
+		BlockDeviceMappings: []types.BlockDeviceMapping{
+			{
+				DeviceName: awssdk.String("/dev/sda1"),
+				Ebs: &types.EbsBlockDevice{
+					VolumeSize:          awssdk.Int32(rootVolumeGB),
+					VolumeType:          types.VolumeTypeGp3,
+					DeleteOnTermination: awssdk.Bool(true),
+				},
+			},
+		},
 		NetworkInterfaces: []types.InstanceNetworkInterfaceSpecification{
 			{
 				DeviceIndex:              awssdk.Int32(0),

@@ -67,6 +67,23 @@ type SoftwareConfig struct {
 	NvidiaDriverVersion           string `json:"nvidiaDriverVersion,omitempty"`
 	NvidiaContainerToolkitVersion string `json:"nvidiaContainerToolkitVersion,omitempty"`
 	K8sDevicePluginVersion        string `json:"k8sDevicePluginVersion,omitempty"`
+
+	ImagePrepulls []string `json:"imagePrepulls,omitempty"`
+
+	// ImagePullSecretRef optionally references a Secret containing registry
+	// credentials used when pre-pulling private images listed in ImagePrepulls.
+	// The Secret must have "username" and "password" keys.
+	// +optional
+	ImagePullSecretRef *SecretKeyReference `json:"imagePullSecretRef,omitempty"`
+}
+
+// SecretKeyReference identifies a Kubernetes Secret by name and an optional key.
+type SecretKeyReference struct {
+	Name string `json:"name"`
+	// Key is the data key within the secret. When omitted, the controller uses
+	// well-known key names (username / password).
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 // NodeProvisionNetConfigStatus defines the observed state of NodeProvisionNetConfig.

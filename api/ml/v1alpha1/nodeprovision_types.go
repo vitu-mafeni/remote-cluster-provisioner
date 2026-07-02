@@ -24,19 +24,20 @@ type NodeProvisionPhase string
 type CloudProvider string
 
 const (
-	NodeProvisionPhasePending          NodeProvisionPhase = "Pending"
-	NodeProvisionPhaseValidating       NodeProvisionPhase = "Validating"
-	NodeProvisionPhaseCreatingInstance NodeProvisionPhase = "CreatingInstance"
+	NodeProvisionPhasePending            NodeProvisionPhase = "Pending"
+	NodeProvisionPhaseValidating         NodeProvisionPhase = "Validating"
+	NodeProvisionPhaseCreatingInstance   NodeProvisionPhase = "CreatingInstance"
 	NodeProvisionPhaseWaitingForInstance NodeProvisionPhase = "WaitingForInstance"
-	NodeProvisionPhaseConfiguringVPN   NodeProvisionPhase = "ConfiguringVPN"
-	NodeProvisionPhaseProvisioning     NodeProvisionPhase = "Provisioning"
-	NodeProvisionPhaseBootstrapping    NodeProvisionPhase = "Bootstrapping"
-	NodeProvisionPhaseRegisteringNode  NodeProvisionPhase = "RegisteringNode"
-	NodeProvisionPhaseJoining          NodeProvisionPhase = "Joining"
-	NodeProvisionPhaseVerifyingHealth  NodeProvisionPhase = "VerifyingHealth"
-	NodeProvisionPhaseReady            NodeProvisionPhase = "Ready"
-	NodeProvisionPhaseFailed           NodeProvisionPhase = "Failed"
-	NodeProvisionPhaseDeleting         NodeProvisionPhase = "Deleting"
+	NodeProvisionPhaseConfiguringVPN     NodeProvisionPhase = "ConfiguringVPN"
+	NodeProvisionPhaseProvisioning       NodeProvisionPhase = "Provisioning"
+	NodeProvisionPhaseBootstrapping      NodeProvisionPhase = "Bootstrapping"
+	NodeProvisionPhaseRegisteringNode    NodeProvisionPhase = "RegisteringNode"
+	NodeProvisionPhaseJoining            NodeProvisionPhase = "Joining"
+	NodeProvisionPhaseVerifyingHealth    NodeProvisionPhase = "VerifyingHealth"
+	NodeProvisionPhaseReady              NodeProvisionPhase = "Ready"
+	NodeProvisionPhaseFailed             NodeProvisionPhase = "Failed"
+	NodeProvisionPhaseDeleting           NodeProvisionPhase = "Deleting"
+	NodeProvisionPhasePrePullingImages   NodeProvisionPhase = "PrePullingImages"
 
 	CloudProviderAWS    CloudProvider = "AWS"
 	CloudProviderGCP    CloudProvider = "GCP"
@@ -78,6 +79,11 @@ type AWSConfig struct {
 	// Additional tags to apply to created AWS resources.
 	// +optional
 	Tags map[string]string `json:"tags,omitempty"`
+	// RootVolumeSizeGB overrides the root EBS volume size in GB.
+	// Defaults to 50 GB when unset. The Ubuntu 22.04 AMI default (8 GB) is
+	// too small for a Kubernetes node running CRI-O and container images.
+	// +optional
+	RootVolumeSizeGB int32 `json:"rootVolumeSizeGB,omitempty"`
 }
 
 // NodeProvisionSpec defines the desired state of NodeProvision.

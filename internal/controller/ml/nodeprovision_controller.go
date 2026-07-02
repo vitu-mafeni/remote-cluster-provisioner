@@ -32,11 +32,11 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
+	"dcn.ssu.ac.kr/infra/pkg/ssh"
 	awsprovision "dcn.ssu.ac.kr/infra/provider/aws"
 	remotenodeprovision "dcn.ssu.ac.kr/infra/provider/onprem"
-	"dcn.ssu.ac.kr/infra/pkg/ssh"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // onPremJobResult carries the outcome of a background on-prem provisioning run.
@@ -46,6 +46,11 @@ type onPremJobResult struct {
 	err       error
 }
 
+// npPrepullJobResult carries the outcome of a background image pre-pull run.
+type npPrepullJobResult struct {
+	err error
+}
+
 // NodeProvisionReconciler reconciles a NodeProvision object
 type NodeProvisionReconciler struct {
 	client.Client
@@ -53,10 +58,38 @@ type NodeProvisionReconciler struct {
 	// onPremJobs holds in-flight on-prem provisioning goroutines.
 	// Key: "<namespace>/<name>", Value: <-chan onPremJobResult
 	onPremJobs sync.Map
+	// onPremProgress tracks the current provisioning step for each in-flight goroutine.
+	// Key: "<namespace>/<name>", Value: string
+	onPremProgress sync.Map
+	// npPrepullJobs holds in-flight image pre-pull goroutines.
+	// Key: "<namespace>/<name>", Value: <-chan npPrepullJobResult
+	npPrepullJobs sync.Map
 }
 
 const (
+	// nodeProvisionFinalizer is placed on the NodeProvision CR itself.
 	nodeProvisionFinalizer = "ml.dcn.ssu.ac.kr/nodeprovision-finalizer"
+
+	// nodeProvisionNodeFinalizer is placed on the Kubernetes Node object so that
+	// the node cannot be deleted independently of the NodeProvision lifecycle.
+	nodeProvisionNodeFinalizer = "ml.dcn.ssu.ac.kr/nodeprovision-node-finalizer"
+
+	// Ownership labels stamped onto the Kubernetes Node when it joins the cluster.
+	// They let any observer (kubectl, dashboard, scripts) find the parent NodeProvision CR.
+	nodeProvisionNameLabel     = "ml.dcn.ssu.ac.kr/node-provision"
+	nodeProvisionNsLabel       = "ml.dcn.ssu.ac.kr/node-provision-namespace"
+	nodeProvisionProviderLabel = "ml.dcn.ssu.ac.kr/provider"
+	// nodeProvisionUIDLabel holds the UID of the owning NodeProvision CR.
+	// Unlike the name, the UID is globally unique and survives CR rename/recreate,
+	// so it is the definitive key for matching a Node back to its exact CR.
+	nodeProvisionUIDLabel = "ml.dcn.ssu.ac.kr/node-provision-uid"
+
+	// controllerCredsSuffix is appended to the NodeProvision name to form the
+	// name of the controller-owned credential copy.  This copy carries an owner
+	// reference so it cannot be deleted while the NodeProvision CR exists; it is
+	// GC'd automatically after the CR is fully removed.  During teardown the
+	// controller falls back to this copy when the user-managed secret is gone.
+	controllerCredsSuffix = "-controller-creds"
 
 	// requeueShort is used when waiting for external state (instance running, VPN).
 	requeueShort = 30 * time.Second
@@ -64,6 +97,8 @@ const (
 	requeueJoining = 15 * time.Second
 	// requeueFailed is used to allow manual remediation before retrying.
 	requeueFailed = time.Minute
+	// npPrepullPollInterval is the requeue interval while images are pre-pulling.
+	npPrepullPollInterval = 30 * time.Second
 )
 
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions,verbs=get;list;watch;create;update;patch;delete
@@ -98,6 +133,18 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, fmt.Errorf("adding finalizer: %w", err)
 		}
 		return ctrl.Result{}, nil
+	}
+
+	// For AWS nodes, keep a controller-owned copy of the credentials secret up-to-date.
+	// The user-supplied secret can be deleted at any time; during teardown the
+	// controller falls back to this owned copy to terminate the EC2 instance.
+	// On-prem nodes use SSH keys embedded in the same secret so we copy it there too.
+	if np.Spec.CredentialsRef.Name != "" {
+		if userSecret, err := r.getSecret(ctx, np); err == nil {
+			if err := r.ensureControllerCredsSecret(ctx, np, userSecret); err != nil {
+				log.Error(err, "Failed to persist credential copy (non-fatal)")
+			}
+		}
 	}
 
 	switch np.Status.Phase {
@@ -143,8 +190,13 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	case mlv1alpha1.NodeProvisionPhaseBootstrapping:
 		// On-prem: poll the background SSH provisioning goroutine.
-		// AWS: cloud-init is running on the instance; just wait for the node to appear.
+		// Skip getSecret when the goroutine is already running — it is only
+		// needed if we need to restart provisioning (no goroutine in map).
 		if np.Spec.Provider == mlv1alpha1.CloudProviderOnPrem {
+			key := np.Namespace + "/" + np.Name
+			if _, running := r.onPremJobs.Load(key); running {
+				return r.pollOnPremBootstrap(ctx, np, nil)
+			}
 			secret, err := r.getSecret(ctx, np)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("getting credentials secret: %w", err)
@@ -158,12 +210,38 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		mlv1alpha1.NodeProvisionPhaseVerifyingHealth:
 		return r.reconcileJoining(ctx, np)
 
+	case mlv1alpha1.NodeProvisionPhasePrePullingImages:
+		return r.reconcileNPImagePrepull(ctx, np)
+
 	case mlv1alpha1.NodeProvisionPhaseReady:
-		log.Info("NodeProvision is ready, no action needed")
+		log.V(1).Info("NodeProvision is ready, no action needed")
 		return ctrl.Result{}, nil
 
 	case mlv1alpha1.NodeProvisionPhaseFailed:
-		log.Info("NodeProvision failed; waiting before retry")
+		if err := r.cleanupVPNPeer(ctx, np); err != nil {
+			log.Error(err, "releasing stale VPN peer before retry (continuing)")
+		}
+		// Re-fetch to get the latest ResourceVersion before writing — a parallel
+		// reconcile may have already reset the phase, in which case we do nothing.
+		fresh := &mlv1alpha1.NodeProvision{}
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
+			return ctrl.Result{}, err
+		}
+		if fresh.Status.Phase != mlv1alpha1.NodeProvisionPhaseFailed {
+			return ctrl.Result{}, nil
+		}
+		now := metav1.Now()
+		fresh.Status.Phase = ""
+		fresh.Status.VpnIP = ""
+		fresh.Status.IPAddress = ""
+		fresh.Status.Message = "Retrying after failure"
+		fresh.Status.LastUpdated = &now
+		log.Info("Retrying NodeProvision after failure — releasing stale VPN IP and resetting phase")
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			// Another reconcile won the race — its reset will trigger re-provisioning.
+			log.Info("Phase reset race lost, other reconcile already reset", "err", err)
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{RequeueAfter: requeueFailed}, nil
 
 	default:
@@ -293,17 +371,20 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	log.Info("Creating EC2 instance")
 
 	result, err := awsprovision.ProvisionEC2Node(ctx, np, secret, vpnServerClient, netConfig)
+	// Always persist VPN allocation immediately — even on EC2 failure — so that
+	// cleanupVPNPeer can find and release the peer on the next retry instead of
+	// leaving it as an orphan and allocating yet another IP.
+	if result != nil && result.VpnIP != "" {
+		if uErr := r.updateNetConfigStatus(ctx, netConfig, result.VpnIP, result.PublicKey, name); uErr != nil {
+			log.Error(uErr, "persisting VPN allocation to NetConfig (non-fatal)")
+		}
+		np.Status.VpnIP = result.VpnIP
+		np.Status.IPAddress = result.VpnIP
+	}
 	if err != nil {
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("EC2 provisioning failed: %v", err))
 	}
 	log.Info("EC2 instance created", "instanceId", result.InstanceID)
-
-	// Persist VPN peer in NetConfig before writing InstanceID into NodeProvision
-	// status.  If the NodeProvision update fails we can still recover the VPN
-	// allocation on the next reconcile via the NetConfig peer list.
-	if err := r.updateNetConfigStatus(ctx, netConfig, result.VpnIP, result.PublicKey, name); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
-	}
 
 	// Re-fetch to ensure we have the latest ResourceVersion before writing
 	// the critical InstanceID field.  This is necessary because the
@@ -562,6 +643,18 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("SSH connectivity check failed: %v", err))
 	}
 
+	// Verify passwordless sudo before attempting any provisioning.
+	// All provisioning commands require sudo in a non-interactive SSH session
+	// (no TTY), so the node must have NOPASSWD configured for the SSH user.
+	if out, err := ssh.Run(sshClient, "sudo -n true"); err != nil {
+		sshClient.Conn.Close()
+		return r.failNodeProvision(ctx, np, fmt.Sprintf(
+			"passwordless sudo check failed — configure NOPASSWD for the SSH user on this node "+
+				"(e.g. echo '<user> ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/nopasswd): %v\nOutput: %s",
+			err, out,
+		))
+	}
+
 	netConfig, err := r.requireNetConfig(ctx, np)
 	if err != nil {
 		sshClient.Conn.Close()
@@ -603,9 +696,12 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	ch := make(chan onPremJobResult, 1)
 	r.onPremJobs.Store(key, (<-chan onPremJobResult)(ch))
 
+	reportStep := func(step string) { r.onPremProgress.Store(key, step) }
+
 	go func() {
 		defer sshClient.Conn.Close()
 		defer vpnServerClient.Conn.Close()
+		defer r.onPremProgress.Delete(key)
 		// Do NOT delete from onPremJobs here. The map entry must remain
 		// until pollOnPremBootstrap reads the result from the channel.
 		// Deleting here creates a window where the goroutine has finished
@@ -619,6 +715,7 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 			sshClient,
 			vpnServerClient,
 			netConfigCopy,
+			reportStep,
 		)
 		ch <- onPremJobResult{vpnIP: vpnNodeIP, publicKey: publicKey, err: err}
 	}()
@@ -647,6 +744,8 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 	if !running {
 		// No goroutine in memory — controller likely restarted mid-provisioning.
 		// Re-enter provisioning to restart the SSH session.
+		// secret is guaranteed non-nil here: the Bootstrapping case only passes
+		// nil when it has already confirmed the goroutine is running.
 		log.Info("No in-flight bootstrap goroutine found (possible restart), restarting provisioning")
 		return r.reconcileOnPremProvisioning(ctx, np, secret)
 	}
@@ -689,8 +788,19 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 		return ctrl.Result{RequeueAfter: requeueJoining}, nil
 
 	default:
-		// Still running.
-		log.Info("On-prem bootstrap in progress, requeueing")
+		// Still running — surface the current step in status so the user can see progress.
+		step := "bootstrapping node (packages and cluster join in progress)"
+		if v, ok := r.onPremProgress.Load(key); ok {
+			step = v.(string)
+		}
+		msg := fmt.Sprintf("Bootstrapping: %s", step)
+		if np.Status.Message != msg {
+			now := metav1.Now()
+			np.Status.Message = msg
+			np.Status.LastUpdated = &now
+			_ = r.Status().Update(ctx, np)
+		}
+		log.Info("On-prem bootstrap in progress", "step", step)
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
 }
@@ -722,10 +832,15 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	}
 
 	if found == nil {
-		log.Info("Node not yet visible in cluster, requeueing", "vpnIP", targetIP)
+		elapsed := ""
+		if np.Status.LastUpdated != nil {
+			elapsed = fmt.Sprintf(" (%.0fs since last update)", time.Since(np.Status.LastUpdated.Time).Seconds())
+		}
+		log.Info("Node not yet visible in cluster — waiting for kubelet to register",
+			"lookingForIP", targetIP, "elapsed", elapsed)
 		now := metav1.Now()
 		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseRegisteringNode
-		np.Status.Message = "Waiting for node to register with control plane"
+		np.Status.Message = fmt.Sprintf("Waiting for node to register with control plane (VPN IP: %s)", targetIP)
 		np.Status.Progress = 70
 		np.Status.LastUpdated = &now
 		_ = r.Status().Update(ctx, np)
@@ -733,28 +848,89 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	}
 
 	log.Info("Node registered with control plane", "node", found.Name)
-	log.Info("Node join progress: verifying health")
 
-	// Apply hardware-type label if requested.
-	if np.Spec.NodeLabel != "" {
+	// Stamp ownership labels + hardware-type label + management finalizer onto
+	// the Kubernetes Node object in a single patch.  We always do this so that
+	// even nodes whose NodeProvision has no NodeLabel still carry the ownership
+	// metadata and are protected against accidental kubectl-delete.
+	{
 		patch := client.MergeFrom(found.DeepCopy())
 		if found.Labels == nil {
 			found.Labels = map[string]string{}
 		}
-		found.Labels["hardware-type"] = np.Spec.NodeLabel
-		if err := r.Patch(ctx, found, patch); err != nil {
-			return ctrl.Result{}, fmt.Errorf("patching node label: %w", err)
+		// Ownership labels — let anyone find the parent NodeProvision CR.
+		found.Labels[nodeProvisionNameLabel] = np.Name
+		found.Labels[nodeProvisionNsLabel] = np.Namespace
+		found.Labels[nodeProvisionProviderLabel] = string(np.Spec.Provider)
+		// UID is the definitive unique identifier: immutable, cluster-scoped,
+		// survives a CR delete+recreate with the same name.
+		found.Labels[nodeProvisionUIDLabel] = string(np.UID)
+		// Optional user-supplied hardware class label.
+		if np.Spec.NodeLabel != "" {
+			found.Labels["hardware-type"] = np.Spec.NodeLabel
 		}
-		log.Info("Applied node label", "node", found.Name, "hardware-type", np.Spec.NodeLabel)
+		// GPU-specific labels and taint — mirrors what RemoteCluster does for
+		// GPU workers via kubectl label/taint on the control-plane.
+		if strings.Contains(np.Spec.NodeLabel, "gpu") {
+			found.Labels["gpu"] = "on"
+			gpuTaint := corev1.Taint{
+				Key:    "hardware-type",
+				Value:  "gpu",
+				Effect: corev1.TaintEffectPreferNoSchedule,
+			}
+			hasTaint := false
+			for _, t := range found.Spec.Taints {
+				if t.Key == gpuTaint.Key && t.Effect == gpuTaint.Effect {
+					hasTaint = true
+					break
+				}
+			}
+			if !hasTaint {
+				found.Spec.Taints = append(found.Spec.Taints, gpuTaint)
+			}
+		}
+		// Finalizer on the Node prevents `kubectl delete node` from bypassing
+		// controller-managed cleanup (VPN peer removal, EC2 termination, etc.).
+		controllerutil.AddFinalizer(found, nodeProvisionNodeFinalizer)
+		if err := r.Patch(ctx, found, patch); err != nil {
+			return ctrl.Result{}, fmt.Errorf("patching node ownership labels/finalizer: %w", err)
+		}
+		log.Info("Stamped ownership metadata on node",
+			"node", found.Name,
+			nodeProvisionNameLabel, np.Name,
+			nodeProvisionNsLabel, np.Namespace,
+			nodeProvisionProviderLabel, string(np.Spec.Provider),
+			nodeProvisionUIDLabel, string(np.UID),
+		)
 	}
 
 	now := metav1.Now()
 	np.Status.NodeName = found.Name
+	np.Status.LastUpdated = &now
+
+	// GPU nodes with images configured get an intermediate phase so the
+	// background goroutine can pull without blocking further reconciles.
+	// Works for both on-prem (SSH via VPN IP) and AWS (SSH via VPN IP set during provisioning).
+	// Image list comes from NodeProvisionNetConfig.Spec.SoftwareConfig.ImagePrepulls.
+	if strings.Contains(np.Spec.NodeLabel, "gpu") {
+		netConfig, err := r.requireNetConfig(ctx, np)
+		if err == nil && len(netConfig.Spec.SoftwareConfig.ImagePrepulls) > 0 {
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhasePrePullingImages
+			np.Status.Message = "Node joined; pre-pulling GPU images in background"
+			np.Status.Progress = 90
+			if err := r.Status().Update(ctx, np); err != nil {
+				return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to PrePullingImages: %w", err)
+			}
+			log.Info("GPU node joined — starting image pre-pull",
+				"node", found.Name, "images", len(netConfig.Spec.SoftwareConfig.ImagePrepulls))
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
 	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
 	np.Status.Message = "Node successfully joined cluster"
 	np.Status.Progress = 100
 	np.Status.CompletionTime = &now
-	np.Status.LastUpdated = &now
 	if err := r.Status().Update(ctx, np); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to Ready: %w", err)
 	}
@@ -763,11 +939,221 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// reconcileNPImagePrepull – background GPU image pre-pull for NodeProvision
+// ────────────────────────────────────────────────────────────────────────────
+
+// reconcileNPImagePrepull manages the background goroutine that pre-pulls GPU
+// images on the node via crictl.  It follows the same pattern as
+// reconcileOnPremProvisioning / pollOnPremBootstrap:
+//
+//   - First call: opens a dedicated SSH connection, spawns the goroutine,
+//     stores a receive-only result channel in npPrepullJobs, returns RequeueAfter.
+//   - Subsequent calls: non-blocking poll of the channel; if done, stamp Ready;
+//     if still running, requeue again.
+//
+// Only the poll branch deletes from npPrepullJobs — not the goroutine — to
+// avoid the TOCTOU race described in reconcileOnPremProvisioning.
+func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
+	ctx context.Context,
+	np *mlv1alpha1.NodeProvision,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	key := np.Namespace + "/" + np.Name
+
+	// Poll branch — hoisted to the top so credential lookups and SSH only
+	// happen once (when spawning), not on every 30s requeue.
+	if v, running := r.npPrepullJobs.Load(key); running {
+		ch := v.(<-chan npPrepullJobResult)
+		select {
+		case res := <-ch:
+			r.npPrepullJobs.Delete(key)
+			if res.err != nil {
+				// Do NOT fail the NodeProvision — the node is already joined.
+				// Log the error and let the next reconcile re-spawn for a retry.
+				log.Error(res.err, "Image pre-pull attempt failed, will retry on next reconcile",
+					"node", np.Status.NodeName)
+				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+			}
+			log.Info("All GPU images pre-pulled successfully", "node", np.Status.NodeName)
+
+			if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+				return ctrl.Result{}, fmt.Errorf("refreshing NodeProvision after pre-pull: %w", err)
+			}
+			now := metav1.Now()
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
+			np.Status.Message = "Node successfully joined cluster"
+			np.Status.Progress = 100
+			np.Status.CompletionTime = &now
+			np.Status.LastUpdated = &now
+			if err := r.Status().Update(ctx, np); err != nil {
+				return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to Ready: %w", err)
+			}
+			return ctrl.Result{}, nil
+		default:
+			log.V(1).Info("GPU image pre-pull in progress, requeueing")
+			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+		}
+	}
+
+	// No goroutine in memory — fetch config and spawn one.
+	{
+		// Fetch the image list from NodeProvisionNetConfig.
+		netConfig, err := r.requireNetConfig(ctx, np)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+		}
+		images := netConfig.Spec.SoftwareConfig.ImagePrepulls
+		if len(images) == 0 {
+			// Nothing to pull — go straight to Ready.
+			if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+				return ctrl.Result{}, err
+			}
+			now := metav1.Now()
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
+			np.Status.Message = "Node successfully joined cluster"
+			np.Status.Progress = 100
+			np.Status.CompletionTime = &now
+			np.Status.LastUpdated = &now
+			return ctrl.Result{}, r.Status().Update(ctx, np)
+		}
+
+		// Resolve registry credentials before spawning the goroutine.
+		// The controller has API access; the goroutine only has SSH.
+		var pullCreds string
+		if ref := netConfig.Spec.SoftwareConfig.ImagePullSecretRef; ref != nil {
+			credSecret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      ref.Name,
+				Namespace: np.Namespace,
+			}, credSecret); err != nil {
+				// Transient — do not fail the NodeProvision.
+				log.Error(err, "Cannot fetch image pull secret, will retry", "secret", ref.Name)
+				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+			}
+			username := strings.TrimSpace(string(credSecret.Data["username"]))
+			password := strings.TrimSpace(string(credSecret.Data["password"]))
+			if username == "" || password == "" {
+				log.Error(fmt.Errorf("missing keys"), "Image pull secret must have non-empty \"username\" and \"password\" keys — will retry", "secret", ref.Name)
+				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+			}
+			pullCreds = username + ":" + password
+			log.Info("Using registry credentials for image pre-pull",
+				"secret", ref.Name, "user", username)
+		}
+
+		// Open a dedicated SSH connection for the goroutine.  After the node
+		// has joined the cluster the most reliable address is its VPN IP since
+		// the controller is also in-cluster on the same VPN mesh.
+		sshClient, err := r.getSSHClientPostJoin(ctx, np)
+		if err != nil {
+			// SSH failure is transient — do not fail the NodeProvision.
+			log.Error(err, "Cannot open SSH connection for image pre-pull, will retry")
+			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+		}
+
+		imagesCopy := make([]string, len(images))
+		copy(imagesCopy, images)
+		credsCopy := pullCreds // immutable string — safe to close over
+		glog := log.WithValues("node", np.Status.NodeName)
+
+		ch := make(chan npPrepullJobResult, 1)
+		r.npPrepullJobs.Store(key, (<-chan npPrepullJobResult)(ch))
+
+		go func() {
+			defer sshClient.Conn.Close()
+			// Clear stale registry auth files when no explicit credentials are
+			// configured.  Stale docker.io entries cause 401 errors even for
+			// public images because the runtime always sends stored credentials.
+			if credsCopy == "" {
+				authFiles := []string{
+					"/root/.docker/config.json",
+					"/run/containers/0/auth.json",
+					"/etc/containers/auth.json",
+				}
+				for _, f := range authFiles {
+					_, _ = ssh.Run(sshClient, fmt.Sprintf("sudo rm -f %s", f))
+				}
+				glog.Info("Cleared stale registry auth files before anonymous pull")
+			}
+
+			for _, img := range imagesCopy {
+				img = strings.TrimSpace(img)
+				if img == "" {
+					continue
+				}
+				glog.Info("Pulling image", "image", img)
+				var cmd string
+				if credsCopy != "" {
+					// timeout prevents an indefinite hang if the TCP connection
+					// drops silently (no SSH keepalive through firewalls).
+					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull --creds %s %s", credsCopy, img)
+				} else {
+					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull %s", img)
+				}
+				output, pullErr := ssh.Run(sshClient, cmd)
+				if pullErr != nil {
+					ch <- npPrepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
+					return
+				}
+				glog.Info("Pulled image successfully", "image", img)
+			}
+			ch <- npPrepullJobResult{err: nil}
+		}()
+
+		log.Info("GPU image pre-pull goroutine started",
+			"node", np.Status.NodeName, "images", len(imagesCopy),
+			"authenticated", pullCreds != "")
+		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+	}
+}
+
+// getSSHClientPostJoin opens an SSH connection to the node using its VPN IP
+// (np.Status.VpnIP), which is reachable from the controller once the node has
+// joined the cluster.  Falls back to the spec IP/hostname if VPN IP is empty.
+func (r *NodeProvisionReconciler) getSSHClientPostJoin(ctx context.Context, np *mlv1alpha1.NodeProvision) (*ssh.Client, error) {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      np.Spec.CredentialsRef.Name,
+		Namespace: np.Namespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("fetching SSH credential secret %q: %w", np.Spec.CredentialsRef.Name, err)
+	}
+
+	credBytes, err := resolveSecretKey(secret, np.Spec.CredentialsRef.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	host := np.Status.VpnIP
+	if host == "" {
+		host = np.Spec.IPAddress
+	}
+	if host == "" {
+		host = np.Spec.Hostname
+	}
+	user := np.Spec.SSHUsernameOverride
+	if user == "" {
+		user = "ubuntu"
+	}
+	return dialSSH(host, np.Spec.SSHPort, user, string(credBytes))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // handleDelete – deprovisions and removes the finalizer
 // ────────────────────────────────────────────────────────────────────────────
 
 func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alpha1.NodeProvision) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+
+	// Guard: if our finalizer is already gone a previous reconcile completed
+	// cleanup successfully.  A stale watch event can re-deliver the delete
+	// notification after the CR is already gone; skip to avoid double-work and
+	// a spurious "not found" error on the final Update.
+	if !controllerutil.ContainsFinalizer(np, nodeProvisionFinalizer) {
+		log.Info("Finalizer already removed — cleanup previously completed, skipping")
+		return ctrl.Result{}, nil
+	}
+
 	log.Info("Deprovisioning node")
 
 	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseDeleting
@@ -779,10 +1165,33 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	if np.Status.NodeName != "" {
 		node := &corev1.Node{}
 		if err := r.Get(ctx, types.NamespacedName{Name: np.Status.NodeName}, node); err == nil {
-			if err := r.Delete(ctx, node); err != nil {
-				log.Error(err, "deleting node from cluster", "node", np.Status.NodeName)
+			// Strip our management finalizer first.  This is necessary because if
+			// the node already has a DeletionTimestamp (e.g. from a previous
+			// controller run that called Delete before crashing, or from a manual
+			// `kubectl delete node`), removing the last finalizer causes the API
+			// server to GC the node immediately — so the subsequent Delete call
+			// would hit "not found".  We handle that below with IgnoreNotFound.
+			if controllerutil.ContainsFinalizer(node, nodeProvisionNodeFinalizer) {
+				patch := client.MergeFrom(node.DeepCopy())
+				controllerutil.RemoveFinalizer(node, nodeProvisionNodeFinalizer)
+				if err := r.Patch(ctx, node, patch); err != nil {
+					log.Error(err, "removing node finalizer (continuing)", "node", np.Status.NodeName)
+				} else {
+					log.Info("Removed management finalizer from node", "node", np.Status.NodeName)
+				}
+			}
+			// If DeletionTimestamp is already set the API server will delete the
+			// node as soon as all finalizers are gone (handled above).  Calling
+			// Delete again is harmless but produces a confusing "not found" log
+			// line, so skip it in that case.
+			if node.DeletionTimestamp.IsZero() {
+				if err := r.Delete(ctx, node); client.IgnoreNotFound(err) != nil {
+					log.Error(err, "deleting node from cluster", "node", np.Status.NodeName)
+				} else if err == nil {
+					log.Info("Removed node from cluster", "node", np.Status.NodeName)
+				}
 			} else {
-				log.Info("Removed node from cluster", "node", np.Status.NodeName)
+				log.Info("Node already terminating — finalizer removal will complete deletion", "node", np.Status.NodeName)
 			}
 		}
 	}
@@ -796,13 +1205,29 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	switch np.Spec.Provider {
 	case mlv1alpha1.CloudProviderAWS:
 		if np.Status.InstanceID != "" {
+			// Prefer the user-supplied secret; fall back to the controller-owned copy
+			// in case the user deleted their secret before deleting the NodeProvision.
 			secret, err := r.getSecret(ctx, np)
 			if err != nil {
-				log.Error(err, "getting credentials for EC2 termination (continuing)")
-			} else if err := awsprovision.TerminateInstance(ctx, np, secret, np.Status.InstanceID); err != nil {
-				log.Error(err, "terminating EC2 instance", "instanceId", np.Status.InstanceID)
-			} else {
-				log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
+				if !apierrors.IsNotFound(err) {
+					log.Error(err, "getting credentials for EC2 termination, trying controller copy")
+				} else {
+					log.Info("User credentials secret not found, falling back to controller copy",
+						"userSecret", np.Spec.CredentialsRef.Name)
+				}
+				secret, err = r.getControllerCredsSecret(ctx, np)
+				if err != nil {
+					log.Error(err, "getting controller credential copy for EC2 termination (skipping)",
+						"instanceId", np.Status.InstanceID,
+						"hint", "manually terminate this EC2 instance")
+				}
+			}
+			if secret != nil {
+				if err := awsprovision.TerminateInstance(ctx, np, secret, np.Status.InstanceID); err != nil {
+					log.Error(err, "terminating EC2 instance", "instanceId", np.Status.InstanceID)
+				} else {
+					log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
+				}
 			}
 		}
 	case mlv1alpha1.CloudProviderOnPrem:
@@ -810,15 +1235,24 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	}
 
 	controllerutil.RemoveFinalizer(np, nodeProvisionFinalizer)
-	if err := r.Update(ctx, np); err != nil {
+	if err := r.Update(ctx, np); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
 	}
 	log.Info("Cleanup complete")
 	return ctrl.Result{}, nil
 }
 
-// cleanupVPNPeer removes the peer from the VPN server and releases the IP
-// allocation from the NodeProvisionNetConfig status.
+// cleanupVPNPeer removes the peer from the VPN server's running config and
+// persisted wg0.conf, then releases the IP from the NodeProvisionNetConfig status.
+//
+// Public-key resolution order (most specific → most defensive):
+//  1. CR status (VPNPeers list) — fast path, always tried first.
+//  2. Live VPN server (wg show wg0 dump keyed by VPN IP) — fallback when the
+//     CR status was never written or has drifted, e.g. provisioning crashed
+//     before updateNetConfigStatus completed.
+//
+// The VPN server connection is always opened so the fallback can be attempted
+// even when the CR has no record of this peer.
 func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1alpha1.NodeProvision) error {
 	log := logf.FromContext(ctx)
 
@@ -828,59 +1262,110 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 	}
 	netConfig := &netConfigList.Items[0]
 
-	// Find the peer entry for this node.
+	// ── 1. Resolve public key and VPN IP from CR status ─────────────────────
 	var peerPublicKey string
+	var resolvedVpnIP string // IP from the peer entry — valid even when np.Status.VpnIP was never written
 	newPeers := make([]mlv1alpha1.VPNPeerStatus, 0, len(netConfig.Status.VPNPeers))
 	for _, p := range netConfig.Status.VPNPeers {
 		if p.NodeName == np.Name || p.VPNIP == np.Status.VpnIP {
 			peerPublicKey = p.PublicKey
+			resolvedVpnIP = p.VPNIP
 		} else {
 			newPeers = append(newPeers, p)
 		}
 	}
 
-	// Remove VPN IP from used list.
-	newIPs := make([]string, 0, len(netConfig.Status.UsedIPAddresses))
-	for _, ip := range netConfig.Status.UsedIPAddresses {
-		if ip != np.Status.VpnIP && ip != np.Status.IPAddress {
-			newIPs = append(newIPs, ip)
-		}
+	// Best-effort IP to release: prefer the peer-entry IP, fall back to status fields.
+	ipToRelease := resolvedVpnIP
+	if ipToRelease == "" {
+		ipToRelease = np.Status.VpnIP
+	}
+	if ipToRelease == "" {
+		ipToRelease = np.Status.IPAddress
 	}
 
+	// Release IP from used list — only match non-empty IPs to avoid spuriously
+	// removing unrelated entries when the IP was never written to np.Status.
+	newIPs := make([]string, 0, len(netConfig.Status.UsedIPAddresses))
+	for _, ip := range netConfig.Status.UsedIPAddresses {
+		if ipToRelease != "" && ip == ipToRelease {
+			continue
+		}
+		newIPs = append(newIPs, ip)
+	}
 	netConfig.Status.VPNPeers = newPeers
 	netConfig.Status.UsedIPAddresses = newIPs
 	if err := r.Status().Update(ctx, netConfig); err != nil {
 		return fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
 	}
 
-	// Remove peer from VPN server if we have credentials.
-	if peerPublicKey != "" {
-		vpnClient, err := r.getVPNServerSSHClient(ctx, netConfig)
-		if err != nil {
-			log.Error(err, "connecting to VPN server for peer removal")
-			return nil
-		}
-		defer vpnClient.Conn.Close()
-
-		removeCmd := fmt.Sprintf("sudo wg set wg0 peer %s remove", peerPublicKey)
-		if _, err := ssh.Run(vpnClient, removeCmd); err != nil {
-			log.Error(err, "removing WireGuard peer from server")
-		}
-
-		// Remove from persisted wg0.conf.
-		vpnIP := np.Status.VpnIP
-		if vpnIP == "" {
-			vpnIP = np.Status.IPAddress
-		}
-		cleanCmd := fmt.Sprintf(
-			`sudo sed -i '/^\\[Peer\\]/{N;/PublicKey = %s/,/^$/d}' /etc/wireguard/wg0.conf 2>/dev/null || true`,
-			peerPublicKey,
-		)
-		if _, err := ssh.Run(vpnClient, cleanCmd); err != nil {
-			log.Error(err, "cleaning wg0.conf on VPN server")
-		}
-		log.Info("Removed VPN peer", "publicKey", peerPublicKey, "vpnIP", vpnIP)
+	// ── 2. Connect to VPN server — always, so we can use the live fallback ───
+	vpnClient, err := r.getVPNServerSSHClient(ctx, netConfig)
+	if err != nil {
+		log.Error(err, "connecting to VPN server for peer removal — peer may remain on server")
+		return nil
 	}
+	defer vpnClient.Conn.Close()
+
+	// ── 3. Fallback: look up public key from live server when CR has no record ─
+	vpnIP := np.Status.VpnIP
+	if vpnIP == "" {
+		vpnIP = np.Status.IPAddress
+	}
+	if peerPublicKey == "" && vpnIP != "" {
+		serverPeers, lookupErr := remotenodeprovision.ReadVPNServerPeers(vpnClient)
+		if lookupErr != nil {
+			log.Error(lookupErr, "reading live VPN peer list for fallback lookup")
+		} else if key, ok := serverPeers[vpnIP]; ok {
+			peerPublicKey = key
+			log.Info("Resolved peer public key from live VPN server (CR status was missing)",
+				"vpnIP", vpnIP, "publicKey", peerPublicKey)
+		}
+	}
+
+	if peerPublicKey == "" {
+		if vpnIP != "" {
+			log.Info("No peer found in CR status or on VPN server for this node — nothing to remove",
+				"vpnIP", vpnIP)
+		}
+		return nil
+	}
+
+	// ── 4. Remove from running WireGuard config ───────────────────────────────
+	removeCmd := fmt.Sprintf("sudo wg set wg0 peer %s remove", peerPublicKey)
+	if _, err := ssh.Run(vpnClient, removeCmd); err != nil {
+		log.Error(err, "removing WireGuard peer from running config", "publicKey", peerPublicKey)
+	}
+
+	// ── 5. Remove block from persisted wg0.conf ───────────────────────────────
+	// Uses the same awk buffering as registerVPNPeer so the removal is correct
+	// regardless of the field order within the [Peer] block.
+	cleanCmd := fmt.Sprintf(`
+sudo awk -v our_key="%s" '
+  /^\[Peer\]/ {
+    in_peer=1; buf=$0"\n"; has_key=0; next
+  }
+  in_peer {
+    buf=buf $0 "\n"
+    if ($0 ~ "PublicKey" && index($0, our_key)) has_key=1
+    if (/^[[:space:]]*$/ || /^\[/) {
+      if (!has_key) printf "%%s", buf
+      if (/^\[/) { in_peer=0; buf=$0"\n"; has_key=0 } else { in_peer=0; buf="" }
+      next
+    }
+    next
+  }
+  { print }
+  END { if (in_peer && !has_key) printf "%%s", buf }
+' /etc/wireguard/wg0.conf 2>/dev/null | sudo tee /etc/wireguard/wg0.conf.tmp > /dev/null &&
+sudo mv /etc/wireguard/wg0.conf.tmp /etc/wireguard/wg0.conf 2>/dev/null || true`,
+		peerPublicKey,
+	)
+	if _, err := ssh.Run(vpnClient, cleanCmd); err != nil {
+		log.Error(err, "removing peer block from wg0.conf on VPN server")
+	}
+
+	log.Info("Removed VPN peer", "publicKey", peerPublicKey, "vpnIP", vpnIP)
 	return nil
 }
 
@@ -892,7 +1377,11 @@ func (r *NodeProvisionReconciler) cleanupOnPremNode(ctx context.Context, np *mlv
 
 	sshClient, err := r.getSSHClient(ctx, np)
 	if err != nil {
-		log.Error(err, "SSH to on-prem node failed during cleanup (continuing)")
+		// Credential secret may have been deleted before the NodeProvision.
+		// VPN peer and Kubernetes node are already cleaned up — this is
+		// best-effort kubeadm reset on the physical node.
+		log.Info("Cannot SSH to on-prem node for kubeadm reset — credential secret missing or node unreachable; skipping node-side cleanup",
+			"err", err)
 		return
 	}
 	defer sshClient.Conn.Close()
@@ -945,6 +1434,65 @@ func (r *NodeProvisionReconciler) getSecret(ctx context.Context, np *mlv1alpha1.
 	return secret, nil
 }
 
+// getControllerCredsSecret retrieves the controller-owned copy of the credentials
+// secret (name = <np.Name> + controllerCredsSuffix).  This copy is created and
+// kept up-to-date by ensureControllerCredsSecret so that teardown can proceed
+// even when the user-managed secret has been deleted.
+func (r *NodeProvisionReconciler) getControllerCredsSecret(ctx context.Context, np *mlv1alpha1.NodeProvision) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      np.Name + controllerCredsSuffix,
+		Namespace: np.Namespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("getting controller credential copy: %w", err)
+	}
+	return secret, nil
+}
+
+// ensureControllerCredsSecret creates (or updates) a controller-owned copy of
+// the user-supplied credentials secret.  The copy carries an owner reference to
+// the NodeProvision CR so Kubernetes will GC it once the CR is fully deleted.
+// As long as the NodeProvision exists (even in terminating state with our
+// finalizer present), the copy is available for EC2 termination.
+func (r *NodeProvisionReconciler) ensureControllerCredsSecret(ctx context.Context, np *mlv1alpha1.NodeProvision, userSecret *corev1.Secret) error {
+	trueVal := true
+	copyName := np.Name + controllerCredsSuffix
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, client.ObjectKey{Name: copyName, Namespace: np.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		desired := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      copyName,
+				Namespace: np.Namespace,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         mlv1alpha1.GroupVersion.String(),
+						Kind:               "NodeProvision",
+						Name:               np.Name,
+						UID:                np.UID,
+						Controller:         &trueVal,
+						BlockOwnerDeletion: &trueVal,
+					},
+				},
+				Labels: map[string]string{
+					nodeProvisionNameLabel: np.Name,
+					nodeProvisionUIDLabel:  string(np.UID),
+				},
+			},
+			Type: userSecret.Type,
+			Data: userSecret.Data,
+		}
+		return r.Create(ctx, desired)
+	} else if err != nil {
+		return fmt.Errorf("checking for controller credential copy: %w", err)
+	}
+	// Already exists — sync data in case the user rotated the source secret.
+	patch := client.MergeFrom(existing.DeepCopy())
+	existing.Data = userSecret.Data
+	existing.Type = userSecret.Type
+	return r.Patch(ctx, existing, patch)
+}
+
 // getSSHClient creates an SSH client for the node being provisioned.
 func (r *NodeProvisionReconciler) getSSHClient(ctx context.Context, np *mlv1alpha1.NodeProvision) (*ssh.Client, error) {
 	secret := &corev1.Secret{}
@@ -964,7 +1512,11 @@ func (r *NodeProvisionReconciler) getSSHClient(ctx context.Context, np *mlv1alph
 	if host == "" {
 		host = np.Spec.Hostname
 	}
-	return dialSSH(host, np.Spec.SSHPort, np.Spec.SSHUsernameOverride, string(credBytes))
+	user := np.Spec.SSHUsernameOverride
+	if user == "" {
+		user = "ubuntu"
+	}
+	return dialSSH(host, np.Spec.SSHPort, user, string(credBytes))
 }
 
 // getVPNServerSSHClient creates an SSH client to the WireGuard VPN server.

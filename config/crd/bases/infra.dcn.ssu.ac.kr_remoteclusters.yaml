@@ -50,7 +50,6 @@ spec:
                       name:
                         type: string
                     required:
-                    - key
                     - name
                     type: object
                   sshPrivateKeySecretRef:
@@ -63,7 +62,6 @@ spec:
                       name:
                         type: string
                     required:
-                    - key
                     - name
                     type: object
                 type: object
@@ -94,13 +92,6 @@ spec:
                 type: object
               host:
                 type: string
-              kubernetes:
-                properties:
-                  version:
-                    type: string
-                required:
-                - version
-                type: object
               nodeInfo:
                 properties:
                   hardwareType:
@@ -109,7 +100,26 @@ spec:
                     type: string
                   softwareConfig:
                     properties:
+                      imagePrepulls:
+                        items:
+                          type: string
+                        type: array
+                      imagePullSecretRef:
+                        description: |-
+                          ImagePullSecretRef optionally references a Secret containing registry
+                          credentials used when pre-pulling private images listed in ImagePrepulls.
+                          The Secret must have "username" and "password" keys.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - name
+                        type: object
                       k8sDevicePluginVersion:
+                        type: string
+                      kubernetesVersion:
                         type: string
                       nvidiaContainerToolkitVersion:
                         type: string
@@ -143,7 +153,6 @@ spec:
             required:
             - auth
             - host
-            - kubernetes
             - port
             - user
             type: object

@@ -39,9 +39,8 @@ type RemoteClusterSpec struct {
 	User        string    `json:"user"`
 	NodeInfo    NodeInfo  `json:"nodeInfo,omitempty"`
 
-	Auth       RemoteClusterAuth       `json:"auth"`
-	Kubernetes RemoteClusterKubernetes `json:"kubernetes"`
-	GitConfig  GitConfig               `json:"gitConfig,omitempty"`
+	Auth      RemoteClusterAuth `json:"auth"`
+	GitConfig GitConfig         `json:"gitConfig,omitempty"`
 }
 
 type VPNConfig struct {
@@ -63,9 +62,17 @@ type NodeInfo struct {
 }
 
 type SoftwareConfig struct {
-	NvidiaDriverVersion           string `json:"nvidiaDriverVersion,omitempty"`
-	NvidiaContainerToolkitVersion string `json:"nvidiaContainerToolkitVersion,omitempty"`
-	K8sDevicePluginVersion        string `json:"k8sDevicePluginVersion,omitempty"`
+	NvidiaDriverVersion           string   `json:"nvidiaDriverVersion,omitempty"`
+	NvidiaContainerToolkitVersion string   `json:"nvidiaContainerToolkitVersion,omitempty"`
+	K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
+	KubernetesVersion             string   `json:"kubernetesVersion,omitempty"` // e.g., "v1.34.2"
+	ImagePrepulls                 []string `json:"imagePrepulls,omitempty"`     // list of container images to be prepulled on the node, e.g., ["nginx:latest", "redis:6.2"]
+
+	// ImagePullSecretRef optionally references a Secret containing registry
+	// credentials used when pre-pulling private images listed in ImagePrepulls.
+	// The Secret must have "username" and "password" keys.
+	// +optional
+	ImagePullSecretRef *SecretKeyReference `json:"imagePullSecretRef,omitempty"`
 }
 
 type GitConfig struct {
@@ -88,13 +95,10 @@ type RemoteClusterAuth struct {
 	SSHPrivateKeySecretRef *SecretKeyReference `json:"sshPrivateKeySecretRef,omitempty"`
 }
 
-type RemoteClusterKubernetes struct {
-	Version string `json:"version"`
-}
-
 type SecretKeyReference struct {
 	Name string `json:"name"`
-	Key  string `json:"key"`
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 // RemoteClusterStatus defines the observed state of RemoteCluster.
