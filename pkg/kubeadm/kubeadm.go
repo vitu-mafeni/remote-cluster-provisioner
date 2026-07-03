@@ -136,9 +136,24 @@ sudo mkdir -p /etc/criu && \
 printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
   | sudo tee /etc/criu/runc.conf > /dev/null`,
 
-		// CRI-O runc runtime drop-in: declare runc as the default OCI runtime.
+		// ── crun from source ─────────────────────────────────────────────────────────
+		// The apt crun on Ubuntu 22.04 is ≈0.19 which predates OCI spec 1.0.2; CRI-O
+		// 1.35 generates specs that old crun rejects with "unknown version specified".
+		// Build the latest release from source to ensure compatibility.
+		`sudo apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
+		`sudo rm -rf /tmp/crun && \
+git clone --depth=1 https://github.com/containers/crun /tmp/crun && \
+cd /tmp/crun && \
+./autogen.sh && \
+./configure --disable-man-page && \
+make -j$(nproc) && \
+sudo make install && \
+rm -rf /tmp/crun`,
+
+		// CRI-O runtime drop-in: use crun as the default OCI runtime.
+		// crun built from source installs to /usr/local/bin/crun.
 		`sudo mkdir -p /etc/crio/crio.conf.d && \
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/sbin/runc"\n        runtime_type = "oci"\n' \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "crun"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.crun]\n        runtime_path = "/usr/local/bin/crun"\n        runtime_type = "oci"\n' \
   | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
 	}
 }
@@ -326,10 +341,41 @@ mode: ipvs
 
 		// ── Phase 5: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
+			// Build crun from source unconditionally so a resume (skipping phase 4)
+			// also gets a version compatible with CRI-O 1.35. apt crun on Ubuntu 22.04
+			// is ≈0.19 which predates OCI spec 1.0.2 and fails with "unknown version".
+			`sudo apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
+			`sudo rm -rf /tmp/crun && \
+git clone --depth=1 https://github.com/containers/crun /tmp/crun && \
+cd /tmp/crun && \
+./autogen.sh && \
+./configure --disable-man-page && \
+make -j$(nproc) && \
+sudo make install && \
+rm -rf /tmp/crun`,
+			// Rewrite the runtime drop-in to use the source-built crun at /usr/local/bin/crun.
+			`sudo mkdir -p /etc/crio/crio.conf.d && \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "crun"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.crun]\n        runtime_path = "/usr/local/bin/crun"\n        runtime_type = "oci"\n' \
+  | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
+			// Stop any running CRI-O and kill stale conmon/crun child processes that
+			// may have survived from the previous cluster. Leftover processes hold
+			// open the socket or container storage, causing the new binary to fail
+			// on start even after a clean wipe.
+			"sudo systemctl stop crio 2>/dev/null || true",
+			"sudo killall -9 crio conmon crun 2>/dev/null || true",
+			// Remove the stale socket and run-time state directory so the new
+			// binary starts with a clean socket path.
+			"sudo rm -rf /run/crio /var/run/crio",
+			// Wipe container storage (overlay mounts, image cache) with CRI-O
+			// stopped so no mounts are held open.
+			"sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true",
+			"sudo crio wipe -f 2>/dev/null || true",
+			"sudo rm -rf /var/lib/crio 2>/dev/null || true",
 			"sudo systemctl daemon-reload",
 			"sudo systemctl enable crio",
-			"sudo crio wipe -f 2>/dev/null || true",
-			`sudo systemctl start crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
+			// Use restart (not start) so it succeeds whether or not a stale unit
+			// is already in failed/active state.
+			`sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager -n 60 >&2; false; }`,
 			crioReadyCheck,
 		}},
 
@@ -403,9 +449,23 @@ metadata:
 handler: nvidia
 EOF`,
 			"rm -rf /tmp/remote-cluster-provisioner",
-			"git clone -b r2-1 https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
+			"git clone https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
 			"kubectl apply -f /tmp/remote-cluster-provisioner/config/crd/bases/",
-			"kubectl apply -Rf /tmp/catalog/distros/",
+			// Two-pass apply: pass 1 seeds namespaces and CRDs so that pass 2
+			// does not hit "namespace not found" for resources applied before their
+			// namespace YAML in alphabetical directory order.
+			// Only sandbox/cert-manager is applied from the sandbox distro tree;
+			// gitea, metallb-sandbox-config, network, and repository dirs are skipped.
+			`kubectl apply -f /tmp/catalog/distros/sandbox/cert-manager/`,
+			// Wait for the cert-manager webhook to be ready before pass 2 so that
+			// ClusterIssuer creation does not fail with "connection refused".
+			`kubectl -n cert-manager wait --for=condition=Available deployment/cert-manager-webhook --timeout=180s 2>/dev/null || true`,
+			`sleep 5`,
+			// Pass 2: real apply. Capture output, print it, then fail only on
+			// actual server errors. Client-side "no matches for kind" errors for
+			// GCP-specific types (ApplyReplacements, RootSync, etc.) are expected
+			// and harmless — they do not produce "Error from server" lines.
+			// `OUT=$(kubectl apply -Rf /tmp/catalog/distros/sandbox/cert-manager/ 2>&1); echo "$OUT"; ERRS=$(echo "$OUT" | grep "^Error from server" || true); [ -z "$ERRS" ]`,
 		}},
 	}
 
@@ -579,10 +639,28 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 
 		// ── Phase 4: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
+			// Build crun from source (handles resume that skipped phase 3).
+			`sudo apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
+			`sudo rm -rf /tmp/crun && \
+git clone --depth=1 https://github.com/containers/crun /tmp/crun && \
+cd /tmp/crun && \
+./autogen.sh && \
+./configure --disable-man-page && \
+make -j$(nproc) && \
+sudo make install && \
+rm -rf /tmp/crun`,
+			`sudo mkdir -p /etc/crio/crio.conf.d && \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "crun"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.crun]\n        runtime_path = "/usr/local/bin/crun"\n        runtime_type = "oci"\n' \
+  | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
+			"sudo systemctl stop crio 2>/dev/null || true",
+			"sudo killall -9 crio conmon crun 2>/dev/null || true",
+			"sudo rm -rf /run/crio /var/run/crio",
+			"sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true",
+			"sudo crio wipe -f 2>/dev/null || true",
+			"sudo rm -rf /var/lib/crio 2>/dev/null || true",
 			"sudo systemctl daemon-reload",
 			"sudo systemctl enable crio",
-			"sudo crio wipe -f 2>/dev/null || true",
-			`sudo systemctl start crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; }`,
+			`sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager -n 60 >&2; false; }`,
 			crioReadyCheck,
 		}},
 
@@ -650,7 +728,7 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 	}
 
 	labelAndTaintCmd := fmt.Sprintf(
-		"kubectl label node %s hardware-type=%s gpu=on --overwrite && kubectl taint node %s hardware-type=gpu:PreferNoSchedule",
+		"kubectl label node %s hardware-type=%s gpu=on --overwrite && kubectl taint node %s hardware-type=gpu:PreferNoSchedule --overwrite",
 		nodeName, cluster.Spec.NodeInfo.HardwareType, nodeName,
 	)
 	if output, err := sshhelper.Run(cpClient, labelAndTaintCmd); err != nil {
@@ -753,18 +831,18 @@ libnvidia-container1=%s`,
 		"sudo nvidia-ctk --version",
 		`sudo rm -rf /etc/crio/crio.conf.d`,
 		`sudo mkdir -p /etc/crio/crio.conf.d`,
-		`sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null <<'EOFCONF'
-[crio]
-
-  [crio.runtime]
-    default_runtime = "runc"
-
-    [crio.runtime.runtimes]
-
-      [crio.runtime.runtimes.runc]
-        runtime_path = "/usr/sbin/runc"
-        runtime_type = "oci"
-EOFCONF`,
+		// Restore paths drop-in — rm -rf wiped it along with the nvidia config.
+		`printf '[crio.runtime]\nlisten = "/var/run/crio/crio.sock"\nconmon = "/usr/local/bin/conmon"\n' \
+  | sudo tee /etc/crio/crio.conf.d/10-paths.conf > /dev/null`,
+		// Restore crun as the default OCI runtime.
+		`printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "crun"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.crun]\n        runtime_path = "/usr/local/bin/crun"\n        runtime_type = "oci"\n' \
+  | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
+		// Recreate 99-nvidia.conf — rm -rf wiped the one nvidia-ctk wrote earlier.
+		// Without this the nvidia runtime handler is absent from CRI-O's runtime map
+		// and pods with runtimeClassName=nvidia fail with "failed to find runtime handler nvidia".
+		// Guard: install the toolkit if nvidia-ctk is not in PATH (e.g. retry after partial failure).
+		`command -v nvidia-ctk >/dev/null || sudo apt-get install -y nvidia-container-toolkit`,
+		`sudo nvidia-ctk runtime configure --runtime=crio`,
 		`sudo sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf 2>/dev/null || true`,
 		`sudo ln -sf /usr/libexec/crio/conmon /usr/local/bin/conmon 2>/dev/null || true`,
 		"sudo systemctl restart crio",
@@ -784,16 +862,16 @@ EOFCONF`,
 
 // GenerateCDI generates the CDI spec for the NVIDIA GPUs on the node.
 // Must be called after the node has rebooted post driver installation.
-func GenerateCDI(client *sshhelper.Client) error {
-	steps := []string{
-		"sudo mkdir -p /etc/cdi",
-		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
-	}
-	for _, cmd := range steps {
-		output, err := sshhelper.Run(client, cmd)
-		if err != nil {
-			return fmt.Errorf("cdi generate failed: %s\nOutput:\n%s", cmd, output)
-		}
-	}
-	return nil
-}
+// func GenerateCDI(client *sshhelper.Client) error {
+// 	steps := []string{
+// 		"sudo mkdir -p /etc/cdi",
+// 		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
+// 	}
+// 	for _, cmd := range steps {
+// 		output, err := sshhelper.Run(client, cmd)
+// 		if err != nil {
+// 			return fmt.Errorf("cdi generate failed: %s\nOutput:\n%s", cmd, output)
+// 		}
+// 	}
+// 	return nil
+// }

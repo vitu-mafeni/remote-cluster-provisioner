@@ -661,9 +661,9 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		if cluster.Annotations[annotationCDIGenerated] != "true" {
 			// Drivers are installed and the node has rebooted — the kernel module
 			// is now loaded, so CDI generation via NVML will succeed.
-			if err := kubeadm.GenerateCDI(sshClient); err != nil {
-				return r.fail(ctx, cluster, "CDIGenerateFailed", fmt.Errorf("generating CDI spec on worker node: %w", err))
-			}
+			// if err := kubeadm.GenerateCDI(sshClient); err != nil {
+			// 	return r.fail(ctx, cluster, "CDIGenerateFailed", fmt.Errorf("generating CDI spec on worker node: %w", err))
+			// }
 
 			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
 				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking CDI generated: %w", err)

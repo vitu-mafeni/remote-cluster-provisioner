@@ -122,4 +122,4 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: "CHANGE ME TO YOUR DOCKERHUB PASSWORD"
+  password: CHANGE ME TO YOUR DOCKERHUB PASSWORD
