@@ -755,7 +755,7 @@ func GetTunIP(client *sshhelper.Client) (string, error) {
 // InstallNvidiaContainerToolkit installs the NVIDIA container toolkit on a GPU node
 // and configures CRI-O to use it. This should be called after JoinWorkerNode for
 // nodes where cluster.Spec.NodeInfo.HardwareType == "gpu".
-func InstallNvidiaContainerToolkit1(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
+func InstallNvidiaContainerToolkit(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
 	if !strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 		log.Printf("Skipping NVIDIA container toolkit install — node %s is not a GPU node", cluster.Spec.Host)
 		return nil
@@ -765,22 +765,34 @@ func InstallNvidiaContainerToolkit1(client *sshhelper.Client, cluster *infrav1.R
 
 	nvidiaToolkitVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
 
+	var toolkitInstallCmd string
+	if nvidiaToolkitVersion == "" {
+		toolkitInstallCmd = `sudo apt-get install --allow-downgrades -y \
+nvidia-container-toolkit \
+nvidia-container-toolkit-base \
+libnvidia-container-tools \
+libnvidia-container1`
+	} else {
+		toolkitInstallCmd = fmt.Sprintf(`sudo apt-get install --allow-downgrades -y \
+nvidia-container-toolkit=%s \
+nvidia-container-toolkit-base=%s \
+libnvidia-container-tools=%s \
+libnvidia-container1=%s`,
+			nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion)
+	}
+
 	steps := []string{
 		"sudo apt-get update",
 		"sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
-		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
+		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
 		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
 sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
 sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
 		"sudo sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list",
 		"sudo apt-get update",
-		fmt.Sprintf(`sudo apt-get install --allow-downgrades -y \
-nvidia-container-toolkit=%s \
-nvidia-container-toolkit-base=%s \
-libnvidia-container-tools=%s \
-libnvidia-container1=%s`,
-			nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion),
+		toolkitInstallCmd,
 		"sudo nvidia-ctk runtime configure --runtime=crio",
+		`sudo sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf 2>/dev/null || true`,
 		"sudo systemctl restart crio",
 		"sudo nvidia-ctk --version",
 	}

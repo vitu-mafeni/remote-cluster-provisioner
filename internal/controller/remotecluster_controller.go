@@ -536,6 +536,26 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("listing RemoteClusters: %w", err)
 	}
+
+	// Sync VPN server config from the control-plane onto the worker CR so that
+	// handleDelete can call removeVPNPeer using only cluster.Spec.VPNConfig.
+	// Worker CRs carry the node's own VPN IP but not the server credentials.
+	if clusterParent != nil &&
+		cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" &&
+		clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("refreshing worker before VPN config sync: %w", err)
+		}
+		cluster.Spec.VPNConfig.VPNServerPublicIP = clusterParent.Spec.VPNConfig.VPNServerPublicIP
+		cluster.Spec.VPNConfig.VPNServerSSHPort = clusterParent.Spec.VPNConfig.VPNServerSSHPort
+		cluster.Spec.VPNConfig.VPNServerSSHUsername = clusterParent.Spec.VPNConfig.VPNServerSSHUsername
+		cluster.Spec.VPNConfig.VPNSSHCredentialsRef = clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef
+		if err := r.Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("syncing VPN server config from control-plane: %w", err)
+		}
+		log.Info("Synced VPN server config from control-plane", "cp", clusterParent.Name)
+	}
+
 	if cluster.Annotations[annotationWorkerJoined] != "true" {
 
 		if clusterParent == nil {
@@ -623,9 +643,9 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
 		}
 		if cluster.Annotations[annotationNvidiaInstalled] != "true" {
-			// if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster, clusterParent); err != nil {
-			// 	return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
-			// }
+			if err := kubeadm.InstallNvidiaContainerToolkit(sshClient, cluster, clusterParent); err != nil {
+				return r.fail(ctx, cluster, "NvidiaToolkitInstallFailed", fmt.Errorf("installing NVIDIA container toolkit on worker node: %w", err))
+			}
 
 			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
 				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking NVIDIA installed: %w", err)
@@ -635,27 +655,8 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 				return ctrl.Result{}, fmt.Errorf("marking NVIDIA as installed: %w", err)
 			}
 
-			log.Info("NVIDIA drivers installed; rebooting node — will reconnect after postRebootWait",
-				"wait", postRebootWait)
-			// Open a *dedicated* SSH connection for the reboot so it doesn't race
-			// with the defer that closes the shared sshClient when this function
-			// returns.  Using the shared connection caused the reboot to silently
-			// no-op when the defer fired before the goroutine ran NewSession().
-			rebootLog := log
-			go func() {
-				rebootCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				rebootClient, err := r.getSSHClient(rebootCtx, cluster)
-				if err != nil {
-					rebootLog.Error(err, "Could not open SSH connection for reboot — node may not reboot")
-					return
-				}
-				defer rebootClient.Conn.Close()
-				// Error is ignored: the connection resets when the node starts
-				// rebooting, which looks like a failure to ssh.Run.
-				// _, _ = ssh.Run(rebootClient, "sudo reboot")
-			}()
-			return ctrl.Result{RequeueAfter: postRebootWait}, nil
+			log.Info("NVIDIA container toolkit installed and CRI-O restarted with nvidia runtime handler")
+			return ctrl.Result{Requeue: true}, nil
 		}
 
 		if cluster.Annotations[annotationCDIGenerated] != "true" {
@@ -1863,6 +1864,12 @@ sudo apt-get purge -y kubelet kubeadm kubectl 2>/dev/null || true
 
 # Purge CRI-O and related container runtime packages.
 sudo apt-get purge -y cri-o criu crun conmon 2>/dev/null || true
+
+# Purge NVIDIA container toolkit packages installed by InstallNvidiaContainerToolkit.
+sudo apt-get purge -y nvidia-container-toolkit nvidia-container-toolkit-base \
+  libnvidia-container-tools libnvidia-container1 2>/dev/null || true
+sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list 2>/dev/null || true
+sudo rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || true
 
 # Remove Kubernetes state directories.
 sudo rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd 2>/dev/null || true
