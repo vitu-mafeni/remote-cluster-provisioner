@@ -105,10 +105,6 @@ const (
 	annotationPkgVariantsCreated = "infra.dcn.ssu.ac.kr/package-variants-created"
 	// annotationWorkerJoined marks that this worker has already successfully joined its cluster.
 	annotationWorkerJoined = "infra.dcn.ssu.ac.kr/worker-joined"
-	// annotationNvidiaInstalled marks that NVIDIA drivers have been installed on this node.
-	annotationNvidiaInstalled = "infra.dcn.ssu.ac.kr/nvidia-installed"
-	// annotationCDIGenerated marks that the CDI spec has been generated after the post-driver reboot.
-	annotationCDIGenerated = "infra.dcn.ssu.ac.kr/nvidia-cdi-generated"
 	// annotationImagesPrepulled marks that all images in spec.nodeInfo.softwareConfig.imagePrepulls
 	// have been successfully pulled on the worker node.
 	annotationImagesPrepulled = "infra.dcn.ssu.ac.kr/images-prepulled"
@@ -266,44 +262,28 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 			return r.reconcilePackageVariants(ctx, cluster)
 		}
-		// GPU worker: join sets phase=Ready before CDI generation and image
-		// pre-pull are complete.  The reconcile that fires after the post-reboot
-		// wait lands here, so we must run those steps.
-		//
-		// We open SSH and call reconcileWorker directly rather than going through
-		// reconcileProvisioning: that function resets phase→Provisioning before
-		// calling reconcileWorker, which is unnecessary status churn for a worker
-		// that is already in Ready state and only needs GPU post-processing.
+		// GPU worker: image pre-pull runs after join. Driver and toolkit are
+		// managed by GPU Operator; the provisioner only pre-pulls large GPU images.
 		if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") &&
-			(cluster.Annotations[annotationCDIGenerated] != "true" ||
-				cluster.Annotations[annotationImagesPrepulled] != "true") {
-			// If an image pre-pull goroutine is already running, skip the SSH
-			// connection entirely and just poll the result channel directly.
-			// Opening SSH on every 30s requeue is wasteful and generates noisy logs.
-			if cluster.Annotations[annotationCDIGenerated] == "true" {
-				key := cluster.Namespace + "/" + cluster.Name
-				if _, running := r.prepullJobs.Load(key); running {
-					return r.reconcileImagePrepull(ctx, cluster, cluster)
-				}
+			cluster.Annotations[annotationImagesPrepulled] != "true" {
+			// If an image pre-pull goroutine is already running, poll its result
+			// directly instead of opening a new SSH connection.
+			key := cluster.Namespace + "/" + cluster.Name
+			if _, running := r.prepullJobs.Load(key); running {
+				return r.reconcileImagePrepull(ctx, cluster, cluster)
 			}
 			sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
 			defer cancel()
 			sshClient, err := r.getSSHClient(sshCtx, cluster)
 			if err != nil {
-				// SSH failure here is likely the node still booting after the
-				// NVIDIA driver reboot.  Requeue and retry rather than failing
-				// the cluster — the node will be reachable once it finishes
-				// coming up, regardless of whether that takes more or less than
-				// postRebootWait.
-				log.Info("SSH not yet reachable for GPU post-processing — node may still be rebooting, retrying",
-					"err", err)
+				log.Info("SSH not yet reachable for GPU image pre-pull — retrying", "err", err)
 				return ctrl.Result{RequeueAfter: postRebootWait}, nil
 			}
 			defer func() { _ = sshClient.Conn.Close() }()
 			return r.reconcileWorker(sshCtx, cluster, sshClient)
 		}
 		if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
-			log.Info("GPU worker fully ready — CDI and image pre-pull already complete")
+			log.Info("GPU worker fully ready — image pre-pull already complete")
 		}
 		return ctrl.Result{}, nil
 	case phaseFailed:
@@ -636,47 +616,15 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		log.Info("Worker already joined; skipping join step")
 	}
 
-	// ── GPU: driver installation → reboot → CDI generation ──────────────────
+	// ── GPU: image pre-pull ──────────────────────────────────────────────────
+	// The NVIDIA driver and container toolkit are managed entirely by GPU Operator
+	// (driver daemonset + toolkit daemonset with CDI mode). The provisioner only
+	// needs to pre-pull large GPU images; CRI-O was already configured for CDI
+	// in Phase 6 before the node joined.
 	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 		if clusterParent == nil {
-			log.Error(fmt.Errorf("control-plane not found"), "Cannot proceed with GPU post-processing — control-plane RemoteCluster missing; requeueing")
+			log.Error(fmt.Errorf("control-plane not found"), "Cannot proceed with GPU image pre-pull — control-plane RemoteCluster missing; requeueing")
 			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
-		}
-		if cluster.Annotations[annotationNvidiaInstalled] != "true" {
-			if err := kubeadm.InstallNvidiaContainerToolkit(sshClient, cluster, clusterParent); err != nil {
-				return r.fail(ctx, cluster, "NvidiaToolkitInstallFailed", fmt.Errorf("installing NVIDIA container toolkit on worker node: %w", err))
-			}
-
-			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking NVIDIA installed: %w", err)
-			}
-			ensureAnnotations(cluster)[annotationNvidiaInstalled] = "true"
-			if err := r.Update(ctx, cluster); err != nil {
-				return ctrl.Result{}, fmt.Errorf("marking NVIDIA as installed: %w", err)
-			}
-
-			log.Info("NVIDIA container toolkit installed and CRI-O restarted with nvidia runtime handler")
-			return ctrl.Result{Requeue: true}, nil
-		}
-
-		if cluster.Annotations[annotationCDIGenerated] != "true" {
-			// Drivers are installed and the node has rebooted — the kernel module
-			// is now loaded, so CDI generation via NVML will succeed.
-			// if err := kubeadm.GenerateCDI(sshClient); err != nil {
-			// 	return r.fail(ctx, cluster, "CDIGenerateFailed", fmt.Errorf("generating CDI spec on worker node: %w", err))
-			// }
-
-			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking CDI generated: %w", err)
-			}
-			ensureAnnotations(cluster)[annotationCDIGenerated] = "true"
-			if err := r.Update(ctx, cluster); err != nil {
-				return ctrl.Result{}, fmt.Errorf("marking CDI as generated: %w", err)
-			}
-			log.Info("CDI spec generated successfully — continuing to image pre-pull")
-			// Explicit requeue: the annotation update does not change generation so
-			// GenerationChangedPredicate would otherwise drop the watch event.
-			return ctrl.Result{Requeue: true}, nil
 		}
 
 		// ── Image pre-pull (GPU nodes only) ──────────────────────────────────

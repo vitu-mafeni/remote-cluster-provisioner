@@ -874,16 +874,16 @@ libnvidia-container1=%s`,
 
 // GenerateCDI generates the CDI spec for the NVIDIA GPUs on the node.
 // Must be called after the node has rebooted post driver installation.
-// func GenerateCDI(client *sshhelper.Client) error {
-// 	steps := []string{
-// 		"sudo mkdir -p /etc/cdi",
-// 		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
-// 	}
-// 	for _, cmd := range steps {
-// 		output, err := sshhelper.Run(client, cmd)
-// 		if err != nil {
-// 			return fmt.Errorf("cdi generate failed: %s\nOutput:\n%s", cmd, output)
-// 		}
-// 	}
-// 	return nil
-// }
+func GenerateCDI(client *sshhelper.Client) error {
+	steps := []string{
+		"sudo mkdir -p /etc/cdi",
+		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
+	}
+	for _, cmd := range steps {
+		output, err := sshhelper.Run(client, cmd)
+		if err != nil {
+			return fmt.Errorf("cdi generate failed: %s\nOutput:\n%s", cmd, output)
+		}
+	}
+	return nil
+}
