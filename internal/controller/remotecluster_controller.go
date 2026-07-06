@@ -45,6 +45,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 	"dcn.ssu.ac.kr/infra/pkg/ssh"
@@ -128,6 +129,13 @@ const (
 	// re-runs the step if missing, recovering clusters that reached Ready before the
 	// NodeProvisionNetConfig was created.
 	annotationNodeProvisionCreated = "infra.dcn.ssu.ac.kr/node-provision-created"
+	// annotationJoinTokenRefreshedAt records the RFC3339 timestamp of the last
+	// successful kubeadm token refresh so the controller knows when to renew again.
+	annotationJoinTokenRefreshedAt = "infra.dcn.ssu.ac.kr/join-token-refreshed-at"
+
+	// tokenRefreshInterval is how often to rotate the kubeadm bootstrap token.
+	// kubeadm tokens expire after 24 h by default; refresh 1 h before expiry.
+	tokenRefreshInterval = 23 * time.Hour
 
 	phaseProvisioning = "Provisioning"
 	phaseReady        = "Ready"
@@ -256,9 +264,30 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 					log.Error(patchErr, "Failed to stamp node-provision-created annotation")
 				}
 			}
+
+			// Periodically refresh the kubeadm bootstrap token so NodeProvision
+			// controllers always have a valid join command.
+			if needsTokenRefresh(cluster) {
+				if result, err := r.refreshJoinToken(ctx, cluster); err != nil {
+					log.Error(err, "refreshing join token (non-fatal); will retry next requeue")
+				} else if result.RequeueAfter > 0 {
+					return result, nil
+				}
+			} else {
+				// Requeue so we come back to refresh before the token expires.
+				if ts, ok := cluster.Annotations[annotationJoinTokenRefreshedAt]; ok {
+					if t, err := time.Parse(time.RFC3339, ts); err == nil {
+						remaining := tokenRefreshInterval - time.Since(t)
+						if remaining > 0 {
+							return ctrl.Result{RequeueAfter: remaining}, nil
+						}
+					}
+				}
+			}
+
 			if cluster.Annotations[annotationPkgVariantsCreated] == "true" {
 				log.Info("Cluster fully ready — no action required")
-				return ctrl.Result{}, nil
+				return ctrl.Result{RequeueAfter: tokenRefreshInterval}, nil
 			}
 			return r.reconcilePackageVariants(ctx, cluster)
 		}
@@ -1062,6 +1091,11 @@ spec:
 		}
 
 		log.Info("Patched NodeProvisionNetConfig status")
+
+		// Also update the local (management cluster) netconfig so the NodeProvision
+		// controller running here can read the join command without needing to reach
+		// back into the remote cluster.
+		r.patchLocalNetConfig(ctx, cluster, clusterParent.Status.JoinCommand, []string{nodeIP})
 	}
 
 	// ============================================================
@@ -1104,9 +1138,146 @@ kubectl patch nodeprovisionnetconfig %s-netconfig \
 			"nodeIP",
 			nodeIP,
 		)
+
+		// Keep the local netconfig in sync — append the new IP.
+		r.patchLocalNetConfigAppendIP(ctx, cluster, nodeIP)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// needsTokenRefresh returns true when the bootstrap token is absent or due for renewal.
+func needsTokenRefresh(cluster *infrav1.RemoteCluster) bool {
+	if cluster.Status.JoinCommand == "" {
+		return false // no token yet; provisioning hasn't finished
+	}
+	ts, ok := cluster.Annotations[annotationJoinTokenRefreshedAt]
+	if !ok {
+		return true // never refreshed
+	}
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return true
+	}
+	return time.Since(t) >= tokenRefreshInterval
+}
+
+// refreshJoinToken SSHes into the control-plane, creates a new kubeadm bootstrap
+// token, and updates both the RemoteCluster status and the local NodeProvisionNetConfig.
+func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster *infrav1.RemoteCluster) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+	defer cancel()
+	sshClient, err := r.getSSHClient(sshCtx, cluster)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("SSH connect for token refresh: %w", err)
+	}
+	defer func() { _ = sshClient.Conn.Close() }()
+
+	out, err := sshhelper.Run(sshClient, "kubeadm token create --print-join-command 2>/dev/null")
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("kubeadm token create: %w\nOutput: %s", err, out)
+	}
+	newJoinCmd := strings.TrimSpace(out)
+	if newJoinCmd == "" {
+		return ctrl.Result{}, fmt.Errorf("kubeadm token create returned empty output")
+	}
+
+	log.Info("Refreshed kubeadm bootstrap token")
+
+	// Persist the new join command on the RemoteCluster status.
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("refreshing cluster before token status update: %w", err)
+	}
+	cluster.Status.JoinCommand = newJoinCmd
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating RemoteCluster join command: %w", err)
+	}
+
+	// Update the local netconfig so NodeProvision controllers see the new token.
+	// Preserve the existing UsedIPAddresses — only the join command changes.
+	localNC := &mlv1alpha1.NodeProvisionNetConfig{}
+	ncKey := types.NamespacedName{Name: cluster.Spec.ClusterName + "-netconfig", Namespace: cluster.Namespace}
+	existingIPs := []string{}
+	if err := r.Get(ctx, ncKey, localNC); err == nil {
+		existingIPs = localNC.Status.UsedIPAddresses
+	}
+	r.patchLocalNetConfig(ctx, cluster, newJoinCmd, existingIPs)
+
+	// Also patch the remote cluster's netconfig via SSH so nodes local to the
+	// remote cluster get the fresh token too.
+	if err := r.patchRemoteNetConfigJoinCmd(ctx, cluster, sshClient, newJoinCmd); err != nil {
+		log.Error(err, "patching remote netconfig join command (non-fatal)")
+	}
+
+	if patchErr := r.patchAnnotation(ctx, cluster, annotationJoinTokenRefreshedAt, time.Now().UTC().Format(time.RFC3339)); patchErr != nil {
+		log.Error(patchErr, "Failed to stamp join-token-refreshed-at annotation")
+	}
+
+	return ctrl.Result{RequeueAfter: tokenRefreshInterval}, nil
+}
+
+// patchRemoteNetConfigJoinCmd updates only the ClusterJoinCommand field on the
+// remote cluster's NodeProvisionNetConfig via SSH.
+func (r *RemoteClusterReconciler) patchRemoteNetConfigJoinCmd(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *ssh.Client, joinCmd string) error {
+	log := logf.FromContext(ctx)
+	joinCmdJSON, _ := json.Marshal(joinCmd)
+	cmd := fmt.Sprintf(
+		`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status -p '{"status":{"clusterJoinCommand":%s}}'`,
+		cluster.Spec.ClusterName,
+		cluster.Namespace,
+		string(joinCmdJSON),
+	)
+	out, err := sshhelper.Run(sshClient, cmd)
+	if err != nil {
+		return fmt.Errorf("patching remote netconfig join command: %w\nOutput: %s", err, out)
+	}
+	log.Info("Patched remote NodeProvisionNetConfig join command")
+	return nil
+}
+
+// patchLocalNetConfig sets ClusterJoinCommand and UsedIPAddresses on the
+// management-cluster copy of NodeProvisionNetConfig. Non-fatal: errors are
+// only logged so that a failure here doesn't block the rest of reconciliation.
+func (r *RemoteClusterReconciler) patchLocalNetConfig(ctx context.Context, cluster *infrav1.RemoteCluster, joinCmd string, ips []string) {
+	log := logf.FromContext(ctx)
+	nc := &mlv1alpha1.NodeProvisionNetConfig{}
+	key := types.NamespacedName{Name: cluster.Spec.ClusterName + "-netconfig", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, nc); err != nil {
+		log.Info("Local NodeProvisionNetConfig not found; skipping local patch", "name", key.Name)
+		return
+	}
+	patch := client.MergeFrom(nc.DeepCopy())
+	nc.Status.ClusterJoinCommand = joinCmd
+	nc.Status.UsedIPAddresses = ips
+	if err := r.Status().Patch(ctx, nc, patch); err != nil {
+		log.Error(err, "patching local NodeProvisionNetConfig status (non-fatal)")
+	} else {
+		log.Info("Patched local NodeProvisionNetConfig status", "name", key.Name)
+	}
+}
+
+// patchLocalNetConfigAppendIP appends a VPN IP to the local netconfig's
+// UsedIPAddresses, deduplicating before writing.
+func (r *RemoteClusterReconciler) patchLocalNetConfigAppendIP(ctx context.Context, cluster *infrav1.RemoteCluster, ip string) {
+	log := logf.FromContext(ctx)
+	nc := &mlv1alpha1.NodeProvisionNetConfig{}
+	key := types.NamespacedName{Name: cluster.Spec.ClusterName + "-netconfig", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, key, nc); err != nil {
+		log.Info("Local NodeProvisionNetConfig not found; skipping IP append", "name", key.Name)
+		return
+	}
+	for _, existing := range nc.Status.UsedIPAddresses {
+		if existing == ip {
+			return
+		}
+	}
+	patch := client.MergeFrom(nc.DeepCopy())
+	nc.Status.UsedIPAddresses = append(nc.Status.UsedIPAddresses, ip)
+	if err := r.Status().Patch(ctx, nc, patch); err != nil {
+		log.Error(err, "appending IP to local NodeProvisionNetConfig status (non-fatal)")
+	}
 }
 
 // setStatus appends a new progress condition to the cluster status, preserving
@@ -2169,15 +2340,31 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				"approval.nephio.org/policy": "initial",
 			},
 		},
+		// {
+		// 	name: "hami-webui-variant",
+		// 	upstream: packageRef{
+		// 		pkg:      "hami-webui",
+		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+		// 		revision: cluster.Spec.GitConfig.PackageRevision,
+		// 	},
+		// 	downstream: packageRef{
+		// 		pkg:  "hami-webui",
+		// 		repo: cluster.Spec.ClusterName,
+		// 	},
+		// 	annotations: map[string]interface{}{
+		// 		"approval.nephio.org/policy": "initial",
+		// 	},
+		// },
+
 		{
-			name: "hami-webui-variant",
+			name: "stateful-migration-variant",
 			upstream: packageRef{
-				pkg:      "hami-webui",
+				pkg:      "stateful-migration",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
 			downstream: packageRef{
-				pkg:  "hami-webui",
+				pkg:  "stateful-migration",
 				repo: cluster.Spec.ClusterName,
 			},
 			annotations: map[string]interface{}{
