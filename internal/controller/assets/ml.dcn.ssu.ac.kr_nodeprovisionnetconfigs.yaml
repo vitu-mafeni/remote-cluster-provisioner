@@ -109,6 +109,13 @@ spec:
                 description: ClusterJoinCommand is the kubeadm join command for worker
                   nodes.
                 type: string
+              kubeconfig:
+                description: |-
+                  Kubeconfig is the base64-encoded admin kubeconfig for this cluster.
+                  Populated after control-plane init and refreshed locally by the
+                  kubeconfig-refresh systemd timer on the control-plane node so that
+                  the remote cluster can stay self-sufficient without the management cluster.
+                type: string
               usedIPAddresses:
                 items:
                   type: string

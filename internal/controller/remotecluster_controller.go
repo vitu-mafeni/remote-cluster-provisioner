@@ -45,7 +45,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 	"dcn.ssu.ac.kr/infra/pkg/ssh"
@@ -265,29 +264,28 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				}
 			}
 
-			// Periodically refresh the kubeadm bootstrap token so NodeProvision
-			// controllers always have a valid join command.
+			// Refresh the kubeadm bootstrap token when due — best-effort, never
+			// blocks PackageVariant creation.  Always fall through so that a
+			// freshly-Ready cluster reaches reconcilePackageVariants on the same
+			// reconcile that the token is first refreshed.
 			if needsTokenRefresh(cluster) {
-				if result, err := r.refreshJoinToken(ctx, cluster); err != nil {
-					log.Error(err, "refreshing join token (non-fatal); will retry next requeue")
-				} else if result.RequeueAfter > 0 {
-					return result, nil
-				}
-			} else {
-				// Requeue so we come back to refresh before the token expires.
-				if ts, ok := cluster.Annotations[annotationJoinTokenRefreshedAt]; ok {
-					if t, err := time.Parse(time.RFC3339, ts); err == nil {
-						remaining := tokenRefreshInterval - time.Since(t)
-						if remaining > 0 {
-							return ctrl.Result{RequeueAfter: remaining}, nil
-						}
-					}
+				if _, err := r.refreshJoinToken(ctx, cluster); err != nil {
+					log.Error(err, "refreshing join token (non-fatal)")
 				}
 			}
 
 			if cluster.Annotations[annotationPkgVariantsCreated] == "true" {
 				log.Info("Cluster fully ready — no action required")
-				return ctrl.Result{RequeueAfter: tokenRefreshInterval}, nil
+				// Schedule next wakeup for token renewal.
+				requeueAfter := tokenRefreshInterval
+				if ts, ok := cluster.Annotations[annotationJoinTokenRefreshedAt]; ok {
+					if t, err := time.Parse(time.RFC3339, ts); err == nil {
+						if remaining := tokenRefreshInterval - time.Since(t); remaining > 0 {
+							requeueAfter = remaining
+						}
+					}
+				}
+				return ctrl.Result{RequeueAfter: requeueAfter}, nil
 			}
 			return r.reconcilePackageVariants(ctx, cluster)
 		}
@@ -861,31 +859,32 @@ func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig(
 	// ============================================================
 	// Resolve wg0 IP from remote node
 	// ============================================================
+	// For "create" the caller passes the configured VPN IP; verify via SSH so we
+	// get the actual address assigned to wg0 (they should match, but this catches
+	// any misconfiguration early).
+	// For "update" the caller passes the worker's VPN IP (returned by JoinWorkerNode);
+	// do NOT re-resolve via SSH here because sshClient is the control-plane client and
+	// would always return the control-plane's IP, not the worker's.
 
-	output, err := sshhelper.Run(
-		sshClient,
-		"ip -4 addr show wg0 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'",
-	)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf(
-			"getting wg0 ip: %w",
-			err,
+	if action == "create" {
+		output, err := sshhelper.Run(
+			sshClient,
+			"ip -4 addr show wg0 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'",
 		)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("getting wg0 ip: %w", err)
+		}
+		nodeIP = strings.TrimSpace(output)
+		if nodeIP == "" {
+			return ctrl.Result{}, fmt.Errorf("empty wg0 ip")
+		}
 	}
-
-	nodeIP = strings.TrimSpace(output)
 
 	if nodeIP == "" {
-		return ctrl.Result{}, fmt.Errorf(
-			"empty wg0 ip",
-		)
+		return ctrl.Result{}, fmt.Errorf("nodeIP is empty")
 	}
 
-	log.Info(
-		"Resolved wg0 IP",
-		"nodeIP",
-		nodeIP,
-	)
+	log.Info("Resolved wg0 IP", "nodeIP", nodeIP)
 
 	// ============================================================
 	// CREATE
@@ -1072,30 +1071,53 @@ spec:
 
 		log.Info("Created NodeProvisionNetConfig remotely")
 
-		// kubectl apply ignores the status subresource — patch it separately.
+		// kubectl apply ignores the status subresource — patch the static fields
+		// (join command + initial IP) with a single-quoted JSON body so that no
+		// shell variable expansion can corrupt the value.
 		joinCmdJSON, _ := json.Marshal(cluster.Status.JoinCommand)
-		statusPatchCmd := fmt.Sprintf(
-			`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status -p '{"status":{"clusterJoinCommand":%s,"usedIPAddresses":["%s"]}}'`,
+		staticPatchCmd := fmt.Sprintf(
+			`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status `+
+				`-p '{"status":{"clusterJoinCommand":%s,"usedIPAddresses":["%s"]}}'`,
 			cluster.Spec.ClusterName,
 			cluster.Namespace,
 			string(joinCmdJSON),
 			nodeIP,
 		)
-		statusOutput, statusErr := sshhelper.Run(sshClient, statusPatchCmd)
-		if statusErr != nil {
+		staticOutput, staticErr := sshhelper.Run(sshClient, staticPatchCmd)
+		if staticErr != nil {
 			return ctrl.Result{}, fmt.Errorf(
 				"patching NodeProvisionNetConfig status: %w\nOutput:\n%s",
-				statusErr,
-				statusOutput,
+				staticErr,
+				staticOutput,
 			)
+		}
+
+		// Embed the admin kubeconfig in a second patch so the remote cluster can
+		// stay self-sufficient without the management cluster.  Use sudo to read
+		// the root-owned admin.conf; failure here is non-fatal — the refresh
+		// timer installed below will populate it shortly.
+		kcPatchCmd := fmt.Sprintf(
+			`KUBECONFIG_B64=$(sudo cat /etc/kubernetes/admin.conf | base64 -w0 2>/dev/null || `+
+				`sudo cat /etc/kubernetes/admin.conf | base64 | tr -d '\n') && `+
+				`[ -n "$KUBECONFIG_B64" ] && `+
+				`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status `+
+				`-p "{\"status\":{\"kubeconfig\":\"$KUBECONFIG_B64\"}}" || true`,
+			cluster.Spec.ClusterName,
+			cluster.Namespace,
+		)
+		kcOutput, kcErr := sshhelper.Run(sshClient, kcPatchCmd)
+		if kcErr != nil {
+			log.Error(kcErr, "embedding kubeconfig in NetConfig status (non-fatal)", "output", kcOutput)
 		}
 
 		log.Info("Patched NodeProvisionNetConfig status")
 
-		// Also update the local (management cluster) netconfig so the NodeProvision
-		// controller running here can read the join command without needing to reach
-		// back into the remote cluster.
-		r.patchLocalNetConfig(ctx, cluster, clusterParent.Status.JoinCommand, []string{nodeIP})
+		// Deploy the kubeconfig-refresh systemd timer so the remote cluster can
+		// renew its own admin kubeconfig and keep this status field fresh without
+		// any involvement from the management cluster.
+		if err := r.deployKubeconfigRefreshTimer(ctx, cluster, sshClient); err != nil {
+			log.Error(err, "deploying kubeconfig-refresh timer (non-fatal)")
+		}
 	}
 
 	// ============================================================
@@ -1103,44 +1125,34 @@ spec:
 	// ============================================================
 
 	if action == "update" {
-
-		patchCmd := fmt.Sprintf(`
-kubectl patch nodeprovisionnetconfig %s-netconfig \
--n %s \
---type='json' \
--p='[
-  {
-    "op": "add",
-    "path": "/status/usedIPAddresses/-",
-    "value": "%s"
-  }
-]' --subresource=status
+		// Append the worker's VPN IP to usedIPAddresses only if not already present.
+		// Using a shell read-then-write to avoid races and duplicates — the JSON patch
+		// "add to array" op has no native dedup.
+		appendCmd := fmt.Sprintf(`
+NAME="%s-netconfig"; NS="%s"; IP="%s"
+EXISTING=$(kubectl get nodeprovisionnetconfig "$NAME" -n "$NS" \
+  -o jsonpath='{.status.usedIPAddresses[*]}' 2>/dev/null || true)
+for x in $EXISTING; do
+  [ "$x" = "$IP" ] && echo "$IP already in usedIPAddresses, skipping" && exit 0
+done
+kubectl patch nodeprovisionnetconfig "$NAME" -n "$NS" \
+  --type='json' --subresource=status \
+  -p="[{\"op\":\"add\",\"path\":\"/status/usedIPAddresses/-\",\"value\":\"$IP\"}]"
 `,
 			cluster.Spec.ClusterName,
 			cluster.Namespace,
 			nodeIP,
 		)
 
-		output, err := sshhelper.Run(
-			sshClient,
-			patchCmd,
-		)
+		output, err := sshhelper.Run(sshClient, appendCmd)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf(
 				"patching remote NodeProvisionNetConfig: %w\nOutput:\n%s",
-				err,
-				output,
+				err, output,
 			)
 		}
 
-		log.Info(
-			"Updated NodeProvisionNetConfig remotely",
-			"nodeIP",
-			nodeIP,
-		)
-
-		// Keep the local netconfig in sync — append the new IP.
-		r.patchLocalNetConfigAppendIP(ctx, cluster, nodeIP)
+		log.Info("Updated NodeProvisionNetConfig remotely", "nodeIP", nodeIP)
 	}
 
 	return ctrl.Result{}, nil
@@ -1195,20 +1207,13 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 		return ctrl.Result{}, fmt.Errorf("updating RemoteCluster join command: %w", err)
 	}
 
-	// Update the local netconfig so NodeProvision controllers see the new token.
-	// Preserve the existing UsedIPAddresses — only the join command changes.
-	localNC := &mlv1alpha1.NodeProvisionNetConfig{}
-	ncKey := types.NamespacedName{Name: cluster.Spec.ClusterName + "-netconfig", Namespace: cluster.Namespace}
-	existingIPs := []string{}
-	if err := r.Get(ctx, ncKey, localNC); err == nil {
-		existingIPs = localNC.Status.UsedIPAddresses
-	}
-	r.patchLocalNetConfig(ctx, cluster, newJoinCmd, existingIPs)
-
-	// Also patch the remote cluster's netconfig via SSH so nodes local to the
-	// remote cluster get the fresh token too.
+	// Patch the remote cluster's netconfig so NodeProvision controllers running
+	// on the remote cluster see the refreshed token and the latest kubeconfig.
 	if err := r.patchRemoteNetConfigJoinCmd(ctx, cluster, sshClient, newJoinCmd); err != nil {
 		log.Error(err, "patching remote netconfig join command (non-fatal)")
+	}
+	if err := r.patchRemoteNetConfigKubeconfig(ctx, cluster, sshClient); err != nil {
+		log.Error(err, "patching remote netconfig kubeconfig (non-fatal)")
 	}
 
 	if patchErr := r.patchAnnotation(ctx, cluster, annotationJoinTokenRefreshedAt, time.Now().UTC().Format(time.RFC3339)); patchErr != nil {
@@ -1216,6 +1221,97 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 	}
 
 	return ctrl.Result{RequeueAfter: tokenRefreshInterval}, nil
+}
+
+// deployKubeconfigRefreshTimer installs a systemd service + timer on the
+// control-plane node that periodically runs `kubeadm certs renew admin.conf`
+// and patches the NodeProvisionNetConfig status kubeconfig field.  The timer
+// fires every 30 days so certs are renewed well before the 1-year expiry.
+// Once installed it operates entirely locally — no management-cluster contact.
+func (r *RemoteClusterReconciler) deployKubeconfigRefreshTimer(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *ssh.Client) error {
+	log := logf.FromContext(ctx)
+
+	clusterName := cluster.Spec.ClusterName
+	namespace := cluster.Namespace
+
+	// Shell script that renews certs and patches the netconfig status.
+	script := fmt.Sprintf(`#!/bin/bash
+set -euo pipefail
+
+# Renew the admin client certificate (no-op if not yet close to expiry).
+kubeadm certs renew admin.conf
+
+# Propagate the renewed kubeconfig to the standard location.
+cp -f /etc/kubernetes/admin.conf "$HOME/.kube/config" 2>/dev/null || true
+
+# Discover the netconfig name and namespace.
+NETCONFIG_NAME="%s-netconfig"
+NAMESPACE="%s"
+
+# Base64-encode the fresh kubeconfig (GNU and BSD base64 compatible).
+KUBECONFIG_B64=$(base64 -w0 /etc/kubernetes/admin.conf 2>/dev/null || \
+                 base64 /etc/kubernetes/admin.conf | tr -d '\n')
+
+# Patch the NodeProvisionNetConfig status.
+kubectl patch nodeprovisionnetconfig "$NETCONFIG_NAME" -n "$NAMESPACE" \
+  --type=merge --subresource=status \
+  -p "{\"status\":{\"kubeconfig\":\"$KUBECONFIG_B64\"}}"
+
+echo "kubeconfig-refresh: done"
+`, clusterName, namespace)
+
+	serviceUnit := `[Unit]
+Description=Renew kubeadm admin kubeconfig and update NodeProvisionNetConfig
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kubeconfig-refresh.sh
+StandardOutput=journal
+StandardError=journal
+`
+
+	timerUnit := `[Unit]
+Description=Periodic kubeconfig renewal (every 30 days)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30d
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+`
+
+	installCmd := fmt.Sprintf(`
+set -e
+# Write the refresh script.
+sudo tee /usr/local/bin/kubeconfig-refresh.sh > /dev/null <<'SCRIPT'
+%s
+SCRIPT
+sudo chmod 0755 /usr/local/bin/kubeconfig-refresh.sh
+
+# Write the systemd service unit.
+sudo tee /etc/systemd/system/kubeconfig-refresh.service > /dev/null <<'SERVICE'
+%s
+SERVICE
+
+# Write the systemd timer unit.
+sudo tee /etc/systemd/system/kubeconfig-refresh.timer > /dev/null <<'TIMER'
+%s
+TIMER
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now kubeconfig-refresh.timer
+echo "kubeconfig-refresh timer enabled"
+`, script, serviceUnit, timerUnit)
+
+	out, err := sshhelper.Run(sshClient, installCmd)
+	if err != nil {
+		return fmt.Errorf("installing kubeconfig-refresh timer: %w\nOutput: %s", err, out)
+	}
+	log.Info("kubeconfig-refresh timer deployed on control-plane", "cluster", clusterName)
+	return nil
 }
 
 // patchRemoteNetConfigJoinCmd updates only the ClusterJoinCommand field on the
@@ -1237,47 +1333,30 @@ func (r *RemoteClusterReconciler) patchRemoteNetConfigJoinCmd(ctx context.Contex
 	return nil
 }
 
-// patchLocalNetConfig sets ClusterJoinCommand and UsedIPAddresses on the
-// management-cluster copy of NodeProvisionNetConfig. Non-fatal: errors are
-// only logged so that a failure here doesn't block the rest of reconciliation.
-func (r *RemoteClusterReconciler) patchLocalNetConfig(ctx context.Context, cluster *infrav1.RemoteCluster, joinCmd string, ips []string) {
+// patchRemoteNetConfigKubeconfig reads /etc/kubernetes/admin.conf on the
+// control-plane node and patches the kubeconfig status field.  Called both
+// during initial setup and during token refresh so the stored kubeconfig
+// stays current when the management cluster is connected.
+func (r *RemoteClusterReconciler) patchRemoteNetConfigKubeconfig(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *ssh.Client) error {
 	log := logf.FromContext(ctx)
-	nc := &mlv1alpha1.NodeProvisionNetConfig{}
-	key := types.NamespacedName{Name: cluster.Spec.ClusterName + "-netconfig", Namespace: cluster.Namespace}
-	if err := r.Get(ctx, key, nc); err != nil {
-		log.Info("Local NodeProvisionNetConfig not found; skipping local patch", "name", key.Name)
-		return
+	// Use sudo cat to read the root-owned admin.conf (mode 600).
+	// Guard with [ -n ] so kubectl never runs with an empty variable.
+	cmd := fmt.Sprintf(
+		`KUBECONFIG_B64=$(sudo cat /etc/kubernetes/admin.conf | base64 -w0 2>/dev/null || `+
+			`sudo cat /etc/kubernetes/admin.conf | base64 | tr -d '\n') && `+
+			`[ -n "$KUBECONFIG_B64" ] && `+
+			`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s `+
+			`--type=merge --subresource=status `+
+			`-p "{\"status\":{\"kubeconfig\":\"$KUBECONFIG_B64\"}}"`,
+		cluster.Spec.ClusterName,
+		cluster.Namespace,
+	)
+	out, err := sshhelper.Run(sshClient, cmd)
+	if err != nil {
+		return fmt.Errorf("patching remote netconfig kubeconfig: %w\nOutput: %s", err, out)
 	}
-	patch := client.MergeFrom(nc.DeepCopy())
-	nc.Status.ClusterJoinCommand = joinCmd
-	nc.Status.UsedIPAddresses = ips
-	if err := r.Status().Patch(ctx, nc, patch); err != nil {
-		log.Error(err, "patching local NodeProvisionNetConfig status (non-fatal)")
-	} else {
-		log.Info("Patched local NodeProvisionNetConfig status", "name", key.Name)
-	}
-}
-
-// patchLocalNetConfigAppendIP appends a VPN IP to the local netconfig's
-// UsedIPAddresses, deduplicating before writing.
-func (r *RemoteClusterReconciler) patchLocalNetConfigAppendIP(ctx context.Context, cluster *infrav1.RemoteCluster, ip string) {
-	log := logf.FromContext(ctx)
-	nc := &mlv1alpha1.NodeProvisionNetConfig{}
-	key := types.NamespacedName{Name: cluster.Spec.ClusterName + "-netconfig", Namespace: cluster.Namespace}
-	if err := r.Get(ctx, key, nc); err != nil {
-		log.Info("Local NodeProvisionNetConfig not found; skipping IP append", "name", key.Name)
-		return
-	}
-	for _, existing := range nc.Status.UsedIPAddresses {
-		if existing == ip {
-			return
-		}
-	}
-	patch := client.MergeFrom(nc.DeepCopy())
-	nc.Status.UsedIPAddresses = append(nc.Status.UsedIPAddresses, ip)
-	if err := r.Status().Patch(ctx, nc, patch); err != nil {
-		log.Error(err, "appending IP to local NodeProvisionNetConfig status (non-fatal)")
-	}
+	log.Info("Patched remote NodeProvisionNetConfig kubeconfig")
+	return nil
 }
 
 // setStatus appends a new progress condition to the cluster status, preserving

@@ -1501,27 +1501,41 @@ sudo mv /etc/wireguard/wg0.conf.tmp /etc/wireguard/wg0.conf 2>/dev/null || true`
 	// ── 6. Release IP and peer entry from NetConfig status ───────────────────
 	// Done AFTER the server removal so a retry still has the peer key available
 	// if the server step fails and the controller restarts.
-	newPeers := make([]mlv1alpha1.VPNPeerStatus, 0, len(netConfig.Status.VPNPeers))
-	for _, p := range netConfig.Status.VPNPeers {
-		if p.NodeName == np.Name || p.VPNIP == vpnIP {
-			continue
+	// Retry on conflict: a concurrent SSH-based update (RemoteCluster controller
+	// adding another worker's IP) must not prevent cleanup from completing.
+	ncKey := types.NamespacedName{Name: netConfig.Name, Namespace: netConfig.Namespace}
+	for attempt := 0; attempt < 5; attempt++ {
+		if err := r.Get(ctx, ncKey, netConfig); err != nil {
+			return fmt.Errorf("re-fetching NetConfig for IP release: %w", err)
 		}
-		newPeers = append(newPeers, p)
-	}
-	newIPs := make([]string, 0, len(netConfig.Status.UsedIPAddresses))
-	for _, ip := range netConfig.Status.UsedIPAddresses {
-		if vpnIP != "" && ip == vpnIP {
-			continue
-		}
-		newIPs = append(newIPs, ip)
-	}
-	netConfig.Status.VPNPeers = newPeers
-	netConfig.Status.UsedIPAddresses = newIPs
-	if err := r.Status().Update(ctx, netConfig); err != nil {
-		return fmt.Errorf("updating NodeProvisionNetConfig status after VPN peer removal: %w", err)
-	}
+		base := netConfig.DeepCopy()
 
-	return nil
+		newPeers := make([]mlv1alpha1.VPNPeerStatus, 0, len(netConfig.Status.VPNPeers))
+		for _, p := range netConfig.Status.VPNPeers {
+			if p.NodeName == np.Name || p.VPNIP == vpnIP {
+				continue
+			}
+			newPeers = append(newPeers, p)
+		}
+		newIPs := make([]string, 0, len(netConfig.Status.UsedIPAddresses))
+		for _, ip := range netConfig.Status.UsedIPAddresses {
+			if vpnIP != "" && ip == vpnIP {
+				continue
+			}
+			newIPs = append(newIPs, ip)
+		}
+		netConfig.Status.VPNPeers = newPeers
+		netConfig.Status.UsedIPAddresses = newIPs
+
+		if err := r.Status().Patch(ctx, netConfig, client.MergeFrom(base)); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return fmt.Errorf("patching NodeProvisionNetConfig after VPN peer removal: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("releasing NetConfig IP: too many conflicts")
 }
 
 // cleanupOnPremNode SSHes into the physical node (best-effort) and reverses
@@ -1699,45 +1713,62 @@ func (r *NodeProvisionReconciler) getVPNServerSSHClient(ctx context.Context, net
 
 // updateNetConfigStatus records the newly allocated VPN IP and WireGuard peer.
 // Idempotent: duplicate entries are skipped.
+// Retries on conflict so a concurrent SSH-based update (from the RemoteCluster
+// controller) never causes the IP to be silently dropped.
 func (r *NodeProvisionReconciler) updateNetConfigStatus(
 	ctx context.Context,
 	netConfig *mlv1alpha1.NodeProvisionNetConfig,
 	vpnIP, publicKey, nodeName string,
 ) error {
-	updated := false
-
-	ipExists := false
-	for _, ip := range netConfig.Status.UsedIPAddresses {
-		if ip == vpnIP {
-			ipExists = true
-			break
+	key := types.NamespacedName{Name: netConfig.Name, Namespace: netConfig.Namespace}
+	for attempt := 0; attempt < 5; attempt++ {
+		// Re-fetch on every attempt so we always patch against the latest version.
+		if err := r.Get(ctx, key, netConfig); err != nil {
+			return fmt.Errorf("fetching NetConfig for IP record: %w", err)
 		}
-	}
-	if !ipExists {
-		netConfig.Status.UsedIPAddresses = append(netConfig.Status.UsedIPAddresses, vpnIP)
-		updated = true
-	}
+		base := netConfig.DeepCopy()
 
-	peerExists := false
-	for _, p := range netConfig.Status.VPNPeers {
-		if p.PublicKey == publicKey || p.VPNIP == vpnIP {
-			peerExists = true
-			break
+		ipExists := false
+		for _, ip := range netConfig.Status.UsedIPAddresses {
+			if ip == vpnIP {
+				ipExists = true
+				break
+			}
 		}
-	}
-	if !peerExists {
-		netConfig.Status.VPNPeers = append(netConfig.Status.VPNPeers, mlv1alpha1.VPNPeerStatus{
-			NodeName:  nodeName,
-			PublicKey: publicKey,
-			VPNIP:     vpnIP,
-		})
-		updated = true
-	}
+		if !ipExists {
+			netConfig.Status.UsedIPAddresses = append(netConfig.Status.UsedIPAddresses, vpnIP)
+		}
 
-	if !updated {
+		peerExists := false
+		for _, p := range netConfig.Status.VPNPeers {
+			if p.PublicKey == publicKey || p.VPNIP == vpnIP {
+				peerExists = true
+				break
+			}
+		}
+		if !peerExists {
+			netConfig.Status.VPNPeers = append(netConfig.Status.VPNPeers, mlv1alpha1.VPNPeerStatus{
+				NodeName:  nodeName,
+				PublicKey: publicKey,
+				VPNIP:     vpnIP,
+			})
+		}
+
+		if ipExists && peerExists {
+			return nil // nothing to write
+		}
+
+		// Patch only the changed fields — won't clobber ClusterJoinCommand,
+		// Kubeconfig, or IPs added by a concurrent SSH-based update.
+		if err := r.Status().Patch(ctx, netConfig, client.MergeFrom(base)); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return fmt.Errorf("patching NetConfig IP/peer record: %w", err)
+		}
 		return nil
 	}
-	return r.Status().Update(ctx, netConfig)
+	return fmt.Errorf("updating NetConfig IP record: too many conflicts")
 }
 
 // setPhaseStatus updates the in-memory phase, message, and progress fields.
