@@ -105,10 +105,6 @@ const (
 	annotationPkgVariantsCreated = "infra.dcn.ssu.ac.kr/package-variants-created"
 	// annotationWorkerJoined marks that this worker has already successfully joined its cluster.
 	annotationWorkerJoined = "infra.dcn.ssu.ac.kr/worker-joined"
-	// annotationNvidiaInstalled marks that NVIDIA drivers have been installed on this node.
-	annotationNvidiaInstalled = "infra.dcn.ssu.ac.kr/nvidia-installed"
-	// annotationCDIGenerated marks that the CDI spec has been generated after the post-driver reboot.
-	annotationCDIGenerated = "infra.dcn.ssu.ac.kr/nvidia-cdi-generated"
 	// annotationImagesPrepulled marks that all images in spec.nodeInfo.softwareConfig.imagePrepulls
 	// have been successfully pulled on the worker node.
 	annotationImagesPrepulled = "infra.dcn.ssu.ac.kr/images-prepulled"
@@ -266,44 +262,28 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 			return r.reconcilePackageVariants(ctx, cluster)
 		}
-		// GPU worker: join sets phase=Ready before CDI generation and image
-		// pre-pull are complete.  The reconcile that fires after the post-reboot
-		// wait lands here, so we must run those steps.
-		//
-		// We open SSH and call reconcileWorker directly rather than going through
-		// reconcileProvisioning: that function resets phase→Provisioning before
-		// calling reconcileWorker, which is unnecessary status churn for a worker
-		// that is already in Ready state and only needs GPU post-processing.
+		// GPU worker: image pre-pull runs after join. Driver and toolkit are
+		// managed by GPU Operator; the provisioner only pre-pulls large GPU images.
 		if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") &&
-			(cluster.Annotations[annotationCDIGenerated] != "true" ||
-				cluster.Annotations[annotationImagesPrepulled] != "true") {
-			// If an image pre-pull goroutine is already running, skip the SSH
-			// connection entirely and just poll the result channel directly.
-			// Opening SSH on every 30s requeue is wasteful and generates noisy logs.
-			if cluster.Annotations[annotationCDIGenerated] == "true" {
-				key := cluster.Namespace + "/" + cluster.Name
-				if _, running := r.prepullJobs.Load(key); running {
-					return r.reconcileImagePrepull(ctx, cluster, cluster)
-				}
+			cluster.Annotations[annotationImagesPrepulled] != "true" {
+			// If an image pre-pull goroutine is already running, poll its result
+			// directly instead of opening a new SSH connection.
+			key := cluster.Namespace + "/" + cluster.Name
+			if _, running := r.prepullJobs.Load(key); running {
+				return r.reconcileImagePrepull(ctx, cluster, cluster)
 			}
 			sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
 			defer cancel()
 			sshClient, err := r.getSSHClient(sshCtx, cluster)
 			if err != nil {
-				// SSH failure here is likely the node still booting after the
-				// NVIDIA driver reboot.  Requeue and retry rather than failing
-				// the cluster — the node will be reachable once it finishes
-				// coming up, regardless of whether that takes more or less than
-				// postRebootWait.
-				log.Info("SSH not yet reachable for GPU post-processing — node may still be rebooting, retrying",
-					"err", err)
+				log.Info("SSH not yet reachable for GPU image pre-pull — retrying", "err", err)
 				return ctrl.Result{RequeueAfter: postRebootWait}, nil
 			}
 			defer func() { _ = sshClient.Conn.Close() }()
 			return r.reconcileWorker(sshCtx, cluster, sshClient)
 		}
 		if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
-			log.Info("GPU worker fully ready — CDI and image pre-pull already complete")
+			log.Info("GPU worker fully ready — image pre-pull already complete")
 		}
 		return ctrl.Result{}, nil
 	case phaseFailed:
@@ -536,6 +516,26 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("listing RemoteClusters: %w", err)
 	}
+
+	// Sync VPN server config from the control-plane onto the worker CR so that
+	// handleDelete can call removeVPNPeer using only cluster.Spec.VPNConfig.
+	// Worker CRs carry the node's own VPN IP but not the server credentials.
+	if clusterParent != nil &&
+		cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" &&
+		clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("refreshing worker before VPN config sync: %w", err)
+		}
+		cluster.Spec.VPNConfig.VPNServerPublicIP = clusterParent.Spec.VPNConfig.VPNServerPublicIP
+		cluster.Spec.VPNConfig.VPNServerSSHPort = clusterParent.Spec.VPNConfig.VPNServerSSHPort
+		cluster.Spec.VPNConfig.VPNServerSSHUsername = clusterParent.Spec.VPNConfig.VPNServerSSHUsername
+		cluster.Spec.VPNConfig.VPNSSHCredentialsRef = clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef
+		if err := r.Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("syncing VPN server config from control-plane: %w", err)
+		}
+		log.Info("Synced VPN server config from control-plane", "cp", clusterParent.Name)
+	}
+
 	if cluster.Annotations[annotationWorkerJoined] != "true" {
 
 		if clusterParent == nil {
@@ -616,66 +616,15 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		log.Info("Worker already joined; skipping join step")
 	}
 
-	// ── GPU: driver installation → reboot → CDI generation ──────────────────
+	// ── GPU: image pre-pull ──────────────────────────────────────────────────
+	// The NVIDIA driver and container toolkit are managed entirely by GPU Operator
+	// (driver daemonset + toolkit daemonset with CDI mode). The provisioner only
+	// needs to pre-pull large GPU images; CRI-O was already configured for CDI
+	// in Phase 6 before the node joined.
 	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 		if clusterParent == nil {
-			log.Error(fmt.Errorf("control-plane not found"), "Cannot proceed with GPU post-processing — control-plane RemoteCluster missing; requeueing")
+			log.Error(fmt.Errorf("control-plane not found"), "Cannot proceed with GPU image pre-pull — control-plane RemoteCluster missing; requeueing")
 			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
-		}
-		if cluster.Annotations[annotationNvidiaInstalled] != "true" {
-			// if err := kubeadm.InstallNvidiaDrivers(sshClient, cluster, clusterParent); err != nil {
-			// 	return r.fail(ctx, cluster, "NvidiaInstallFailed", fmt.Errorf("installing NVIDIA drivers on worker node: %w", err))
-			// }
-
-			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking NVIDIA installed: %w", err)
-			}
-			ensureAnnotations(cluster)[annotationNvidiaInstalled] = "true"
-			if err := r.Update(ctx, cluster); err != nil {
-				return ctrl.Result{}, fmt.Errorf("marking NVIDIA as installed: %w", err)
-			}
-
-			log.Info("NVIDIA drivers installed; rebooting node — will reconnect after postRebootWait",
-				"wait", postRebootWait)
-			// Open a *dedicated* SSH connection for the reboot so it doesn't race
-			// with the defer that closes the shared sshClient when this function
-			// returns.  Using the shared connection caused the reboot to silently
-			// no-op when the defer fired before the goroutine ran NewSession().
-			rebootLog := log
-			go func() {
-				rebootCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				rebootClient, err := r.getSSHClient(rebootCtx, cluster)
-				if err != nil {
-					rebootLog.Error(err, "Could not open SSH connection for reboot — node may not reboot")
-					return
-				}
-				defer rebootClient.Conn.Close()
-				// Error is ignored: the connection resets when the node starts
-				// rebooting, which looks like a failure to ssh.Run.
-				// _, _ = ssh.Run(rebootClient, "sudo reboot")
-			}()
-			return ctrl.Result{RequeueAfter: postRebootWait}, nil
-		}
-
-		if cluster.Annotations[annotationCDIGenerated] != "true" {
-			// Drivers are installed and the node has rebooted — the kernel module
-			// is now loaded, so CDI generation via NVML will succeed.
-			if err := kubeadm.GenerateCDI(sshClient); err != nil {
-				return r.fail(ctx, cluster, "CDIGenerateFailed", fmt.Errorf("generating CDI spec on worker node: %w", err))
-			}
-
-			if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-				return ctrl.Result{}, fmt.Errorf("refreshing cluster before marking CDI generated: %w", err)
-			}
-			ensureAnnotations(cluster)[annotationCDIGenerated] = "true"
-			if err := r.Update(ctx, cluster); err != nil {
-				return ctrl.Result{}, fmt.Errorf("marking CDI as generated: %w", err)
-			}
-			log.Info("CDI spec generated successfully — continuing to image pre-pull")
-			// Explicit requeue: the annotation update does not change generation so
-			// GenerationChangedPredicate would otherwise drop the watch event.
-			return ctrl.Result{Requeue: true}, nil
 		}
 
 		// ── Image pre-pull (GPU nodes only) ──────────────────────────────────
@@ -1017,6 +966,15 @@ data:
 			imagePrepullsYAML += fmt.Sprintf("    imagePullSecretRef:\n      name: \"%s\"\n", ref.Name)
 		}
 
+		vpnServerSSHPort := cluster.Spec.VPNConfig.VPNServerSSHPort
+		if vpnServerSSHPort == 0 {
+			vpnServerSSHPort = 22
+		}
+		vpnServerSSHUsername := cluster.Spec.VPNConfig.VPNServerSSHUsername
+		if vpnServerSSHUsername == "" {
+			vpnServerSSHUsername = "ubuntu"
+		}
+
 		netConfigYAML := fmt.Sprintf(`
 apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
 kind: NodeProvisionNetConfig
@@ -1033,6 +991,8 @@ spec:
 %s  vpnRange: %s
   vpnServerPublicConfig:
     publicIP: %s
+    sshPort: %d
+    sshUsername: %s
     vpnSshCredentialsRef:
       name: %s
       namespace: %s
@@ -1047,6 +1007,8 @@ spec:
 			imagePrepullsYAML,
 			vpnCIDR,
 			cluster.Spec.VPNConfig.VPNServerPublicIP,
+			vpnServerSSHPort,
+			vpnServerSSHUsername,
 			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
 			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
 		)
@@ -1747,10 +1709,29 @@ func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *inf
 	}
 
 	// Step 3: Remove the WireGuard peer from the VPN server.
-	if cluster.Spec.VPNConfig.IP != "" && cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
-		if err := r.removeVPNPeer(ctx, cluster); err != nil {
-			log.Error(err, "VPN peer removal incomplete (continuing)")
+	//
+	// Worker CRs only get VPNSSHCredentialsRef populated on their own spec via
+	// a one-time sync in reconcileWorker (see the "Synced VPN server config"
+	// log line). If that sync never ran or was never persisted — e.g. the CR
+	// was deleted before finishing provisioning — the worker's own spec.vpnConfig
+	// has an IP but no server credentials. Fall back to reading them fresh from
+	// the sibling control-plane CR so peer removal isn't silently skipped.
+	if cluster.Spec.NodeInfo.NodeType == "worker" && cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" {
+		if clusterParent, err := r.findControlPlane(ctx, cluster); err != nil {
+			log.Error(err, "looking up control-plane for VPN server config (continuing)")
+		} else if clusterParent != nil && clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
+			cluster.Spec.VPNConfig.VPNServerPublicIP = clusterParent.Spec.VPNConfig.VPNServerPublicIP
+			cluster.Spec.VPNConfig.VPNServerSSHPort = clusterParent.Spec.VPNConfig.VPNServerSSHPort
+			cluster.Spec.VPNConfig.VPNServerSSHUsername = clusterParent.Spec.VPNConfig.VPNServerSSHUsername
+			cluster.Spec.VPNConfig.VPNSSHCredentialsRef = clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef
 		}
+	}
+
+	if cluster.Spec.VPNConfig.IP == "" || cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" {
+		log.Info("Skipping VPN peer removal — no VPN IP or VPN server credentials configured",
+			"vpnIP", cluster.Spec.VPNConfig.IP, "vpnSSHCredentialsRef", cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name)
+	} else if err := r.removeVPNPeer(ctx, cluster); err != nil {
+		log.Error(err, "VPN peer removal incomplete (continuing)")
 	}
 
 	// Step 4: Delete management-cluster resources (Porch repo, Nephio tokens,
@@ -1851,6 +1832,12 @@ sudo apt-get purge -y kubelet kubeadm kubectl 2>/dev/null || true
 # Purge CRI-O and related container runtime packages.
 sudo apt-get purge -y cri-o criu crun conmon 2>/dev/null || true
 
+# Purge NVIDIA container toolkit packages installed by InstallNvidiaContainerToolkit.
+sudo apt-get purge -y nvidia-container-toolkit nvidia-container-toolkit-base \
+  libnvidia-container-tools libnvidia-container1 2>/dev/null || true
+sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list 2>/dev/null || true
+sudo rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || true
+
 # Remove Kubernetes state directories.
 sudo rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd 2>/dev/null || true
 
@@ -1938,16 +1925,24 @@ func (r *RemoteClusterReconciler) removeVPNPeer(ctx context.Context, cluster *in
 
 	cred := strings.TrimSpace(string(credBytes))
 	vpnHost := cluster.Spec.VPNConfig.VPNServerPublicIP
+	vpnPort := cluster.Spec.VPNConfig.VPNServerSSHPort
+	if vpnPort == 0 {
+		vpnPort = 22
+	}
+	vpnUser := cluster.Spec.VPNConfig.VPNServerSSHUsername
+	if vpnUser == "" {
+		vpnUser = "ubuntu"
+	}
 
 	var vpnClient *ssh.Client
 	var err error
 	if strings.HasPrefix(cred, "-----BEGIN") {
-		vpnClient, err = ssh.ConnectWithPrivateKey(vpnHost, 22, "ubuntu", cred)
+		vpnClient, err = ssh.ConnectWithPrivateKey(vpnHost, vpnPort, vpnUser, cred)
 	} else {
-		vpnClient, err = ssh.Connect(vpnHost, 22, "ubuntu", cred)
+		vpnClient, err = ssh.Connect(vpnHost, vpnPort, vpnUser, cred)
 	}
 	if err != nil {
-		return fmt.Errorf("SSH to VPN server %s: %w", vpnHost, err)
+		return fmt.Errorf("SSH to VPN server %s:%d as %s: %w", vpnHost, vpnPort, vpnUser, err)
 	}
 	defer vpnClient.Conn.Close()
 
