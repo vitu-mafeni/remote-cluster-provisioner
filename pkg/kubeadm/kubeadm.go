@@ -153,8 +153,18 @@ rm -rf /tmp/crun`,
 		// CRI-O runtime drop-in: use crun as the default OCI runtime.
 		// crun built from source installs to /usr/local/bin/crun.
 		`sudo mkdir -p /etc/crio/crio.conf.d && \
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "crun"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.crun]\n        runtime_path = "/usr/local/bin/crun"\n        runtime_type = "oci"\n' \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/bin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
   | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
+		`sudo tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'EOF'
+[crio.runtime]
+  [crio.runtime.runtimes]
+    [crio.runtime.runtimes.nvidia]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+      runtime_type = "oci"
+    [crio.runtime.runtimes.nvidia-cdi]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
+      runtime_type = "oci"
+EOF`,
 	}
 }
 
@@ -355,8 +365,18 @@ sudo make install && \
 rm -rf /tmp/crun`,
 			// Rewrite the runtime drop-in to use the source-built crun at /usr/local/bin/crun.
 			`sudo mkdir -p /etc/crio/crio.conf.d && \
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "crun"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.crun]\n        runtime_path = "/usr/local/bin/crun"\n        runtime_type = "oci"\n' \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/bin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
   | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
+			`sudo tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'EOF'
+[crio.runtime]
+  [crio.runtime.runtimes]
+    [crio.runtime.runtimes.nvidia]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+      runtime_type = "oci"
+    [crio.runtime.runtimes.nvidia-cdi]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
+      runtime_type = "oci"
+EOF`,
 			// Stop any running CRI-O and kill stale conmon/crun child processes that
 			// may have survived from the previous cluster. Leftover processes hold
 			// open the socket or container storage, causing the new binary to fail
@@ -650,8 +670,18 @@ make -j$(nproc) && \
 sudo make install && \
 rm -rf /tmp/crun`,
 			`sudo mkdir -p /etc/crio/crio.conf.d && \
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "crun"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.crun]\n        runtime_path = "/usr/local/bin/crun"\n        runtime_type = "oci"\n' \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/bin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
   | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
+			`sudo tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'EOF'
+[crio.runtime]
+  [crio.runtime.runtimes]
+    [crio.runtime.runtimes.nvidia]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+      runtime_type = "oci"
+    [crio.runtime.runtimes.nvidia-cdi]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
+      runtime_type = "oci"
+EOF`,
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo killall -9 crio conmon crun 2>/dev/null || true",
 			"sudo rm -rf /run/crio /var/run/crio",
@@ -847,8 +877,18 @@ libnvidia-container1=%s`,
 		`printf '[crio.runtime]\nlisten = "/var/run/crio/crio.sock"\nconmon = "/usr/local/bin/conmon"\n' \
   | sudo tee /etc/crio/crio.conf.d/10-paths.conf > /dev/null`,
 		// Restore crun as the default OCI runtime.
-		`printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "crun"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.crun]\n        runtime_path = "/usr/local/bin/crun"\n        runtime_type = "oci"\n' \
+		`printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/bin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
   | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
+		`sudo tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'EOF'
+[crio.runtime]
+  [crio.runtime.runtimes]
+    [crio.runtime.runtimes.nvidia]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+      runtime_type = "oci"
+    [crio.runtime.runtimes.nvidia-cdi]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
+      runtime_type = "oci"
+EOF`,
 		// Recreate 99-nvidia.conf — rm -rf wiped the one nvidia-ctk wrote earlier.
 		// Without this the nvidia runtime handler is absent from CRI-O's runtime map
 		// and pods with runtimeClassName=nvidia fail with "failed to find runtime handler nvidia".

@@ -1709,10 +1709,29 @@ func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *inf
 	}
 
 	// Step 3: Remove the WireGuard peer from the VPN server.
-	if cluster.Spec.VPNConfig.IP != "" && cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
-		if err := r.removeVPNPeer(ctx, cluster); err != nil {
-			log.Error(err, "VPN peer removal incomplete (continuing)")
+	//
+	// Worker CRs only get VPNSSHCredentialsRef populated on their own spec via
+	// a one-time sync in reconcileWorker (see the "Synced VPN server config"
+	// log line). If that sync never ran or was never persisted — e.g. the CR
+	// was deleted before finishing provisioning — the worker's own spec.vpnConfig
+	// has an IP but no server credentials. Fall back to reading them fresh from
+	// the sibling control-plane CR so peer removal isn't silently skipped.
+	if cluster.Spec.NodeInfo.NodeType == "worker" && cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" {
+		if clusterParent, err := r.findControlPlane(ctx, cluster); err != nil {
+			log.Error(err, "looking up control-plane for VPN server config (continuing)")
+		} else if clusterParent != nil && clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
+			cluster.Spec.VPNConfig.VPNServerPublicIP = clusterParent.Spec.VPNConfig.VPNServerPublicIP
+			cluster.Spec.VPNConfig.VPNServerSSHPort = clusterParent.Spec.VPNConfig.VPNServerSSHPort
+			cluster.Spec.VPNConfig.VPNServerSSHUsername = clusterParent.Spec.VPNConfig.VPNServerSSHUsername
+			cluster.Spec.VPNConfig.VPNSSHCredentialsRef = clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef
 		}
+	}
+
+	if cluster.Spec.VPNConfig.IP == "" || cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" {
+		log.Info("Skipping VPN peer removal — no VPN IP or VPN server credentials configured",
+			"vpnIP", cluster.Spec.VPNConfig.IP, "vpnSSHCredentialsRef", cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name)
+	} else if err := r.removeVPNPeer(ctx, cluster); err != nil {
+		log.Error(err, "VPN peer removal incomplete (continuing)")
 	}
 
 	// Step 4: Delete management-cluster resources (Porch repo, Nephio tokens,

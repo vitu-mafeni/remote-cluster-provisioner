@@ -101,6 +101,62 @@ const (
 	npPrepullPollInterval = 30 * time.Second
 )
 
+// npNodeResetScript is the comprehensive node cleanup script run via SSH during
+// deletion.  It mirrors resetNodeViaSSH in the RemoteCluster controller.
+const npNodeResetScript = `
+if command -v kubeadm >/dev/null 2>&1; then
+  sudo kubeadm reset --force 2>/dev/null || true
+fi
+
+sudo systemctl stop kubelet crio 2>/dev/null || true
+sudo systemctl disable kubelet crio 2>/dev/null || true
+
+sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+
+sudo apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
+sudo apt-get purge -y kubelet kubeadm kubectl 2>/dev/null || true
+
+sudo apt-get purge -y cri-o criu crun conmon 2>/dev/null || true
+
+sudo apt-get purge -y nvidia-container-toolkit nvidia-container-toolkit-base \
+  libnvidia-container-tools libnvidia-container1 2>/dev/null || true
+sudo rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list 2>/dev/null || true
+sudo rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null || true
+
+sudo rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd 2>/dev/null || true
+
+sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
+sudo rm -rf /etc/crio 2>/dev/null || true
+
+sudo rm -rf /etc/criu 2>/dev/null || true
+
+sudo rm -f  /etc/modules-load.d/k8s.conf /etc/sysctl.d/k8s.conf 2>/dev/null || true
+sudo rm -f  /etc/apt/sources.list.d/kubernetes.list /etc/apt/sources.list.d/cri-o.list 2>/dev/null || true
+sudo rm -f  /etc/apt/keyrings/kubernetes-apt-keyring.gpg /etc/apt/keyrings/cri-o-apt-keyring.gpg 2>/dev/null || true
+
+sudo rm -f /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true
+sudo rm -f /usr/local/bin/crun   /usr/bin/crun   2>/dev/null || true
+sudo rm -f /usr/sbin/runc /usr/local/sbin/runc   2>/dev/null || true
+sudo rm -f /usr/sbin/criu                         2>/dev/null || true
+sudo rm -f /usr/bin/crio                          2>/dev/null || true
+sudo rm -f /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || true
+
+sudo rm -f /var/lib/node-bootstrap-complete 2>/dev/null || true
+
+sudo apt-get autoremove -y 2>/dev/null || true
+
+nohup sudo bash -c '
+  sleep 3
+  systemctl stop    wg-quick@wg0 2>/dev/null || true
+  wg-quick down wg0              2>/dev/null || true
+  systemctl disable wg-quick@wg0 2>/dev/null || true
+  rm -f /etc/wireguard/wg0.conf  2>/dev/null || true
+  apt-get purge -y wireguard wireguard-tools 2>/dev/null || true
+' >/dev/null 2>&1 &
+
+echo "node reset complete"
+`
+
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions/finalizers,verbs=update
@@ -908,6 +964,29 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	np.Status.NodeName = found.Name
 	np.Status.LastUpdated = &now
 
+	// GPU CDI configuration — mirrors JoinWorkerNode Phase 6 in kubeadm.go.
+	// Creates the CDI directories and enables CDI support in CRI-O so that
+	// the GPU Operator can inject GPU devices via CDI specs.
+	if strings.Contains(np.Spec.NodeLabel, "gpu") {
+		if sshClient, err := r.getSSHClientByProvider(ctx, np); err != nil {
+			log.Error(err, "Cannot SSH to GPU node for CDI configuration (continuing)")
+		} else {
+			cdiCmds := []string{
+				"sudo mkdir -p /etc/cdi /var/run/cdi /etc/crio/crio.conf.d",
+				"test -f /etc/crio/crio.conf.d/99-cdi.conf || " +
+					`printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]\n' ` +
+					"| sudo tee /etc/crio/crio.conf.d/99-cdi.conf > /dev/null",
+			}
+			for _, cmd := range cdiCmds {
+				if out, cmdErr := ssh.Run(sshClient, cmd); cmdErr != nil {
+					log.Error(cmdErr, "GPU CDI configuration step failed (continuing)", "output", out)
+				}
+			}
+			sshClient.Conn.Close()
+			log.Info("GPU CDI configured on node", "node", found.Name)
+		}
+	}
+
 	// GPU nodes with images configured get an intermediate phase so the
 	// background goroutine can pull without blocking further reconciles.
 	// Works for both on-prem (SSH via VPN IP) and AWS (SSH via VPN IP set during provisioning).
@@ -1107,6 +1186,39 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 	}
 }
 
+// getSSHClientByProvider opens an SSH connection to the node using the correct
+// credentials for each provider: on-prem uses the user credential secret;
+// AWS uses the dedicated SSH key secret (<name>-ssh-key) created during EC2
+// provisioning.  Both connect via the VPN IP that is reachable in-cluster.
+func (r *NodeProvisionReconciler) getSSHClientByProvider(ctx context.Context, np *mlv1alpha1.NodeProvision) (*ssh.Client, error) {
+	host := np.Status.VpnIP
+	if host == "" {
+		host = np.Spec.IPAddress
+		if host == "" {
+			host = np.Spec.Hostname
+		}
+	}
+	user := np.Spec.SSHUsernameOverride
+	if user == "" {
+		user = "ubuntu"
+	}
+	if np.Spec.Provider == mlv1alpha1.CloudProviderAWS {
+		sshKeySecret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      np.Name + "-ssh-key",
+			Namespace: np.Namespace,
+		}, sshKeySecret); err != nil {
+			return nil, fmt.Errorf("fetching AWS SSH key secret %q: %w", np.Name+"-ssh-key", err)
+		}
+		credBytes, err := resolveSecretKey(sshKeySecret, "")
+		if err != nil {
+			return nil, err
+		}
+		return dialSSH(host, np.Spec.SSHPort, user, string(credBytes))
+	}
+	return r.getSSHClientPostJoin(ctx, np)
+}
+
 // getSSHClientPostJoin opens an SSH connection to the node using its VPN IP
 // (np.Status.VpnIP), which is reachable from the controller once the node has
 // joined the cluster.  Falls back to the spec IP/hostname if VPN IP is empty.
@@ -1211,6 +1323,20 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	// ── Provider-specific cleanup (must happen before secrets are deleted) ──────
 	switch np.Spec.Provider {
 	case mlv1alpha1.CloudProviderAWS:
+		// SSH reset before instance termination — mirrors resetNodeViaSSH in the
+		// RemoteCluster controller.  Best-effort: if SSH fails we still terminate.
+		if np.Status.VpnIP != "" {
+			if sshClient, sshErr := r.getSSHClientByProvider(ctx, np); sshErr != nil {
+				log.Error(sshErr, "Cannot SSH to AWS node for reset (continuing with termination)")
+			} else {
+				if out, resetErr := ssh.Run(sshClient, npNodeResetScript); resetErr != nil {
+					log.Error(resetErr, "AWS node SSH reset incomplete (continuing)", "output", out)
+				} else {
+					log.Info("AWS node SSH reset complete")
+				}
+				sshClient.Conn.Close()
+			}
+		}
 		if np.Status.InstanceID != "" {
 			// Prefer the user-supplied secret; fall back to the controller-owned copy
 			// in case the user deleted their secret before deleting the NodeProvision.
@@ -1415,17 +1541,8 @@ func (r *NodeProvisionReconciler) cleanupOnPremNode(ctx context.Context, np *mlv
 	}
 	defer sshClient.Conn.Close()
 
-	cmds := []string{
-		"sudo kubeadm reset -f 2>/dev/null || true",
-		"sudo systemctl stop wg-quick@wg0 2>/dev/null || true",
-		"sudo systemctl disable wg-quick@wg0 2>/dev/null || true",
-		"sudo rm -f /etc/wireguard/wg0.conf",
-		"sudo apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true",
-	}
-	for _, cmd := range cmds {
-		if _, err := ssh.Run(sshClient, cmd); err != nil {
-			log.Error(err, "cleanup command failed on on-prem node (continuing)", "cmd", cmd)
-		}
+	if out, err := ssh.Run(sshClient, npNodeResetScript); err != nil {
+		log.Error(err, "on-prem node reset script reported errors (continuing)", "output", out)
 	}
 	log.Info("On-prem node reset complete")
 }
