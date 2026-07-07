@@ -391,8 +391,8 @@ done
 # ── Done ─────────────────────────────────────────────────────────────────────
 touch /var/lib/node-bootstrap-complete
 report "Bootstrap complete"
-`, nopasswdBlock,
-		p.KubernetesVersion,
+`, p.KubernetesVersion,
+		nopasswdBlock,
 		wgConf,
 		p.CRIOVersion, p.CRIOVersion,
 		kubeadm.CriuGitID, kubeadm.CriuAsset,
