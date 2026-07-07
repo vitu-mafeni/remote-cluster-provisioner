@@ -136,6 +136,35 @@ sudo mkdir -p /etc/criu && \
 printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
   | sudo tee /etc/criu/runc.conf > /dev/null`,
 
+		// Default CRIU config (used when criu is invoked without --config).
+		`sudo rm -f /etc/criu/default.conf && \
+sudo mkdir -p /etc/criu && \
+printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+  | sudo tee /etc/criu/default.conf > /dev/null`,
+
+		// ── Custom CRIU binary (device-restore-with-hook) ────────────────────────────
+		// Ensure runtime shared libraries are present (libnl, libcap, libbsd, libgnutls).
+		"sudo apt-get install -y libcap2 libnl-3-200 libbsd0 libgnutls30 2>/dev/null || true",
+		// Idempotent install: skip if the binary already has the expected GitID.
+		fmt.Sprintf(`WANT="%s"; \
+CRIU_BIN=$(command -v criu || echo /usr/sbin/criu); \
+HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}'); \
+if [ "$HAVE" = "$WANT" ]; then \
+  echo "custom criu $WANT already at $CRIU_BIN, skipping"; \
+else \
+  curl -fsSL %s -o /tmp/criu && \
+  chmod 0755 /tmp/criu && \
+  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}') && \
+  [ "$GOT" = "$WANT" ] || { echo "GitID mismatch: got $GOT want $WANT"; false; } && \
+  sudo install -m 0755 /tmp/criu "$CRIU_BIN" && \
+  rm -f /tmp/criu && \
+  echo "installed custom criu $WANT at $CRIU_BIN"; \
+fi`, CriuGitID, CriuAsset),
+		"criu --version || true",
+		// Grant CAP_CHECKPOINT_RESTORE so criu can run without full root.
+		"sudo setcap cap_checkpoint_restore+eip /usr/sbin/criu || true",
+		"criu check 2>&1 | head -1 || true",
+
 		// ── crun from source ─────────────────────────────────────────────────────────
 		// The apt crun on Ubuntu 22.04 is ≈0.19 which predates OCI spec 1.0.2; CRI-O
 		// 1.35 generates specs that old crun rejects with "unknown version specified".

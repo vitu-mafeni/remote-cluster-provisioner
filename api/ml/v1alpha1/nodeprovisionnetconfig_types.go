@@ -95,6 +95,12 @@ type NodeProvisionNetConfigStatus struct {
 	// VPNPeers tracks every WireGuard peer registered on the VPN server.
 	// +optional
 	VPNPeers []VPNPeerStatus `json:"vpnPeers,omitempty"`
+	// Kubeconfig is the base64-encoded admin kubeconfig for this cluster.
+	// Populated after control-plane init and refreshed locally by the
+	// kubeconfig-refresh systemd timer on the control-plane node so that
+	// the remote cluster can stay self-sufficient without the management cluster.
+	// +optional
+	Kubeconfig string `json:"kubeconfig,omitempty"`
 }
 
 // +kubebuilder:object:root=true

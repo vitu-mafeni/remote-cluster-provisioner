@@ -411,7 +411,8 @@ func resolveDefaultSubnet(ctx context.Context, client *ec2.Client, vpcID string)
 	return awssdk.ToString(all.Subnets[0].SubnetId), nil
 }
 
-// resolveDefaultSecurityGroup returns the ID of the VPC's default security group.
+// resolveDefaultSecurityGroup returns the ID of the VPC's default security group
+// and ensures it has inbound rules for SSH (TCP 22) and WireGuard (UDP 51820).
 func resolveDefaultSecurityGroup(ctx context.Context, client *ec2.Client, vpcID string) (string, error) {
 	out, err := client.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
 		Filters: []types.Filter{
@@ -425,7 +426,71 @@ func resolveDefaultSecurityGroup(ctx context.Context, client *ec2.Client, vpcID 
 	if len(out.SecurityGroups) == 0 {
 		return "", fmt.Errorf("no default security group found in VPC %s", vpcID)
 	}
-	return awssdk.ToString(out.SecurityGroups[0].GroupId), nil
+	sgID := awssdk.ToString(out.SecurityGroups[0].GroupId)
+	sg := out.SecurityGroups[0]
+	if err := ensureNodeIngressRules(ctx, client, sgID, sg.IpPermissions); err != nil {
+		log.Printf("[WARN] Security group %s: could not ensure ingress rules: %v", sgID, err)
+	}
+	return sgID, nil
+}
+
+// ensureNodeIngressRules adds TCP 22 (SSH) and UDP 51820 (WireGuard) ingress rules
+// to the security group if they are not already present.  Existing rules are never
+// removed.  Duplicate-rule errors from AWS are silently ignored.
+func ensureNodeIngressRules(ctx context.Context, client *ec2.Client, sgID string, existing []types.IpPermission) error {
+	type ruleKey struct {
+		proto string
+		port  int32
+	}
+	present := make(map[ruleKey]bool)
+	for _, perm := range existing {
+		if perm.FromPort == nil || perm.ToPort == nil || perm.IpProtocol == nil {
+			continue
+		}
+		if *perm.FromPort == *perm.ToPort {
+			k := ruleKey{proto: *perm.IpProtocol, port: *perm.FromPort}
+			for _, r := range perm.IpRanges {
+				if awssdk.ToString(r.CidrIp) == "0.0.0.0/0" {
+					present[k] = true
+				}
+			}
+		}
+	}
+
+	var toAdd []types.IpPermission
+	needed := []ruleKey{
+		{"tcp", 22},    // SSH
+		{"udp", 51820}, // WireGuard
+	}
+	for _, r := range needed {
+		if !present[r] {
+			port := r.port
+			toAdd = append(toAdd, types.IpPermission{
+				IpProtocol: awssdk.String(r.proto),
+				FromPort:   awssdk.Int32(port),
+				ToPort:     awssdk.Int32(port),
+				IpRanges: []types.IpRange{
+					{CidrIp: awssdk.String("0.0.0.0/0"), Description: awssdk.String("node-provision-controller")},
+				},
+			})
+		}
+	}
+	if len(toAdd) == 0 {
+		return nil
+	}
+
+	_, err := client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
+		GroupId:       awssdk.String(sgID),
+		IpPermissions: toAdd,
+	})
+	if err != nil && !strings.Contains(err.Error(), "InvalidPermission.Duplicate") {
+		return fmt.Errorf("authorizing ingress on %s: %w", sgID, err)
+	}
+	for _, r := range toAdd {
+		log.Printf("[INFO] Security group %s: added %s/%d ingress from 0.0.0.0/0",
+			sgID, awssdk.ToString(r.IpProtocol), awssdk.ToInt32(r.FromPort))
+	}
+	return nil
 }
 
 // KeyPairResult is returned by ResolveOrCreateKeyPair.
