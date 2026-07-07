@@ -305,7 +305,7 @@ printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nex
 
 # CRI-O runc runtime drop-in — declares runc as the default OCI runtime
 mkdir -p /etc/crio/crio.conf.d
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/sbin/runc"\n        runtime_type = "oci"\n' \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/local/sbin/runc"\n        runtime_type = "oci"\n' \
   | tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null
 
 report "CRI-O installed"
