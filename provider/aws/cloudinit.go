@@ -129,7 +129,7 @@ report "Running apt-get update"
 $APT update
 
 report "Installing base packages"
-$APT install -y ca-certificates curl gnupg apt-transport-https lsof cri-tools
+$APT install -y ca-certificates curl gnupg apt-transport-https lsof
 
 # Ensure crictl is in PATH for controller image pre-pull
 # CRI-tools releases use minor version (e.g., v1.34, not v1.34.2)
