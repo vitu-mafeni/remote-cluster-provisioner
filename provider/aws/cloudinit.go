@@ -205,7 +205,7 @@ if ! which crio > /dev/null 2>&1; then
     > /etc/apt/sources.list.d/cri-o.list
   $APT update
   $APT install -y jq criu crun conmon cri-o
-  CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null)
+  CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null || echo "")
   { [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17
   curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \
     -o /usr/local/bin/crun
@@ -224,13 +224,13 @@ $APT install -y libcap2 libnl-3-200 libbsd0 libgnutls30
 # Swap in custom criu (device-restore-with-hook), idempotent on GitID
 WANT="%s"
 CRIU_BIN=$(command -v criu || echo /usr/sbin/criu)
-HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}')
+HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}' || true)
 if [ "$HAVE" = "$WANT" ]; then
   echo "custom criu $WANT already at $CRIU_BIN, skipping"
 else
   curl -fsSL %s -o /tmp/criu
   chmod 0755 /tmp/criu
-  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}')
+  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}' || true)
   [ "$GOT" = "$WANT" ] && \
   install -m 0755 /tmp/criu "$CRIU_BIN" && \
   rm -f /tmp/criu && \
@@ -244,7 +244,7 @@ criu check 2>&1 | head -1 || true
 # Install latest runc, idempotent on version
 WANT="%s"
 RUNC_BIN=$(command -v runc || echo /usr/local/sbin/runc)
-HAVE=$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}')
+HAVE=$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}' || true)
 if [ "$HAVE" = "$WANT" ]; then
   echo "runc $WANT already installed at $RUNC_BIN, skipping"
 else
@@ -259,12 +259,12 @@ else
 fi
 runc --version || true
 
-WANT=%s
-HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit)
+WANT="%s"
+HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit || true)
 if [ "$HAVE" != "$WANT" ]; then
   curl -fsSL %s -o /tmp/crio
   chmod 0755 /tmp/crio
-  GOT=$(/tmp/crio version --json | jq -r .gitCommit)
+  GOT=$(/tmp/crio version --json | jq -r .gitCommit || true)
   if [ "$GOT" = "$WANT" ]; then
     systemctl stop crio
     install -m 0755 /tmp/crio /usr/bin/crio
