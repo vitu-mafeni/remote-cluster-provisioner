@@ -1120,10 +1120,10 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 				"secret", ref.Name, "user", username)
 		}
 
-		// Open a dedicated SSH connection for the goroutine.  After the node
-		// has joined the cluster the most reliable address is its VPN IP since
-		// the controller is also in-cluster on the same VPN mesh.
-		sshClient, err := r.getSSHClientPostJoin(ctx, np)
+		// Open a dedicated SSH connection for the goroutine.  Use the provider-
+		// aware helper so AWS nodes use the EC2 SSH key secret (<name>-ssh-key)
+		// rather than the AWS credentials secret.
+		sshClient, err := r.getSSHClientByProvider(ctx, np)
 		if err != nil {
 			// SSH failure is transient — do not fail the NodeProvision.
 			log.Error(err, "Cannot open SSH connection for image pre-pull, will retry")
