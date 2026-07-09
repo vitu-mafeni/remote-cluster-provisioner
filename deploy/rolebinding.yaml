@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: remote-cluster-provisioner-leader-election
+  namespace: remote-cluster-provisioner-system
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: remote-cluster-provisioner-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: remote-cluster-provisioner
+    namespace: remote-cluster-provisioner-system

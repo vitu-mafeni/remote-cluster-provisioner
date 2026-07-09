@@ -1,0 +1,22 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: remote-cluster-provisioner-leader-election
+  namespace: remote-cluster-provisioner-system
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+rules:
+  # Leader election via leases (controller-runtime default)
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  # Legacy leader election via configmaps
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  # Event emission (reconciler status messages)
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
