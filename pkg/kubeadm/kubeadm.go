@@ -14,8 +14,8 @@ import (
 const (
 	CrioAsset   = "https://github.com/vitu-mafeni/leehun-cri-o/releases/download/crio-v1.35.0-digest-lookup-fix/crio"
 	CrioCommit  = "ccd43393035e134a47f6b7eec6b28476c3647c6e"
-	CriuAsset   = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-device-restore-with-hook-v2/criu"
-	CriuGitID   = "2cb63fd5b"
+	CriuAsset   = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-seccomp-fix/criu"
+	CriuGitID   = "5823b7222"
 	RuncVersion = "v1.5.0"
 
 	// crioSock = "unix:///var/run/crio/crio.sock"
@@ -124,6 +124,16 @@ printf '[crio.runtime]\nlisten = "/var/run/crio/crio.sock"\nconmon = "/usr/local
 		`sudo mkdir -p /etc/containers && \
 printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' \
   | sudo tee /etc/containers/policy.json > /dev/null`,
+
+		// Unqualified image search registry — lets short image names (e.g. "busybox")
+		// resolve against Docker Hub instead of failing with "short-name resolution enforced".
+		`sudo mkdir -p /etc/containers
+sudo tee /etc/containers/registries.conf >/dev/null <<EOF
+unqualified-search-registries = ["docker.io"]
+
+[[registry]]
+location = "docker.io"
+EOF`,
 
 		// CNI directories must exist before CRI-O starts so the CNI plugin probe passes.
 		`sudo mkdir -p /etc/cni/net.d /opt/cni/bin`,

@@ -310,6 +310,17 @@ sudo rm -rf /var/lib/crio /run/crio /var/lib/containers /run/containers 2>/dev/n
 sudo systemctl daemon-reload && \
 sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; } && \
 sleep 3`,
+
+				// Unqualified image search registry — lets short image names (e.g. "busybox")
+				// resolve against Docker Hub instead of failing with "short-name resolution enforced".
+				`sudo mkdir -p /etc/containers
+sudo tee /etc/containers/registries.conf >/dev/null <<EOF
+unqualified-search-registries = ["docker.io"]
+
+[[registry]]
+location = "docker.io"
+EOF`,
+
 				`test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
 sudo install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
 /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
