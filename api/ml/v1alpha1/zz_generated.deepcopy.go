@@ -214,6 +214,10 @@ func (in *NodeProvisionNetConfigStatus) DeepCopyInto(out *NodeProvisionNetConfig
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.JoinTokenRefreshedAt != nil {
+		in, out := &in.JoinTokenRefreshedAt, &out.JoinTokenRefreshedAt
+		*out = (*in).DeepCopy()
+	}
 	if in.VPNPeers != nil {
 		in, out := &in.VPNPeers, &out.VPNPeers
 		*out = make([]VPNPeerStatus, len(*in))

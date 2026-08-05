@@ -100,10 +100,10 @@ func ResolveAWSCredentialsWithMFA(ctx context.Context, region string, secret *co
 		return ResolveAWSCredentials(secret), nil, nil
 	}
 
-	keyID     := secretVal(secret, "awsAccessKeyId")
+	keyID := secretVal(secret, "awsAccessKeyId")
 	secretKey := secretVal(secret, "awsSecretAccessKey")
-	serial    := secretVal(secret, "mfaSerialNumber")
-	totpSeed  := secretVal(secret, "mfaTotpSecret")
+	serial := secretVal(secret, "mfaSerialNumber")
+	totpSeed := secretVal(secret, "mfaTotpSecret")
 
 	// ── Reuse cached session if still valid ─────────────────────────────────
 	if token := secretVal(secret, secretKeySessionToken); token != "" {
