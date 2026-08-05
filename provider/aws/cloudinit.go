@@ -73,6 +73,9 @@ func renderBootstrapScript(p CloudInitParams) string {
 	// nvidia runtime handler, matching what InstallNvidiaContainerToolkit does in
 	// pkg/kubeadm.  Written before kubeadm join so CRI-O is nvidia-ready when the
 	// GPU operator schedules pods with runtimeClassName=nvidia.
+	// gpuBlock replicates InstallNvidiaContainerToolkit from pkg/kubeadm for GPU nodes.
+	// 9999-nvidia.conf is written separately in the template (unconditionally, matching
+	// crioBuildSteps which runs for ALL nodes in kubeadm).
 	gpuBlock := ""
 	if p.IsGPUNode {
 		toolkitInstallCmd := `$APT install -y \
@@ -91,23 +94,7 @@ func renderBootstrapScript(p CloudInitParams) string {
 		}
 		gpuBlock = fmt.Sprintf(`
 # ── NVIDIA container toolkit ──────────────────────────────────────────────────
-# Pre-declare the nvidia runtime handler before the GPU operator installs the
-# actual binary to /usr/local/nvidia/toolkit/.  This ensures CRI-O already has
-# the handler registered when the GPU operator schedules runtimeClassName=nvidia
-# pods, avoiding "failed to find runtime handler nvidia" sandbox errors.
 report "Installing NVIDIA container toolkit"
-
-mkdir -p /etc/crio/crio.conf.d
-tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'NVEOF'
-[crio.runtime]
-  [crio.runtime.runtimes]
-    [crio.runtime.runtimes.nvidia]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
-      runtime_type = "oci"
-    [crio.runtime.runtimes.nvidia-cdi]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
-      runtime_type = "oci"
-NVEOF
 
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
   | gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
@@ -121,8 +108,9 @@ $APT update
 nvidia-ctk runtime configure --runtime=crio
 sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf 2>/dev/null || true
 
-# Enable CDI support for the GPU operator.
-mkdir -p /etc/cdi /var/run/cdi
+# CDI support (matches gpuCDISteps in kubeadm.go).
+mkdir -p /etc/cdi /var/run/cdi /etc/crio/crio.conf.d
+test -f /etc/crio/crio.conf.d/99-cdi.conf || \
 printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]\n' \
   | tee /etc/crio/crio.conf.d/99-cdi.conf > /dev/null
 
@@ -389,12 +377,25 @@ mkdir -p /etc/criu
 printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | tee /etc/criu/default.conf > /dev/null
 
-# CRI-O runc runtime drop-in — declares runc as the default OCI runtime.
-# nvidia handler is pre-declared here as a fallback; 9999-nvidia.conf (written
-# by the GPU block below) overrides it with the GPU operator toolkit path.
+# CRI-O runtime drop-ins — matches crioBuildSteps in kubeadm.go (written for ALL nodes).
 mkdir -p /etc/crio/crio.conf.d
 printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/local/sbin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
   | tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null
+
+# 9999-nvidia.conf: always written for ALL nodes (matches crioBuildSteps in kubeadm.go).
+# Declares the GPU operator toolkit paths so CRI-O has the nvidia handler in its
+# runtime list as soon as the GPU operator DaemonSet installs the binary and
+# signals a reload — no matter whether this is a GPU node or not.
+tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'NVEOF'
+[crio.runtime]
+  [crio.runtime.runtimes]
+    [crio.runtime.runtimes.nvidia]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+      runtime_type = "oci"
+    [crio.runtime.runtimes.nvidia-cdi]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
+      runtime_type = "oci"
+NVEOF
 
 report "CRI-O installed"
 
