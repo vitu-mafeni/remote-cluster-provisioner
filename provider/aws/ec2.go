@@ -187,15 +187,17 @@ func ProvisionEC2Node(
 	}
 
 	userDataB64 := BuildUserData(CloudInitParams{
-		WGConfig:               wgConfig,
-		VpnIP:                  vpnIP,
-		JoinCommand:            netNodeConfig.Status.ClusterJoinCommand,
-		KubernetesVersion:      clean,
-		KubernetesMinorVersion: crioVersion,
-		CRIOVersion:            crioVersion,
-		NodeName:               name,
-		Labels:                 labels,
-		SSHUsername:            nodeProvision.Spec.SSHUsernameOverride,
+		WGConfig:                      wgConfig,
+		VpnIP:                         vpnIP,
+		JoinCommand:                   netNodeConfig.Status.ClusterJoinCommand,
+		KubernetesVersion:             clean,
+		KubernetesMinorVersion:        crioVersion,
+		CRIOVersion:                   crioVersion,
+		NodeName:                      name,
+		Labels:                        labels,
+		SSHUsername:                   nodeProvision.Spec.SSHUsernameOverride,
+		IsGPUNode:                     strings.EqualFold(nodeProvision.Spec.NodeLabel, "gpu"),
+		NvidiaContainerToolkitVersion: netNodeConfig.Spec.SoftwareConfig.NvidiaContainerToolkitVersion,
 	})
 
 	// ── Create EC2 instance ────────────────────────────────────────────────

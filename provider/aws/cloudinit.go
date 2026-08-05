@@ -31,6 +31,12 @@ type CloudInitParams struct {
 	// that non-interactive SSH sessions can run privileged commands.
 	// When empty, no sudoers entry is written.
 	SSHUsername string
+	// IsGPUNode triggers NVIDIA container toolkit installation and CRI-O
+	// nvidia runtime handler configuration during bootstrap.
+	IsGPUNode bool
+	// NvidiaContainerToolkitVersion pins the nvidia-container-toolkit apt package
+	// version (e.g. "1.17.3-1").  When empty the latest available version is used.
+	NvidiaContainerToolkitVersion string
 }
 
 // BuildUserData renders an idempotent cloud-init bash script and returns it
@@ -52,6 +58,67 @@ func renderBootstrapScript(p CloudInitParams) string {
 			"echo '%s ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/nopasswd-%s\nchmod 0440 /etc/sudoers.d/nopasswd-%s\n",
 			p.SSHUsername, p.SSHUsername, p.SSHUsername,
 		)
+	}
+
+	// GPU block: installs NVIDIA container toolkit and configures CRI-O with the
+	// nvidia runtime handler, matching what InstallNvidiaContainerToolkit does in
+	// pkg/kubeadm.  Written before kubeadm join so CRI-O is nvidia-ready when the
+	// GPU operator schedules pods with runtimeClassName=nvidia.
+	gpuBlock := ""
+	if p.IsGPUNode {
+		toolkitInstallCmd := `$APT install -y \
+  nvidia-container-toolkit \
+  nvidia-container-toolkit-base \
+  libnvidia-container-tools \
+  libnvidia-container1`
+		if p.NvidiaContainerToolkitVersion != "" {
+			toolkitInstallCmd = fmt.Sprintf(`$APT install --allow-downgrades -y \
+  nvidia-container-toolkit=%s \
+  nvidia-container-toolkit-base=%s \
+  libnvidia-container-tools=%s \
+  libnvidia-container1=%s`,
+				p.NvidiaContainerToolkitVersion, p.NvidiaContainerToolkitVersion,
+				p.NvidiaContainerToolkitVersion, p.NvidiaContainerToolkitVersion)
+		}
+		gpuBlock = fmt.Sprintf(`
+# ── NVIDIA container toolkit ──────────────────────────────────────────────────
+# Pre-declare the nvidia runtime handler before the GPU operator installs the
+# actual binary to /usr/local/nvidia/toolkit/.  This ensures CRI-O already has
+# the handler registered when the GPU operator schedules runtimeClassName=nvidia
+# pods, avoiding "failed to find runtime handler nvidia" sandbox errors.
+report "Installing NVIDIA container toolkit"
+
+mkdir -p /etc/crio/crio.conf.d
+tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'NVEOF'
+[crio.runtime]
+  [crio.runtime.runtimes]
+    [crio.runtime.runtimes.nvidia]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+      runtime_type = "oci"
+    [crio.runtime.runtimes.nvidia-cdi]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
+      runtime_type = "oci"
+NVEOF
+
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list
+$APT update
+%s
+
+nvidia-ctk runtime configure --runtime=crio
+sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf 2>/dev/null || true
+
+# Enable CDI support for the GPU operator.
+mkdir -p /etc/cdi /var/run/cdi
+printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]\n' \
+  | tee /etc/crio/crio.conf.d/99-cdi.conf > /dev/null
+
+report "NVIDIA container toolkit installed"
+`, toolkitInstallCmd)
 	}
 
 	// Escape the WireGuard config for embedding in heredoc.
@@ -313,16 +380,18 @@ mkdir -p /etc/criu
 printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | tee /etc/criu/default.conf > /dev/null
 
-# CRI-O runc runtime drop-in — declares runc as the default OCI runtime
+# CRI-O runc runtime drop-in — declares runc as the default OCI runtime.
+# nvidia handler is pre-declared here as a fallback; 9999-nvidia.conf (written
+# by the GPU block below) overrides it with the GPU operator toolkit path.
 mkdir -p /etc/crio/crio.conf.d
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/local/sbin/runc"\n        runtime_type = "oci"\n' \
+printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/local/sbin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
   | tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null
 
 report "CRI-O installed"
 
 # Fix storage directory permissions (CRI-O may create with restrictive permissions)
 sudo chmod 0711 /var/lib/crio /var/lib/containers/storage 2>/dev/null || true
-
+%s
 # ── Kubernetes packages ──────────────────────────────────────────────────────
 report "Installing Kubernetes packages"
 rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
@@ -408,6 +477,7 @@ report "Bootstrap complete"
 		kubeadm.CriuGitID, kubeadm.CriuAsset,
 		kubeadm.RuncVersion,
 		kubeadm.CrioCommit, kubeadm.CrioAsset,
+		gpuBlock,
 		p.KubernetesMinorVersion, p.KubernetesMinorVersion,
 		p.KubernetesVersion, p.KubernetesVersion, p.KubernetesVersion,
 		p.VpnIP,
