@@ -284,6 +284,16 @@ systemctl daemon-reload
 systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
 sleep 3
 
+# Unqualified image search registry — lets short image names (e.g. "busybox")
+# resolve against Docker Hub instead of failing with "short-name resolution enforced".
+mkdir -p /etc/containers
+tee /etc/containers/registries.conf >/dev/null <<EOF
+unqualified-search-registries = ["docker.io"]
+
+[[registry]]
+location = "docker.io"
+EOF
+
 test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
   install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
   /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
@@ -294,13 +304,13 @@ systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; 
 # CRIU configuration (matches crioBuildSteps in kubeadm.go)
 rm -f /etc/criu/runc.conf
 mkdir -p /etc/criu
-printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | tee /etc/criu/runc.conf > /dev/null
 
 # Default CRIU config (used when criu is invoked without --config)
 rm -f /etc/criu/default.conf
 mkdir -p /etc/criu
-printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | tee /etc/criu/default.conf > /dev/null
 
 # CRI-O runc runtime drop-in — declares runc as the default OCI runtime

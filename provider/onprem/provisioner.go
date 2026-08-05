@@ -310,6 +310,17 @@ sudo rm -rf /var/lib/crio /run/crio /var/lib/containers /run/containers 2>/dev/n
 sudo systemctl daemon-reload && \
 sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&2; false; } && \
 sleep 3`,
+
+				// Unqualified image search registry — lets short image names (e.g. "busybox")
+				// resolve against Docker Hub instead of failing with "short-name resolution enforced".
+				`sudo mkdir -p /etc/containers
+sudo tee /etc/containers/registries.conf >/dev/null <<EOF
+unqualified-search-registries = ["docker.io"]
+
+[[registry]]
+location = "docker.io"
+EOF`,
+
 				`test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
 sudo install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
 /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
@@ -318,13 +329,13 @@ echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"`,
 				// CRIU configuration (matches crioBuildSteps in kubeadm.go)
 				`sudo rm -f /etc/criu/runc.conf && \
 sudo mkdir -p /etc/criu && \
-printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | sudo tee /etc/criu/runc.conf > /dev/null`,
 
 				// Default CRIU config (used when criu is invoked without --config)
 				`sudo rm -f /etc/criu/default.conf && \
 sudo mkdir -p /etc/criu && \
-printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | sudo tee /etc/criu/default.conf > /dev/null`,
 
 				// CRI-O runc runtime drop-in — declares runc as the default OCI runtime

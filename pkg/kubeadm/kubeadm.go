@@ -14,11 +14,31 @@ import (
 const (
 	CrioAsset   = "https://github.com/vitu-mafeni/leehun-cri-o/releases/download/crio-v1.35.0-digest-lookup-fix/crio"
 	CrioCommit  = "ccd43393035e134a47f6b7eec6b28476c3647c6e"
-	CriuAsset   = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-device-restore-with-hook-v2/criu"
-	CriuGitID   = "2cb63fd5b"
+	CriuAsset   = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-seccomp-fix/criu"
+	CriuGitID   = "8c1c54be6"
 	RuncVersion = "v1.5.0"
 
 	// crioSock = "unix:///var/run/crio/crio.sock"
+
+	// EGKernelspecsExportPath is the NFS export path Enterprise Gateway's Helm
+	// chart hardcodes for its kernelspecs volume — see
+	// charts/templates/deployment.yaml in github.com/vitu-mafeni/enterprise_gateway:
+	// `nfs.server`/`nfs.internalServerIPAddress` are the only configurable
+	// values.yaml keys, the mount path itself is not. The control-plane NFS
+	// server must export exactly this path so both EG (nfs.enabled: true) and
+	// quota-api (its own NFS volume, ui-ml-platform's
+	// deploy/k8s/06-deployment-quota-api.yaml) mount the identical directory.
+	EGKernelspecsExportPath = "/usr/local/share/jupyter/kernels"
+
+	// EGKernelspecsImage bundles every built-in (python3, r_kubernetes, spark_*,
+	// etc.) and framework GPU kernelspec (pytorch-gpu-*, tf-gpu-*) under /kernels
+	// — see github.com/vitu-mafeni/eg-templates's Dockerfile. Once
+	// nfs.enabled is on, EG's chart can no longer use its own built-in-copying
+	// init container (its volumeMounts reference a volume name that's only
+	// defined when nfs.enabled is false — combining both crashes the
+	// Deployment), so this image is the only remaining source for those
+	// kernelspecs. Seeded onto EGKernelspecsExportPath once, here, instead.
+	EGKernelspecsImage = "docker.io/vitu1/enterprise-gateway-kernelspecs:1.1.0"
 )
 
 // crioReadyCheck polls crictl until CRI-O responds over gRPC or times out after 90 s.
@@ -125,6 +145,16 @@ printf '[crio.runtime]\nlisten = "/var/run/crio/crio.sock"\nconmon = "/usr/local
 printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' \
   | sudo tee /etc/containers/policy.json > /dev/null`,
 
+		// Unqualified image search registry — lets short image names (e.g. "busybox")
+		// resolve against Docker Hub instead of failing with "short-name resolution enforced".
+		`sudo mkdir -p /etc/containers
+sudo tee /etc/containers/registries.conf >/dev/null <<EOF
+unqualified-search-registries = ["docker.io"]
+
+[[registry]]
+location = "docker.io"
+EOF`,
+
 		// CNI directories must exist before CRI-O starts so the CNI plugin probe passes.
 		`sudo mkdir -p /etc/cni/net.d /opt/cni/bin`,
 
@@ -132,13 +162,13 @@ printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' \
 		// Remove any stale file first, then write fresh config.
 		`sudo rm -f /etc/criu/runc.conf && \
 sudo mkdir -p /etc/criu && \
-printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | sudo tee /etc/criu/runc.conf > /dev/null`,
 
 		// Default CRIU config (used when criu is invoked without --config).
 		`sudo rm -f /etc/criu/default.conf && \
 sudo mkdir -p /etc/criu && \
-printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | sudo tee /etc/criu/default.conf > /dev/null`,
 
 		// ── Custom CRIU binary (device-restore-with-hook) ────────────────────────────
@@ -365,6 +395,43 @@ mode: ipvs
 else
   echo "nfs-kernel-server already active, skipping"
 fi`,
+
+			// Second, separate export for Enterprise Gateway's kernelspecs (see
+			// EGKernelspecsExportPath). Kept as its own always-run, self-idempotent
+			// step — NOT nested inside the "if ! systemctl is-active" guard above —
+			// so a resumed/retried run (nfs-kernel-server already active from a
+			// prior attempt) still adds this export rather than being skipped along
+			// with the whole block. Appends to /etc/exports (tee -a) rather than
+			// overwriting it, since the step above already wrote the /srv/nfs/k8s
+			// line to that file.
+			fmt.Sprintf(`sudo mkdir -p %[1]s
+sudo chmod 755 %[1]s
+grep -qxF '%[1]s *(rw,sync,no_subtree_check,no_root_squash)' /etc/exports || \
+  echo '%[1]s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
+sudo exportfs -ra`, EGKernelspecsExportPath),
+
+			// Seed the export with EG's built-in + framework kernelspecs. No Docker
+			// on this host, so `skopeo copy docker://... dir:...` (a standalone,
+			// daemonless apt package) pulls the image straight from the registry as
+			// flat OCI blobs, which are then just tar-extracted in layer order —
+			// equivalent to `docker run --rm -v ...:/dest IMAGE cp -r /kernels/. /dest/`
+			// without needing a container runtime at all. Idempotent: skipped
+			// entirely once python3's kernelspec is present (proof a prior run
+			// already seeded this export).
+			fmt.Sprintf(`if [ ! -f %[1]s/python3/kernel.json ]; then
+  command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y skopeo; }
+  command -v jq >/dev/null || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq; }
+  sudo rm -rf /tmp/eg-kernelspecs-img
+  sudo skopeo copy docker://%[2]s dir:/tmp/eg-kernelspecs-img
+  for DIGEST in $(jq -r '.layers[].digest' /tmp/eg-kernelspecs-img/manifest.json | sed 's/^sha256://'); do
+    sudo tar -xf "/tmp/eg-kernelspecs-img/$DIGEST" -C %[1]s
+  done
+  sudo chmod -R a+rX %[1]s
+  sudo rm -rf /tmp/eg-kernelspecs-img
+  echo "Seeded EG kernelspecs onto %[1]s"
+else
+  echo "EG kernelspecs already seeded at %[1]s, skipping"
+fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 		}},
 
 		// ── Phase 2: System settings ─────────────────────────────────────────────────
@@ -488,7 +555,7 @@ exit $RC )`,
 		// ── Phase 8: Post-init ───────────────────────────────────────────────────────
 		{Name: "Post-Init", Steps: []string{
 			"kubectl taint nodes --all node-role.kubernetes.io/control-plane- || kubectl taint nodes --all node-role.kubernetes.io/master- || true",
-			fmt.Sprintf("kubectl label nodes --all hardware-type=%s --overwrite", cluster.Spec.NodeInfo.HardwareType),
+			fmt.Sprintf("kubectl label nodes --all hardware-type=%s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite", cluster.Spec.NodeInfo.HardwareType),
 		}},
 
 		// ── Phase 9: CNI ─────────────────────────────────────────────────────────────
@@ -506,6 +573,7 @@ exit $RC )`,
 			"rm -rf /tmp/catalog",
 			"git clone https://github.com/vitu-mafeni/catalog.git /tmp/catalog",
 			"kubectl apply -f /tmp/catalog/nephio/optional/flux-helm-controllers",
+
 			`cat <<EOF | kubectl apply -f -
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
@@ -525,7 +593,8 @@ EOF`,
 			// Wait for the cert-manager webhook to be ready before pass 2 so that
 			// ClusterIssuer creation does not fail with "connection refused".
 			`kubectl -n cert-manager wait --for=condition=Available deployment/cert-manager-webhook --timeout=180s 2>/dev/null || true`,
-			`sleep 5`,
+			`sleep 3`,
+			`kubectl apply -f /tmp/catalog/workloads/ml-platform/harbor/`,
 			// Pass 2: real apply. Capture output, print it, then fail only on
 			// actual server errors. Client-side "no matches for kind" errors for
 			// GCP-specific types (ApplyReplacements, RootSync, etc.) are expected
@@ -807,10 +876,18 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 		return fmt.Errorf("failed to resolve node name for host %s vpn ip: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput), ""
 	}
 
-	labelAndTaintCmd := fmt.Sprintf(
-		"kubectl label node %s hardware-type=%s gpu=on --overwrite && kubectl taint node %s hardware-type=gpu:PreferNoSchedule --overwrite",
-		nodeName, cluster.Spec.NodeInfo.HardwareType, nodeName,
-	)
+	var labelAndTaintCmd string
+	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+		labelAndTaintCmd = fmt.Sprintf(
+			"kubectl label node %s hardware-type=%s gpu=on ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite && kubectl taint node %s hardware-type=gpu:PreferNoSchedule --overwrite",
+			nodeName, cluster.Spec.NodeInfo.HardwareType, nodeName,
+		)
+	} else {
+		labelAndTaintCmd = fmt.Sprintf(
+			"kubectl label node %s hardware-type=%s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite",
+			nodeName, cluster.Spec.NodeInfo.HardwareType,
+		)
+	}
 	if output, err := sshhelper.Run(cpClient, labelAndTaintCmd); err != nil {
 		return fmt.Errorf("failed to label/taint worker node %s: %w\nOutput:\n%s", nodeName, err, output), ""
 	}
