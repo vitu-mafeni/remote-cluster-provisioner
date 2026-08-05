@@ -18,6 +18,12 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - configmaps
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
   - secrets
   verbs:
   - create

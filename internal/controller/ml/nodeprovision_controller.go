@@ -1622,6 +1622,7 @@ func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1
 	if needsRefresh {
 		log.Info("Bootstrap token missing or too old — refreshing via local Kubernetes API")
 		if err := r.refreshLocalJoinToken(ctx, nc); err != nil {
+			log.Error(err, "Failed to refresh bootstrap token")
 			return nil, fmt.Errorf("refreshing bootstrap token: %w", err)
 		}
 		// Re-fetch so callers see the updated join command.

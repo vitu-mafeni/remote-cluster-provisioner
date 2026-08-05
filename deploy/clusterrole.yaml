@@ -37,6 +37,12 @@ rules:
     resources: [nodeprovisions/finalizers, nodeprovisionnetconfigs/finalizers]
     verbs: [update]
 
+  # Core: configmaps — read cluster-info from kube-public to build kubeadm join
+  # commands (CA cert hash + API server URL).
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+
   # Core: events — CRs may live in any namespace; controller-runtime records events
   # in the object's namespace, so this must be cluster-scoped.
   - apiGroups: [""]
