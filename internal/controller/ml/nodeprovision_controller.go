@@ -1588,6 +1588,12 @@ func (r *NodeProvisionReconciler) cleanupOnPremNode(ctx context.Context, np *mlv
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
+// joinTokenMaxAge is the window before the 24-hour kubeadm token expiry in
+// which the NodeProvision controller refuses to launch a new EC2 instance.
+// The RemoteCluster controller refreshes the token every 23 h; this 4-hour
+// guard ensures the instance always gets a token with plenty of life left.
+const joinTokenMaxAge = 20 * time.Hour
+
 func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1alpha1.NodeProvision) (*mlv1alpha1.NodeProvisionNetConfig, error) {
 	log := logf.FromContext(ctx)
 	netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
@@ -1602,6 +1608,18 @@ func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1
 	if nc.Status.ClusterJoinCommand == "" {
 		log.Info("Cluster join command not ready yet; requeueing")
 		return nil, fmt.Errorf("join command not ready")
+	}
+	// Refuse to embed a bootstrap token that is more than joinTokenMaxAge old.
+	// kubeadm tokens expire after 24 h; the RemoteCluster controller refreshes
+	// every 23 h.  If the timestamp is absent (first init before this field was
+	// added) we allow the command through — it will be stamped on next refresh.
+	if nc.Status.JoinTokenRefreshedAt != nil {
+		age := time.Since(nc.Status.JoinTokenRefreshedAt.Time)
+		if age > joinTokenMaxAge {
+			log.Info("Bootstrap token is too old; waiting for RemoteCluster controller to refresh it",
+				"age", age.Round(time.Minute), "maxAge", joinTokenMaxAge)
+			return nil, fmt.Errorf("bootstrap token too old (%s); waiting for refresh", age.Round(time.Minute))
+		}
 	}
 	return nc, nil
 }

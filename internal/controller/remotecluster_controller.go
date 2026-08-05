@@ -1314,16 +1314,22 @@ echo "kubeconfig-refresh timer enabled"
 	return nil
 }
 
-// patchRemoteNetConfigJoinCmd updates only the ClusterJoinCommand field on the
-// remote cluster's NodeProvisionNetConfig via SSH.
+// patchRemoteNetConfigJoinCmd updates the ClusterJoinCommand and
+// JoinTokenRefreshedAt fields on the remote cluster's NodeProvisionNetConfig
+// via SSH.  The timestamp lets the NodeProvision controller verify that the
+// embedded bootstrap token is still within its 24-hour lifetime before
+// launching a new EC2 instance.
 func (r *RemoteClusterReconciler) patchRemoteNetConfigJoinCmd(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *ssh.Client, joinCmd string) error {
 	log := logf.FromContext(ctx)
 	joinCmdJSON, _ := json.Marshal(joinCmd)
+	nowJSON, _ := json.Marshal(time.Now().UTC().Format(time.RFC3339))
 	cmd := fmt.Sprintf(
-		`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status -p '{"status":{"clusterJoinCommand":%s}}'`,
+		`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status `+
+			`-p '{"status":{"clusterJoinCommand":%s,"joinTokenRefreshedAt":%s}}'`,
 		cluster.Spec.ClusterName,
 		cluster.Namespace,
 		string(joinCmdJSON),
+		string(nowJSON),
 	)
 	out, err := sshhelper.Run(sshClient, cmd)
 	if err != nil {
