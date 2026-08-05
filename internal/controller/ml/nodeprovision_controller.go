@@ -1703,13 +1703,15 @@ func (r *NodeProvisionReconciler) refreshLocalJoinToken(ctx context.Context, nc 
 	}
 
 	// Minimal struct to extract server + CA from the kubeconfig YAML.
+	// sigs.k8s.io/yaml converts YAML→JSON then uses encoding/json, so json tags
+	// are required (yaml tags are silently ignored by the JSON decoder).
 	var kc struct {
 		Clusters []struct {
 			Cluster struct {
-				Server                   string `yaml:"server"`
-				CertificateAuthorityData string `yaml:"certificate-authority-data"`
-			} `yaml:"cluster"`
-		} `yaml:"clusters"`
+				Server                   string `json:"server"`
+				CertificateAuthorityData string `json:"certificate-authority-data"`
+			} `json:"cluster"`
+		} `json:"clusters"`
 	}
 	if err := yaml.Unmarshal([]byte(kubeconfigYAML), &kc); err != nil {
 		return fmt.Errorf("parsing cluster-info kubeconfig: %w", err)
