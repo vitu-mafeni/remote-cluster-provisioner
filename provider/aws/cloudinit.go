@@ -25,8 +25,11 @@ type CloudInitParams struct {
 	KubernetesMinorVersion string
 	CRIOVersion            string
 	NodeName               string
-	Labels                 []string // Kept for API compatibility; applied by the controller after join.
+	Labels                 []string // Extra labels reserved for the control-plane reconciler.
 	SSHUsername            string
+	// IsGPUNode identifies this worker as a GPU node. It controls Kubernetes
+	// node labels only; GPU Operator owns all NVIDIA software/runtime setup.
+	IsGPUNode bool
 }
 
 const (
@@ -118,12 +121,24 @@ type templateData struct {
 	NodeName          string
 	SSHUsername       string
 	HasSSHUsername    bool
+	IsGPUNode         bool
+	KubeletNodeLabels string
 	CRIOAsset         string
 	CRIOCommit        string
 	CRIUAsset         string
 	CRIUGitID         string
 	RuncVersion       string
 	CRIOSocket        string
+}
+
+func kubeletNodeLabels(p CloudInitParams) string {
+	if !p.IsGPUNode {
+		return ""
+	}
+	// These are the same GPU identity labels applied authoritatively by the
+	// kubeadm control-plane reconciler after the worker joins. Setting them at
+	// registration time avoids a window where the GPU worker is unclassified.
+	return "hardware-type=gpu,gpu=on,ml.dcn.ssu.ac.kr/provider=OnPrem"
 }
 
 func renderBootstrapScript(p CloudInitParams) (string, error) {
@@ -143,6 +158,8 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 		NodeName:          p.NodeName,
 		SSHUsername:       p.SSHUsername,
 		HasSSHUsername:    p.SSHUsername != "",
+		IsGPUNode:         p.IsGPUNode,
+		KubeletNodeLabels: kubeletNodeLabels(p),
 		CRIOAsset:         kubeadm.CrioAsset,
 		CRIOCommit:        kubeadm.CrioCommit,
 		CRIUAsset:         kubeadm.CriuAsset,
@@ -240,15 +257,17 @@ apt_install() {
 }
 
 wait_for_apt() {
-  local i
-  for i in $(seq 1 30); do
-    if flock -n /var/lib/dpkg/lock-frontend -c 'true' 2>/dev/null; then
+  local i holders
+  for i in $(seq 1 36); do
+    holders="$(fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true)"
+    if [[ -z "${holders//[[:space:]]/}" ]]; then
       return 0
     fi
-    report "Waiting for apt/dpkg lock (${i}/30)"
+    report "Waiting for apt/dpkg lock holders (${i}/36): ${holders}"
     sleep 5
   done
-  echo 'Timed out waiting for dpkg lock' >&2
+  echo 'Timed out waiting for dpkg/apt locks' >&2
+  fuser -v /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
   return 1
 }
 
@@ -329,14 +348,13 @@ sysctl --system >/dev/null
 # -----------------------------------------------------------------------------
 report "Installing base OS packages"
 
-wait_for_apt
+# Stop Ubuntu's scheduled package jobs before waiting for the package database.
+# Do not kill arbitrary apt/dpkg processes: cloud-init itself can be running apt.
 systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
 systemctl disable unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 
-# Never kill arbitrary apt-get processes: cloud-init itself can be running apt.
-# Wait for the lock and repair dpkg instead.
 wait_for_apt
-dpkg --configure -a || true
+dpkg --configure -a
 apt_update
 apt_install ca-certificates curl gnupg apt-transport-https lsof jq git build-essential pkg-config \
   autoconf automake libtool python3-dev libyajl-dev libjson-c-dev \
@@ -384,12 +402,32 @@ dpkg --configure -a
 # depending on the Ubuntu release's older golang package.
 report "Installing Go 1.26.4 for custom CRI-O"
 GO_VERSION="1.26.4"
+case "$(dpkg --print-architecture)" in
+  amd64) GO_ARCH=amd64 ;;
+  arm64) GO_ARCH=arm64 ;;
+  *) echo "Unsupported architecture for Go: $(dpkg --print-architecture)" >&2; exit 1 ;;
+esac
 if [[ ! -x /usr/local/go/bin/go ]] || [[ "$(/usr/local/go/bin/go version 2>/dev/null || true)" != *"go${GO_VERSION}"* ]]; then
-  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
   rm -rf /usr/local/go
   tar -C /usr/local -xzf /tmp/go.tar.gz
   rm -f /tmp/go.tar.gz
 fi
+
+# cloud-init may execute scripts with HOME unset. Go's build system requires a
+# writable cache location and otherwise fails with:
+#   build cache is required, but could not be located: GOCACHE is not defined
+# Set all relevant Go cache/module variables explicitly because the custom CRI-O
+# build invokes go build through Make.
+export HOME=/root
+export USER=root
+export LOGNAME=root
+export XDG_CACHE_HOME=/root/.cache
+export GOCACHE=/root/.cache/go-build
+export GOPATH=/root/go
+export GOMODCACHE=/root/go/pkg/mod
+mkdir -p "$XDG_CACHE_HOME" "$GOCACHE" "$GOPATH" "$GOMODCACHE"
+/usr/local/go/bin/go env HOME XDG_CACHE_HOME GOCACHE GOPATH GOMODCACHE
 /usr/local/go/bin/go version
 export PATH="/usr/local/go/bin:${PATH}"
 
@@ -400,7 +438,7 @@ rm -rf /tmp/conmon
 git clone --depth=1 https://github.com/containers/conmon /tmp/conmon
 (
   cd /tmp/conmon
-  PATH="/usr/local/go/bin:${PATH}" make
+  HOME="${HOME}" XDG_CACHE_HOME="${XDG_CACHE_HOME}" GOCACHE="${GOCACHE}" GOPATH="${GOPATH}" GOMODCACHE="${GOMODCACHE}" PATH="/usr/local/go/bin:${PATH}" make
   make install
 )
 mkdir -p /usr/libexec/crio
@@ -415,7 +453,7 @@ git clone --depth=1 --branch 22-07-2026-checkpoint-restore \
   https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio
 (
   cd /tmp/custom-crio
-  PATH="/usr/local/go/bin:${PATH}" make
+  HOME="${HOME}" XDG_CACHE_HOME="${XDG_CACHE_HOME}" GOCACHE="${GOCACHE}" GOPATH="${GOPATH}" GOMODCACHE="${GOMODCACHE}" PATH="/usr/local/go/bin:${PATH}" make
   make install
   make install.config
   make install.systemd
@@ -480,8 +518,23 @@ cat > /etc/crio/crio.conf.d/999-runc.conf <<'RUNTIME'
 
     [crio.runtime.runtimes]
       [crio.runtime.runtimes.runc]
-        runtime_path = "/usr/local/sbin/runc"
+        runtime_path = "/usr/bin/runc"
         runtime_type = "oci"
+
+      [crio.runtime.runtimes.nvidia]
+        runtime_path = "/usr/bin/nvidia-container-runtime"
+        runtime_type = "oci"
+RUNTIME
+
+cat > /etc/crio/crio.conf.d/9999-nvidia.conf <<'RUNTIME'
+[crio.runtime]
+  [crio.runtime.runtimes]
+    [crio.runtime.runtimes.nvidia]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+      runtime_type = "oci"
+    [crio.runtime.runtimes.nvidia-cdi]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
+      runtime_type = "oci"
 RUNTIME
 
 cat > /etc/containers/policy.json <<'POLICY'
@@ -496,6 +549,7 @@ location = "docker.io"
 REGCONF
 
 # CRIU runtime configuration used by the customized CRI-O/checkpoint path.
+mkdir -p /etc/criu
 cat > /etc/criu/runc.conf <<'CRIUCONF'
 tcp-close
 skip-in-flight
@@ -544,9 +598,14 @@ RUNC_WANT="{{.RuncVersion}}"
 RUNC_BIN=/usr/local/sbin/runc
 RUNC_HAVE="$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}' || true)"
 if [[ "$RUNC_HAVE" != "$RUNC_WANT" ]]; then
-  curl -fsSL "https://github.com/opencontainers/runc/releases/download/${RUNC_WANT}/runc.amd64" -o /tmp/runc
+  case "$(dpkg --print-architecture)" in
+    amd64) RUNC_ARCH=amd64 ;;
+    arm64) RUNC_ARCH=arm64 ;;
+    *) echo "Unsupported architecture for runc: $(dpkg --print-architecture)" >&2; exit 1 ;;
+  esac
+  curl -fsSL "https://github.com/opencontainers/runc/releases/download/${RUNC_WANT}/runc.${RUNC_ARCH}" -o /tmp/runc
   curl -fsSL "https://github.com/opencontainers/runc/releases/download/${RUNC_WANT}/runc.sha256sum" -o /tmp/runc.sha256sum
-  EXPECTED_SHA="$(awk '/ runc\.amd64$/{print $1; exit}' /tmp/runc.sha256sum)"
+  EXPECTED_SHA="$(awk -v f="runc.${RUNC_ARCH}" '$2 == f {print $1; exit}' /tmp/runc.sha256sum)"
   ACTUAL_SHA="$(sha256sum /tmp/runc | awk '{print $1}')"
   [[ -n "$EXPECTED_SHA" && "$EXPECTED_SHA" == "$ACTUAL_SHA" ]] || {
     echo "runc checksum mismatch" >&2
@@ -599,8 +658,7 @@ debug: false
 CRICTL
 chmod 0644 /etc/crictl.yaml
 crictl --version
-crictl info >/dev/null
-report "CRI-O is healthy and crictl is configured"
+report "crictl is installed and configured"
 
 systemctl daemon-reload
 systemctl enable crio
@@ -626,7 +684,11 @@ apt-mark hold kubelet kubeadm kubectl
 systemctl enable kubelet
 systemctl stop kubelet 2>/dev/null || true
 
-printf 'KUBELET_EXTRA_ARGS=--node-ip=%s\n' "$NODE_IP" > /etc/default/kubelet
+KUBELET_ARGS="--node-ip=${NODE_IP}"
+if [[ -n "{{.KubeletNodeLabels}}" ]]; then
+  KUBELET_ARGS="${KUBELET_ARGS} --node-labels={{.KubeletNodeLabels}}"
+fi
+printf 'KUBELET_EXTRA_ARGS=%s\n' "$KUBELET_ARGS" > /etc/default/kubelet
 mkdir -p /etc/systemd/system/kubelet.service.d
 cat > /etc/systemd/system/kubelet.service.d/10-crio.conf <<'UNIT'
 [Unit]
@@ -697,10 +759,10 @@ crictl info >/dev/null
 # make CRI-O unavailable before the operator is ready.
 report "GPU configuration deferred entirely to GPU Operator"
 
-# Labels are deliberately not applied here. An EC2 worker normally has no
-# kubeconfig/admin.conf, and the provisioning controller already applies the
-# authoritative labels/taints after resolving the joined node on the control
-# plane. The Labels field remains for API compatibility.
+# GPU identity labels are supplied to kubelet at registration time when
+# IsGPUNode=true. The control-plane reconciler remains authoritative and will
+# re-apply the same labels and the GPU taint after resolving the joined node.
+# No kubectl/admin kubeconfig is required on the worker.
 
 # -----------------------------------------------------------------------------
 # SSH access
