@@ -61,6 +61,8 @@ type npPrepullJobResult struct {
 type NodeProvisionReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// CredMgr handles background refresh of AWS STS / MFA-backed sessions.
+	CredMgr *awsprovision.CredentialManager
 	// onPremJobs holds in-flight on-prem provisioning goroutines.
 	// Key: "<namespace>/<name>", Value: <-chan onPremJobResult
 	onPremJobs sync.Map
@@ -1766,42 +1768,15 @@ func (r *NodeProvisionReconciler) getSecret(ctx context.Context, np *mlv1alpha1.
 	return secret, nil
 }
 
-// resolveAWSCreds returns AWS credentials for the given secret, transparently
-// handling MFA-backed STS session tokens.
-//
-// When mfaSerialNumber is present in the secret the function calls
-// ResolveAWSCredentialsWithMFA, which either reuses a cached STS session or
-// performs sts:GetSessionToken (using an auto-generated TOTP code when
-// mfaTotpSecret is set, or the manual mfaTokenCode otherwise).
-//
-// When a fresh STS session is obtained the new token and its expiry are written
-// back into the secret (keys awsSessionToken + awsSessionExpiry) so the next
-// reconcile can reuse the session without another MFA round-trip.
+// resolveAWSCreds returns AWS credentials for the given secret via the
+// CredentialManager, which maintains an in-memory cache and refreshes
+// STS/MFA-backed sessions in the background before they expire.
 func (r *NodeProvisionReconciler) resolveAWSCreds(
 	ctx context.Context,
 	region string,
 	secret *corev1.Secret,
 ) (awsprovision.AWSCredentials, error) {
-	creds, session, err := awsprovision.ResolveAWSCredentialsWithMFA(ctx, region, secret)
-	if err != nil {
-		return awsprovision.AWSCredentials{}, fmt.Errorf("resolving AWS credentials: %w", err)
-	}
-	if session != nil {
-		// Fresh STS session — persist it back into the secret so subsequent
-		// reconciles can reuse it for the duration of the session.
-		patch := secret.DeepCopy()
-		if patch.Data == nil {
-			patch.Data = map[string][]byte{}
-		}
-		patch.Data["awsSessionToken"] = []byte(session.Credentials.SessionToken)
-		patch.Data["awsSessionExpiry"] = []byte(session.Expiry.UTC().Format(time.RFC3339))
-		if pErr := r.Patch(ctx, patch, client.MergeFrom(secret)); pErr != nil {
-			// Non-fatal: session is valid for this reconcile; log and continue.
-			logf.FromContext(ctx).Error(pErr, "persisting MFA session token to secret (non-fatal)",
-				"secret", secret.Name)
-		}
-	}
-	return creds, nil
+	return r.CredMgr.Get(ctx, secret.Namespace, secret.Name, region)
 }
 
 // getControllerCredsSecret retrieves the controller-owned copy of the credentials

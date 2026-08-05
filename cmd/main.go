@@ -39,6 +39,7 @@ import (
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/internal/controller"
 	mlcontroller "dcn.ssu.ac.kr/infra/internal/controller/ml"
+	awsprovision "dcn.ssu.ac.kr/infra/provider/aws"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -188,9 +189,15 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "RemoteCluster")
 		os.Exit(1)
 	}
+	credMgr := awsprovision.NewCredentialManager(mgr.GetClient(), ctrl.Log.WithName("aws-cred-manager"))
+	if err := mgr.Add(credMgr); err != nil {
+		setupLog.Error(err, "Failed to register AWS credential manager")
+		os.Exit(1)
+	}
 	if err := (&mlcontroller.NodeProvisionReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		CredMgr: credMgr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "NodeProvision")
 		os.Exit(1)

@@ -49,13 +49,22 @@ import (
 //	awsSessionExpiry    — RFC3339 expiry timestamp
 
 const (
+	// Secret keys written by the controller for MFA / GetSessionToken sessions.
 	secretKeySessionToken  = "awsSessionToken"
 	secretKeySessionExpiry = "awsSessionExpiry"
+
+	// Secret keys written by the controller for AssumeRole sessions.
+	secretKeyRoleAccessKeyID     = "roleAccessKeyId"
+	secretKeyRoleSecretAccessKey = "roleSecretAccessKey"
+	secretKeyRoleSessionToken    = "roleSessionToken"
+	secretKeyRoleSessionExpiry   = "roleSessionExpiry"
 
 	// Sessions expiring within this window are refreshed proactively.
 	mfaSessionGrace = 5 * time.Minute
 	// Default sts:GetSessionToken duration when mfaDurationSeconds is absent.
 	mfaDefaultDuration = int32(43200) // 12 hours
+	// Default sts:AssumeRole duration when roleDurationSeconds is absent.
+	roleDefaultDuration = int32(3600) // 1 hour
 )
 
 // MFASession holds the temporary credentials returned by sts:GetSessionToken
@@ -212,6 +221,83 @@ func generateTOTPCode(seed string, t time.Time) (string, error) {
 		uint32(h[offset+3])) % 1_000_000
 
 	return fmt.Sprintf("%06d", code), nil
+}
+
+// AssumeRole calls sts:AssumeRole using the provided base credentials and
+// returns a short-lived session for the target role.
+//
+// sessionName defaults to "remote-cluster-provisioner" when empty.
+// externalID is optional (used for cross-account trust policies).
+// durationSec is clamped to [900, 43200]; 0 uses roleDefaultDuration (1 h).
+func AssumeRole(
+	ctx context.Context,
+	region string,
+	base AWSCredentials,
+	roleArn, sessionName, externalID string,
+	durationSec int32,
+) (MFASession, error) {
+	if sessionName == "" {
+		sessionName = "remote-cluster-provisioner"
+	}
+	if durationSec <= 0 {
+		durationSec = roleDefaultDuration
+	}
+
+	sdkCfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+		config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(base.AccessKeyID, base.SecretAccessKey, base.SessionToken),
+		),
+	)
+	if err != nil {
+		return MFASession{}, fmt.Errorf("loading AWS config for AssumeRole: %w", err)
+	}
+
+	input := &sts.AssumeRoleInput{
+		RoleArn:         awssdk.String(roleArn),
+		RoleSessionName: awssdk.String(sessionName),
+		DurationSeconds: awssdk.Int32(durationSec),
+	}
+	if externalID != "" {
+		input.ExternalId = awssdk.String(externalID)
+	}
+
+	out, err := sts.NewFromConfig(sdkCfg).AssumeRole(ctx, input)
+	if err != nil {
+		return MFASession{}, fmt.Errorf("sts:AssumeRole %s: %w", roleArn, err)
+	}
+	if out.Credentials == nil {
+		return MFASession{}, fmt.Errorf("sts:AssumeRole %s returned empty credentials", roleArn)
+	}
+
+	c := out.Credentials
+	return MFASession{
+		Credentials: AWSCredentials{
+			AccessKeyID:     awssdk.ToString(c.AccessKeyId),
+			SecretAccessKey: awssdk.ToString(c.SecretAccessKey),
+			SessionToken:    awssdk.ToString(c.SessionToken),
+		},
+		Expiry: awssdk.ToTime(c.Expiration),
+	}, nil
+}
+
+// CachedRoleSession returns the role session credentials persisted in the
+// secret, and whether they are present and not yet near expiry.
+func CachedRoleSession(secret *corev1.Secret, grace time.Duration) (AWSCredentials, time.Time, bool) {
+	token := secretVal(secret, secretKeyRoleSessionToken)
+	if token == "" {
+		return AWSCredentials{}, time.Time{}, false
+	}
+	expStr := secretVal(secret, secretKeyRoleSessionExpiry)
+	exp, err := time.Parse(time.RFC3339, expStr)
+	if err != nil || time.Now().Add(grace).After(exp) {
+		return AWSCredentials{}, time.Time{}, false
+	}
+	return AWSCredentials{
+		AccessKeyID:     secretVal(secret, secretKeyRoleAccessKeyID),
+		SecretAccessKey: secretVal(secret, secretKeyRoleSecretAccessKey),
+		SessionToken:    token,
+	}, exp, true
 }
 
 // secretVal reads a secret Data key and trims surrounding whitespace.
