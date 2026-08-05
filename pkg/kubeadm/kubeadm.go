@@ -162,13 +162,13 @@ EOF`,
 		// Remove any stale file first, then write fresh config.
 		`sudo rm -f /etc/criu/runc.conf && \
 sudo mkdir -p /etc/criu && \
-printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | sudo tee /etc/criu/runc.conf > /dev/null`,
 
 		// Default CRIU config (used when criu is invoked without --config).
 		`sudo rm -f /etc/criu/default.conf && \
 sudo mkdir -p /etc/criu && \
-printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | sudo tee /etc/criu/default.conf > /dev/null`,
 
 		// ── Custom CRIU binary (device-restore-with-hook) ────────────────────────────

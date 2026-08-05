@@ -1,0 +1,123 @@
+# Harbor Registry Configurator DaemonSet
+#
+# Writes /etc/containers/registries.conf on every node with Harbor as an
+# insecure registry, then sends SIGHUP to CRI-O so it picks up the change
+# without a restart.
+#
+# Usage:
+#   1. Set the harbor-registry ConfigMap's endpoint field to your Harbor
+#      registry host:port (e.g. "10.8.0.1:30080").
+#   2. kubectl apply -f deploy/harbor-registry-configurator.yaml
+#
+# To auto-discover the Harbor NodePort from within the cluster:
+#   kubectl -n harbor get svc harbor -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}'
+# Then set endpoint to "<control-plane-vpn-ip>:<nodeport>".
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: harbor-registry
+  namespace: kube-system
+data:
+  # Harbor registry endpoint — host:port reachable from all nodes (VPN IP + NodePort).
+  # Example: "10.8.0.1:30080"
+  endpoint: ""
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: harbor-registry-configurator
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: harbor-registry-configurator
+    app.kubernetes.io/component: registry-config
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: harbor-registry-configurator
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: harbor-registry-configurator
+    spec:
+      hostPID: true
+      priorityClassName: system-node-critical
+      tolerations:
+      - operator: Exists    # tolerate all taints — must run on every node
+      containers:
+      - name: configurator
+        image: alpine:3
+        securityContext:
+          privileged: true
+        env:
+        - name: HARBOR_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: harbor-registry
+              key: endpoint
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -eu
+
+          CONF=/host/etc/containers/registries.conf
+          mkdir -p /host/etc/containers
+
+          apply_config() {
+            if [ -z "${HARBOR_ENDPOINT:-}" ]; then
+              echo "HARBOR_ENDPOINT not set — nothing to configure"
+              return
+            fi
+
+            # Build the desired registries.conf content
+            DESIRED=$(printf 'unqualified-search-registries = ["docker.io"]\n\n[[registry]]\nlocation = "docker.io"\n\n[[registry]]\nprefix = "%s"\nlocation = "%s"\ninsecure = true\n' \
+              "$HARBOR_ENDPOINT" "$HARBOR_ENDPOINT")
+
+            # Only write and reload when the file has actually changed
+            CURRENT=$(cat "$CONF" 2>/dev/null || true)
+            if [ "$CURRENT" = "$DESIRED" ]; then
+              echo "registries.conf already up to date (Harbor: ${HARBOR_ENDPOINT})"
+              return
+            fi
+
+            printf '%s\n' "$DESIRED" > "$CONF"
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) Updated registries.conf (Harbor: ${HARBOR_ENDPOINT})"
+
+            # Send SIGHUP to CRI-O — it reloads registries.conf without a full restart
+            for f in /proc/[0-9]*/comm; do
+              [ -r "$f" ] || continue
+              read -r comm < "$f" 2>/dev/null || continue
+              [ "$comm" = "crio" ] || continue
+              pid="${f##/proc/}"
+              pid="${pid%%/*}"
+              kill -HUP "$pid" 2>/dev/null \
+                && echo "Sent SIGHUP to CRI-O (pid ${pid})" \
+                || echo "WARN: could not signal CRI-O pid ${pid}"
+              break
+            done
+          }
+
+          # Apply immediately on startup, then re-check hourly so the config
+          # survives CRI-O restarts and node reboots.
+          apply_config
+          while sleep 3600; do
+            apply_config
+          done
+        volumeMounts:
+        - name: host-etc-containers
+          mountPath: /host/etc/containers
+        resources:
+          requests:
+            cpu: 5m
+            memory: 10Mi
+          limits:
+            memory: 20Mi
+      volumes:
+      - name: host-etc-containers
+        hostPath:
+          path: /etc/containers
+          type: DirectoryOrCreate

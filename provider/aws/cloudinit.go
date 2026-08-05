@@ -304,13 +304,13 @@ systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; 
 # CRIU configuration (matches crioBuildSteps in kubeadm.go)
 rm -f /etc/criu/runc.conf
 mkdir -p /etc/criu
-printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | tee /etc/criu/runc.conf > /dev/null
 
 # Default CRIU config (used when criu is invoked without --config)
 rm -f /etc/criu/default.conf
 mkdir -p /etc/criu
-printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\n' \
+printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
   | tee /etc/criu/default.conf > /dev/null
 
 # CRI-O runc runtime drop-in — declares runc as the default OCI runtime
