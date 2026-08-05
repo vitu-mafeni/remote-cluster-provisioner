@@ -431,7 +431,12 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	}
 	log.Info("Creating EC2 instance")
 
-	result, err := awsprovision.ProvisionEC2Node(ctx, np, secret, vpnServerClient, netConfig)
+	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+	if err != nil {
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving AWS credentials: %v", err))
+	}
+
+	result, err := awsprovision.ProvisionEC2Node(ctx, np, creds, vpnServerClient, netConfig)
 	// Always persist VPN allocation immediately — even on EC2 failure — so that
 	// cleanupVPNPeer can find and release the peer on the next retry instead of
 	// leaving it as an orphan and allocating yet another IP.
@@ -565,7 +570,10 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		return false, nil // nothing to resolve
 	}
 
-	creds := awsprovision.ResolveAWSCredentials(secret)
+	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+	if err != nil {
+		return false, fmt.Errorf("resolving AWS credentials: %w", err)
+	}
 	base := np.DeepCopy()
 	if np.Spec.AWSConfig == nil {
 		np.Spec.AWSConfig = &mlv1alpha1.AWSConfig{}
@@ -646,7 +654,12 @@ func (r *NodeProvisionReconciler) reconcileWaitingForInstance(
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	privateIP, publicIP, err := awsprovision.WaitForInstanceRunning(ctx, np, secret, np.Status.InstanceID)
+	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("resolving AWS credentials: %w", err)
+	}
+
+	privateIP, publicIP, err := awsprovision.WaitForInstanceRunning(ctx, np, creds, np.Status.InstanceID)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("polling instance state: %w", err)
 	}
@@ -1361,7 +1374,12 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 				}
 			}
 			if secret != nil {
-				if err := awsprovision.TerminateInstance(ctx, np, secret, np.Status.InstanceID); err != nil {
+				terminateCreds, credsErr := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+				if credsErr != nil {
+					log.Error(credsErr, "resolving AWS credentials for termination — using static fallback")
+					terminateCreds = awsprovision.ResolveAWSCredentials(secret)
+				}
+				if err := awsprovision.TerminateInstance(ctx, np, terminateCreds, np.Status.InstanceID); err != nil {
 					log.Error(err, "terminating EC2 instance", "instanceId", np.Status.InstanceID)
 				} else {
 					log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
@@ -1597,6 +1615,44 @@ func (r *NodeProvisionReconciler) getSecret(ctx context.Context, np *mlv1alpha1.
 		return nil, fmt.Errorf("getting credentials secret: %w", err)
 	}
 	return secret, nil
+}
+
+// resolveAWSCreds returns AWS credentials for the given secret, transparently
+// handling MFA-backed STS session tokens.
+//
+// When mfaSerialNumber is present in the secret the function calls
+// ResolveAWSCredentialsWithMFA, which either reuses a cached STS session or
+// performs sts:GetSessionToken (using an auto-generated TOTP code when
+// mfaTotpSecret is set, or the manual mfaTokenCode otherwise).
+//
+// When a fresh STS session is obtained the new token and its expiry are written
+// back into the secret (keys awsSessionToken + awsSessionExpiry) so the next
+// reconcile can reuse the session without another MFA round-trip.
+func (r *NodeProvisionReconciler) resolveAWSCreds(
+	ctx context.Context,
+	region string,
+	secret *corev1.Secret,
+) (awsprovision.AWSCredentials, error) {
+	creds, session, err := awsprovision.ResolveAWSCredentialsWithMFA(ctx, region, secret)
+	if err != nil {
+		return awsprovision.AWSCredentials{}, fmt.Errorf("resolving AWS credentials: %w", err)
+	}
+	if session != nil {
+		// Fresh STS session — persist it back into the secret so subsequent
+		// reconciles can reuse it for the duration of the session.
+		patch := secret.DeepCopy()
+		if patch.Data == nil {
+			patch.Data = map[string][]byte{}
+		}
+		patch.Data["awsSessionToken"] = []byte(session.Credentials.SessionToken)
+		patch.Data["awsSessionExpiry"] = []byte(session.Expiry.UTC().Format(time.RFC3339))
+		if pErr := r.Patch(ctx, patch, client.MergeFrom(secret)); pErr != nil {
+			// Non-fatal: session is valid for this reconcile; log and continue.
+			logf.FromContext(ctx).Error(pErr, "persisting MFA session token to secret (non-fatal)",
+				"secret", secret.Name)
+		}
+	}
+	return creds, nil
 }
 
 // getControllerCredsSecret retrieves the controller-owned copy of the credentials

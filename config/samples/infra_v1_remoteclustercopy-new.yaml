@@ -119,3 +119,66 @@ type: Opaque
 stringData:
   username: vitu1
   password: CHANGE ME
+---
+# AWS credentials secret — two supported modes:
+#
+# Mode 1: Static IAM credentials only
+#   Provide awsAccessKeyId and awsSecretAccessKey.
+#   The long-lived key pair is used directly for all AWS API calls.
+#
+# Mode 2: MFA-backed STS session (static credentials + MFA fields)
+#   Add mfaSerialNumber and mfaTotpSecret to enable automatic
+#   sts:GetSessionToken refresh. The controller generates TOTP codes and
+#   caches the resulting session token (awsSessionToken / awsSessionExpiry)
+#   in this secret, refreshing it automatically before it expires.
+#
+# ── How to obtain mfaTotpSecret ─────────────────────────────────────────────
+#
+#   mfaTotpSecret is the base32 seed AWS shows ONCE when you register a
+#   virtual MFA device. Retrieve it as follows:
+#
+#   New device:
+#     1. IAM → Users → <your user> → Security credentials → Assign MFA device
+#     2. Choose "Authenticator app" and click Next
+#     3. Click "Show QR code", then "show secret key" below the QR image
+#     4. Copy that key — this is your mfaTotpSecret
+#     5. Also scan the QR code with your authenticator app as normal
+#
+#   Already-registered device:
+#     AWS does not expose the seed after setup. Options:
+#     - Check your authenticator app: Authy, 1Password, and Bitwarden can
+#       export/display the secret. Google Authenticator cannot.
+#     - Deregister the device in IAM and re-register it, saving the secret
+#       key when it is displayed.
+#
+#   Hardware MFA keys (YubiKey, etc.) do not expose their TOTP seed and are
+#   not compatible with mfaTotpSecret. Use a virtual authenticator app.
+#
+#   Verify the secret generates correct codes (output should match your app):
+#     oathtool --totp --base32 <mfaTotpSecret>
+#
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-credentials
+  namespace: default
+type: Opaque
+stringData:
+  # ── Required for both modes ──────────────────────────────────────────────
+  awsAccessKeyId: "CHANGE ME"
+  awsSecretAccessKey: "CHANGE ME"
+
+  # ── MFA session mode (remove these two lines to use static mode only) ────
+  # ARN of the already-registered MFA device in AWS IAM.
+  mfaSerialNumber: "arn:aws:iam::123456789012:mfa/mydevice"
+  # Base32 TOTP seed — see "How to obtain mfaTotpSecret" above.
+  mfaTotpSecret: "CHANGE ME"
+
+  # ── Optional ─────────────────────────────────────────────────────────────
+  # Session token lifetime in seconds (900–129600). Default: 43200 (12 h).
+  # mfaDurationSeconds: "43200"
+
+  # The following fields are written automatically by the controller
+  # after each successful sts:GetSessionToken call. Do not set manually.
+  # awsSessionToken: ""
+  # awsSessionExpiry: ""

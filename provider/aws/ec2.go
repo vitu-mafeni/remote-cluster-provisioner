@@ -123,7 +123,7 @@ type ProvisionResult struct {
 func ProvisionEC2Node(
 	ctx context.Context,
 	nodeProvision *mlv1alpha1.NodeProvision,
-	secret *corev1.Secret,
+	creds AWSCredentials,
 	vpnServerClient *sshhelper.Client,
 	netNodeConfig *mlv1alpha1.NodeProvisionNetConfig,
 ) (*ProvisionResult, error) {
@@ -203,7 +203,6 @@ func ProvisionEC2Node(
 	// if EC2 launch fails — preventing orphaned peers on retry.
 	vpnResult := &ProvisionResult{VpnIP: vpnIP, PublicKey: publicKey}
 
-	creds := ResolveAWSCredentials(secret)
 	ec2Client, err := newEC2Client(ctx, nodeProvision.Spec.Region, creds)
 	if err != nil {
 		return vpnResult, fmt.Errorf("creating EC2 client: %w", err)
@@ -241,11 +240,10 @@ func ProvisionEC2Node(
 func WaitForInstanceRunning(
 	ctx context.Context,
 	nodeProvision *mlv1alpha1.NodeProvision,
-	secret *corev1.Secret,
+	creds AWSCredentials,
 	instanceID string,
 ) (privateIP, publicIP string, err error) {
 	name := nodeProvision.Name
-	creds := ResolveAWSCredentials(secret)
 	ec2Client, err := newEC2Client(ctx, nodeProvision.Spec.Region, creds)
 	if err != nil {
 		return "", "", fmt.Errorf("creating EC2 client: %w", err)
@@ -284,11 +282,10 @@ func WaitForInstanceRunning(
 func TerminateInstance(
 	ctx context.Context,
 	nodeProvision *mlv1alpha1.NodeProvision,
-	secret *corev1.Secret,
+	creds AWSCredentials,
 	instanceID string,
 ) error {
 	name := nodeProvision.Name
-	creds := ResolveAWSCredentials(secret)
 	ec2Client, err := newEC2Client(ctx, nodeProvision.Spec.Region, creds)
 	if err != nil {
 		return fmt.Errorf("creating EC2 client: %w", err)
