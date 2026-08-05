@@ -61,6 +61,20 @@ func renderBootstrapScript(p CloudInitParams) string {
 		labelCmd = fmt.Sprintf("kubectl label node \"$(hostname)\" %s --overwrite 2>/dev/null || true", strings.Join(p.Labels, " "))
 	}
 
+	// Match kubeadm's worker-node GPU labeling/tainting logic.  The GPU node
+	// must be identifiable to the scheduler even when the caller did not pass
+	// an explicit gpu=on label.
+	if p.IsGPUNode {
+		if labelCmd == "" {
+			labelCmd = `kubectl label node "$(hostname)" gpu=on --overwrite 2>/dev/null || true
+kubectl taint node "$(hostname)" hardware-type=gpu:PreferNoSchedule --overwrite 2>/dev/null || true`
+		} else {
+			labelCmd += `
+kubectl label node "$(hostname)" gpu=on --overwrite 2>/dev/null || true
+kubectl taint node "$(hostname)" hardware-type=gpu:PreferNoSchedule --overwrite 2>/dev/null || true`
+		}
+	}
+
 	nopasswdBlock := ""
 	if p.SSHUsername != "" {
 		nopasswdBlock = fmt.Sprintf(
@@ -69,16 +83,21 @@ func renderBootstrapScript(p CloudInitParams) string {
 		)
 	}
 
-	// GPU block: installs NVIDIA container toolkit and configures CRI-O with the
-	// nvidia runtime handler, matching what InstallNvidiaContainerToolkit does in
-	// pkg/kubeadm.  Written before kubeadm join so CRI-O is nvidia-ready when the
-	// GPU operator schedules pods with runtimeClassName=nvidia.
-	// gpuBlock replicates InstallNvidiaContainerToolkit from pkg/kubeadm for GPU nodes.
-	// 9999-nvidia.conf is written separately in the template (unconditionally, matching
-	// crioBuildSteps which runs for ALL nodes in kubeadm).
+	// GPU bootstrap mirrors the kubeadm GPU path:
+	//   1. add NVIDIA's libnvidia-container repository
+	//   2. install the same toolkit packages/version
+	//   3. configure CRI-O through nvidia-ctk
+	//   4. enable CDI in CRI-O and use /etc/cdi + /var/run/cdi
+	//   5. generate an NVIDIA CDI spec when the host driver is already active
+	//
+	// Driver installation is intentionally not forced here. The kubeadm package
+	// installs drivers in a separate operation and requires a reboot before
+	// GenerateCDI. AWS GPU AMIs may already contain a working driver, so cloud-init
+	// generates CDI immediately when nvidia-smi is usable and otherwise leaves the
+	// CDI generation to the GPU Operator/driver initialization path.
 	gpuBlock := ""
 	if p.IsGPUNode {
-		toolkitInstallCmd := `$APT install -y \
+		toolkitInstallCmd := `$APT install --allow-downgrades -y \
   nvidia-container-toolkit \
   nvidia-container-toolkit-base \
   libnvidia-container-tools \
@@ -92,15 +111,19 @@ func renderBootstrapScript(p CloudInitParams) string {
 				p.NvidiaContainerToolkitVersion, p.NvidiaContainerToolkitVersion,
 				p.NvidiaContainerToolkitVersion, p.NvidiaContainerToolkitVersion)
 		}
-		gpuBlock = fmt.Sprintf(`
-# ── NVIDIA container toolkit ──────────────────────────────────────────────────
-report "Installing NVIDIA container toolkit"
 
+		gpuBlock = fmt.Sprintf(`
+# ── GPU: NVIDIA container toolkit + CDI ───────────────────────────────────────
+report "Configuring NVIDIA GPU runtime"
+
+# Match pkg/kubeadm.InstallNvidiaContainerToolkit exactly: repository,
+# optional package pin, nvidia-ctk CRI-O configuration, and monitor_path cleanup.
+$APT install -y --no-install-recommends ca-certificates curl gnupg2
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
   | gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
   | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-  | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
 sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list
 $APT update
 %s
@@ -108,13 +131,24 @@ $APT update
 nvidia-ctk runtime configure --runtime=crio
 sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf 2>/dev/null || true
 
-# CDI support (matches gpuCDISteps in kubeadm.go).
+# Match kubeadm WorkerPhaseGPUCDI. CRI-O must know where NVIDIA CDI specs live.
 mkdir -p /etc/cdi /var/run/cdi /etc/crio/crio.conf.d
 test -f /etc/crio/crio.conf.d/99-cdi.conf || \
 printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]\n' \
   | tee /etc/crio/crio.conf.d/99-cdi.conf > /dev/null
 
-report "NVIDIA container toolkit installed"
+# Match kubeadm.GenerateCDI when the driver is already loaded.
+# Do not fail the entire bootstrap on an AMI where the NVIDIA driver needs a
+# reboot or is installed later by GPU Operator.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  report "NVIDIA driver is active; generating CDI specification"
+  nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+else
+  report "NVIDIA driver is not active yet; deferring CDI generation"
+fi
+
+nvidia-ctk --version
+report "NVIDIA GPU runtime configured"
 `, toolkitInstallCmd)
 	}
 
