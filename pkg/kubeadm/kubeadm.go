@@ -12,13 +12,13 @@ import (
 )
 
 const (
-	CrioAsset   = "https://github.com/vitu-mafeni/leehun-cri-o/releases/download/crio-1.35.0-restore-from-file/crio"
-	CrioCommit  = "a0e6cb3d7f0ca8e9f31131daa17570082e716393"
-	CriuAsset   = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-device-restore-with-hook/criu"
-	CriuGitID   = "eece9e851"
+	CrioAsset   = "https://github.com/vitu-mafeni/leehun-cri-o/releases/download/crio-v1.35.0-digest-lookup-fix/crio"
+	CrioCommit  = "ccd43393035e134a47f6b7eec6b28476c3647c6e"
+	CriuAsset   = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-device-restore-with-hook-v2/criu"
+	CriuGitID   = "2cb63fd5b"
 	RuncVersion = "v1.5.0"
 
-	crioSock = "unix:///var/run/crio/crio.sock"
+	// crioSock = "unix:///var/run/crio/crio.sock"
 )
 
 // crioReadyCheck polls crictl until CRI-O responds over gRPC or times out after 90 s.
@@ -50,12 +50,12 @@ sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
 func crioBuildSteps(clean string) []string {
 	return []string{
 		// ── Build deps ──────────────────────────────────────────────────────────────
-		"sudo apt-get install -y build-essential libgpgme-dev gcc xmlto asciidoc " +
+		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential libgpgme-dev gcc xmlto asciidoc " +
 			"libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler " +
 			"python3-protobuf uuid-dev libbsd-dev libnftables-dev libcap-dev libnl-3-dev " +
 			"libnet1-dev libaio-dev libgnutls28-dev libdrm-dev --no-install-recommends",
 		"sudo dpkg --configure -a",
-		"sudo apt-get install -y git make pkg-config libassuan-dev libglib2.0-dev " +
+		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git make pkg-config libassuan-dev libglib2.0-dev " +
 			"libc6-dev libgpg-error-dev libseccomp-dev libsystemd-dev libselinux1-dev " +
 			"libbtrfs-dev libudev-dev software-properties-common go-md2man runc crun",
 
@@ -85,8 +85,7 @@ rm -rf /tmp/conmon`,
 		// make install.systemd → /usr/local/lib/systemd/system/crio.service  (points to
 		//                         /usr/local/bin/crio, not the apt binary at /usr/bin/crio)
 		`sudo rm -rf /tmp/custom-crio && \
-git clone https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio \
-  -b 2026-02-03/support-restore-from-file && \
+git clone https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio -b 22-07-2026-checkpoint-restore && \
 cd /tmp/custom-crio && \
 PATH=/usr/local/go/bin:$PATH make && \
 sudo make install && \
@@ -144,7 +143,7 @@ printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nex
 
 		// ── Custom CRIU binary (device-restore-with-hook) ────────────────────────────
 		// Ensure runtime shared libraries are present (libnl, libcap, libbsd, libgnutls).
-		"sudo apt-get install -y libcap2 libnl-3-200 libbsd0 libgnutls30 2>/dev/null || true",
+		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libcap2 libnl-3-200 libbsd0 libgnutls30 2>/dev/null || true",
 		// Idempotent install: skip if the binary already has the expected GitID.
 		fmt.Sprintf(`WANT="%s"; \
 CRIU_BIN=$(command -v criu || echo /usr/sbin/criu); \
@@ -169,7 +168,7 @@ fi`, CriuGitID, CriuAsset),
 		// The apt crun on Ubuntu 22.04 is ≈0.19 which predates OCI spec 1.0.2; CRI-O
 		// 1.35 generates specs that old crun rejects with "unknown version specified".
 		// Build the latest release from source to ensure compatibility.
-		`sudo apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
+		`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
 		`sudo rm -rf /tmp/crun && \
 git clone --depth=1 https://github.com/containers/crun /tmp/crun && \
 cd /tmp/crun && \
@@ -317,6 +316,8 @@ scheduler:
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 maxPods: 200
+maxParallelImagePulls: 5
+serializeImagePulls: false
 cgroupDriver: systemd
 containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
 featureGates:
@@ -334,6 +335,13 @@ mode: ipvs
 		// Only runs on a fresh start (startPhase == 0).  Skipped on retries so that
 		// kubeadm reset does not undo work completed in earlier phases.
 		{Name: "Cleanup", Steps: []string{
+			// Kill background apt/dpkg processes that hold the lock on fresh nodes
+			// (unattended-upgrades, apt-daily) so subsequent apt-get calls do not hang.
+			"sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true",
+			"sudo systemctl disable unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true",
+			"sudo flock /var/lib/dpkg/lock-frontend -w 120 true 2>/dev/null || true",
+			"sudo apt-get -y -f install 2>/dev/null || true",
+			"sudo dpkg --configure -a 2>/dev/null || true",
 			"sudo systemctl stop kubelet 2>/dev/null || true",
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
@@ -342,13 +350,21 @@ mode: ipvs
 
 		// ── Phase 1: NFS server ──────────────────────────────────────────────────────
 		{Name: "NFS Server", Steps: []string{
-			"sudo apt-get install -y nfs-kernel-server nfs-common",
-			"sudo mkdir -p /srv/nfs/k8s",
-			"sudo chown -R nobody:nogroup /srv/nfs/k8s",
-			"sudo chmod 755 /srv/nfs/k8s",
-			"echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports",
-			"sudo exportfs -ra",
-			"sudo systemctl enable --now nfs-kernel-server",
+			// Idempotent: skip install and chown if nfs-kernel-server is already active.
+			`if ! systemctl is-active --quiet nfs-kernel-server; then
+  sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+  sudo flock /var/lib/dpkg/lock-frontend -w 60 true 2>/dev/null || true
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server nfs-common
+  sudo mkdir -p /srv/nfs/k8s
+  sudo chown nobody:nogroup /srv/nfs/k8s
+  sudo chmod 755 /srv/nfs/k8s
+  echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports
+  sudo exportfs -ra
+  sudo systemctl enable --now nfs-kernel-server
+else
+  echo "nfs-kernel-server already active, skipping"
+fi`,
 		}},
 
 		// ── Phase 2: System settings ─────────────────────────────────────────────────
@@ -365,7 +381,7 @@ mode: ipvs
 		// ── Phase 3: APT repos ───────────────────────────────────────────────────────
 		{Name: "APT Repos", Steps: []string{
 			"sudo apt-get update",
-			"sudo apt-get install -y ca-certificates software-properties-common curl gnupg apt-transport-https",
+			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates software-properties-common curl gnupg apt-transport-https",
 			"sudo install -m 0755 -d /etc/apt/keyrings",
 			"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
 			fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
@@ -383,7 +399,7 @@ mode: ipvs
 			// Build crun from source unconditionally so a resume (skipping phase 4)
 			// also gets a version compatible with CRI-O 1.35. apt crun on Ubuntu 22.04
 			// is ≈0.19 which predates OCI spec 1.0.2 and fails with "unknown version".
-			`sudo apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
+			`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
 			`sudo rm -rf /tmp/crun && \
 git clone --depth=1 https://github.com/containers/crun /tmp/crun && \
 cd /tmp/crun && \
@@ -430,7 +446,7 @@ EOF`,
 
 		// ── Phase 6: Kubernetes components ───────────────────────────────────────────
 		{Name: "K8s Install", Steps: []string{
-			fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages", clean, clean, clean),
+			fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages", clean, clean, clean),
 			"sudo apt-mark hold kubelet kubeadm kubectl",
 			"sudo systemctl enable kubelet",
 			"sudo systemctl stop kubelet 2>/dev/null || true",
@@ -651,6 +667,11 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 		// Only runs on a fresh start; skipped on retries so kubeadm reset does not
 		// undo work completed in earlier phases.
 		{Name: "Cleanup", Steps: []string{
+			"sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true",
+			"sudo systemctl disable unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true",
+			"sudo flock /var/lib/dpkg/lock-frontend -w 120 true 2>/dev/null || true",
+			"sudo apt-get -y -f install 2>/dev/null || true",
+			"sudo dpkg --configure -a 2>/dev/null || true",
 			"sudo systemctl stop kubelet 2>/dev/null || true",
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
@@ -671,9 +692,9 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 		// ── Phase 2: APT repos ───────────────────────────────────────────────────────
 		{Name: "APT Repos", Steps: []string{
 			"sudo apt-get update",
-			"sudo apt-get install -y ca-certificates curl gnupg apt-transport-https",
+			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg apt-transport-https",
 			// nfs-common: kernel NFS client + mount.nfs so the node can mount NFS volumes.
-			"sudo apt-get install -y nfs-common",
+			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common",
 			"sudo install -m 0755 -d /etc/apt/keyrings",
 			"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
 			fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
@@ -689,7 +710,7 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 		// ── Phase 4: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
 			// Build crun from source (handles resume that skipped phase 3).
-			`sudo apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
+			`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
 			`sudo rm -rf /tmp/crun && \
 git clone --depth=1 https://github.com/containers/crun /tmp/crun && \
 cd /tmp/crun && \
@@ -726,7 +747,7 @@ EOF`,
 		// ── Phase 5: Kubernetes components ───────────────────────────────────────────
 		{Name: "K8s Install", Steps: []string{
 			"sudo apt-get update",
-			fmt.Sprintf("sudo apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages --allow-downgrades", clean, clean, clean),
+			fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages --allow-downgrades", clean, clean, clean),
 			"sudo apt-mark hold kubelet kubeadm kubectl",
 			"sudo systemctl enable kubelet",
 			"sudo systemctl stop kubelet 2>/dev/null || true",
@@ -826,13 +847,13 @@ func InstallNvidiaContainerToolkit(client *sshhelper.Client, cluster *infrav1.Re
 
 	var toolkitInstallCmd string
 	if nvidiaToolkitVersion == "" {
-		toolkitInstallCmd = `sudo apt-get install --allow-downgrades -y \
+		toolkitInstallCmd = `sudo DEBIAN_FRONTEND=noninteractive apt-get install --allow-downgrades -y \
 nvidia-container-toolkit \
 nvidia-container-toolkit-base \
 libnvidia-container-tools \
 libnvidia-container1`
 	} else {
-		toolkitInstallCmd = fmt.Sprintf(`sudo apt-get install --allow-downgrades -y \
+		toolkitInstallCmd = fmt.Sprintf(`sudo DEBIAN_FRONTEND=noninteractive apt-get install --allow-downgrades -y \
 nvidia-container-toolkit=%s \
 nvidia-container-toolkit-base=%s \
 libnvidia-container-tools=%s \
@@ -842,7 +863,7 @@ libnvidia-container1=%s`,
 
 	steps := []string{
 		"sudo apt-get update",
-		"sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
+		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
 		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
 		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
 sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
@@ -877,14 +898,14 @@ func InstallNvidiaDrivers11(client *sshhelper.Client, cluster *infrav1.RemoteClu
 
 	steps := []string{
 		"sudo apt-get update",
-		"sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
+		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
 		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
 		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
 sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
 sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
 		"sudo sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list",
 		"sudo apt-get update",
-		fmt.Sprintf(`sudo apt-get install --allow-downgrades -y \
+		fmt.Sprintf(`sudo DEBIAN_FRONTEND=noninteractive apt-get install --allow-downgrades -y \
 nvidia-container-toolkit=%s \
 nvidia-container-toolkit-base=%s \
 libnvidia-container-tools=%s \
@@ -893,11 +914,11 @@ libnvidia-container1=%s`,
 		"sudo nvidia-ctk runtime configure --runtime=crio",
 		"sudo systemctl restart crio",
 		"sudo ubuntu-drivers list --gpgpu || true",
-		"sudo apt-get install -y linux-headers-$(uname -r) linux-headers-generic",
+		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-headers-$(uname -r) linux-headers-generic",
 		fmt.Sprintf("sudo ubuntu-drivers install nvidia:%s", nvidiaDriverVersion),
 		fmt.Sprintf("sudo ubuntu-drivers install --gpgpu nvidia:%s-server", nvidiaDriverVersion),
-		fmt.Sprintf("sudo apt-get install -y nvidia-dkms-%s-server", nvidiaDriverVersion),
-		fmt.Sprintf("sudo apt-get install -y nvidia-utils-%s-server", nvidiaDriverVersion),
+		fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-dkms-%s-server", nvidiaDriverVersion),
+		fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-utils-%s-server", nvidiaDriverVersion),
 		"nvidia-smi || true",
 		"sudo nvidia-ctk --version",
 		`sudo rm -rf /etc/crio/crio.conf.d`,
@@ -922,7 +943,7 @@ EOF`,
 		// Without this the nvidia runtime handler is absent from CRI-O's runtime map
 		// and pods with runtimeClassName=nvidia fail with "failed to find runtime handler nvidia".
 		// Guard: install the toolkit if nvidia-ctk is not in PATH (e.g. retry after partial failure).
-		`command -v nvidia-ctk >/dev/null || sudo apt-get install -y nvidia-container-toolkit`,
+		`command -v nvidia-ctk >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit`,
 		`sudo nvidia-ctk runtime configure --runtime=crio`,
 		`sudo sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf 2>/dev/null || true`,
 		`sudo ln -sf /usr/libexec/crio/conmon /usr/local/bin/conmon 2>/dev/null || true`,

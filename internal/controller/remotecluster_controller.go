@@ -2072,8 +2072,10 @@ fi
 sudo systemctl stop kubelet crio 2>/dev/null || true
 sudo systemctl disable kubelet crio 2>/dev/null || true
 
-# Unmount any lingering container overlay mounts.
-sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+# Unmount all submounts under container storage paths (deepest first) so that
+# subsequent rm -rf does not hit EBUSY on overlay or shm mounts.
+awk '$2~/^\/var\/lib\/containers|^\/run\/containers/{print $2}' /proc/mounts \
+  | sort -r | xargs -r sudo umount -l 2>/dev/null || true
 
 # Purge Kubernetes packages.
 sudo apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
@@ -2093,8 +2095,10 @@ sudo rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd 2>/dev/null || true
 
 # Remove CRI-O runtime state and the entire config tree (includes
 # 999-runc.conf, 10-crun.conf, crio.conf, and any leftover dpkg conffiles).
-sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
-sudo rm -rf /etc/crio 2>/dev/null || true
+sudo rm -rf /var/lib/crio /run/crio /run/containers 2>/dev/null || true
+sudo rm -rf /var/lib/containers 2>/dev/null || true
+sudo rm -rf /var/log/crio 2>/dev/null || true
+sudo rm -rf /etc/crio /etc/containers 2>/dev/null || true
 
 # Remove CRIU config directory (runc.conf and anything else under /etc/criu).
 sudo rm -rf /etc/criu 2>/dev/null || true
@@ -2103,13 +2107,24 @@ sudo rm -f  /etc/modules-load.d/k8s.conf /etc/sysctl.d/k8s.conf 2>/dev/null || t
 sudo rm -f  /etc/apt/sources.list.d/kubernetes.list /etc/apt/sources.list.d/cri-o.list 2>/dev/null || true
 sudo rm -f  /etc/apt/keyrings/kubernetes-apt-keyring.gpg /etc/apt/keyrings/cri-o-apt-keyring.gpg 2>/dev/null || true
 
+# Remove the kubeconfig-refresh systemd timer deployed on control-plane nodes.
+sudo systemctl stop    kubeconfig-refresh.timer   2>/dev/null || true
+sudo systemctl disable kubeconfig-refresh.timer   2>/dev/null || true
+sudo rm -f /usr/local/bin/kubeconfig-refresh.sh                2>/dev/null || true
+sudo rm -f /etc/systemd/system/kubeconfig-refresh.service      2>/dev/null || true
+sudo rm -f /etc/systemd/system/kubeconfig-refresh.timer        2>/dev/null || true
+sudo systemctl daemon-reload                                    2>/dev/null || true
+
 # Remove custom binaries installed during provisioning.
 sudo rm -f /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true
 sudo rm -f /usr/local/bin/crun   /usr/bin/crun   2>/dev/null || true
 sudo rm -f /usr/sbin/runc /usr/local/sbin/runc   2>/dev/null || true
 sudo rm -f /usr/sbin/criu                         2>/dev/null || true
-sudo rm -f /usr/bin/crio                          2>/dev/null || true
+sudo rm -f /usr/bin/crio /usr/local/bin/crio       2>/dev/null || true
 sudo rm -f /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || true
+
+# Remove GPU CDI device spec directory.
+sudo rm -rf /etc/cdi 2>/dev/null || true
 
 # Remove the bootstrap-complete marker so re-provisioning is not skipped.
 sudo rm -f /var/lib/node-bootstrap-complete 2>/dev/null || true

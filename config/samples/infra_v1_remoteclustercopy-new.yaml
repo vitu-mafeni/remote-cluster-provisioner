@@ -105,7 +105,9 @@ metadata:
 type: Opaque
 stringData:
   id_rsa: |
-    -----BEGIN RSA PRIVATE KEY----- CHANGE ME TO YOUR VPN SERVER PRIVATE KEY -----END RSA PRIVATE KEY-----
+    -----BEGIN RSA PRIVATE KEY-----
+    CHANGE ME
+    -----END RSA PRIVATE KEY-----
 ---
 # Secret
 apiVersion: v1
@@ -116,4 +118,4 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: CHANGE ME TO YOUR DOCKERHUB PASSWORD
+  password: CHANGE ME

@@ -111,7 +111,8 @@ fi
 sudo systemctl stop kubelet crio 2>/dev/null || true
 sudo systemctl disable kubelet crio 2>/dev/null || true
 
-sudo umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
+awk '$2~/^\/var\/lib\/containers|^\/run\/containers/{print $2}' /proc/mounts \
+  | sort -r | xargs -r sudo umount -l 2>/dev/null || true
 
 sudo apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
 sudo apt-get purge -y kubelet kubeadm kubectl 2>/dev/null || true
@@ -125,8 +126,10 @@ sudo rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null 
 
 sudo rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd 2>/dev/null || true
 
-sudo rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
-sudo rm -rf /etc/crio 2>/dev/null || true
+sudo rm -rf /var/lib/crio /run/crio /run/containers 2>/dev/null || true
+sudo rm -rf /var/lib/containers 2>/dev/null || true
+sudo rm -rf /var/log/crio 2>/dev/null || true
+sudo rm -rf /etc/crio /etc/containers 2>/dev/null || true
 
 sudo rm -rf /etc/criu 2>/dev/null || true
 
@@ -138,8 +141,10 @@ sudo rm -f /usr/local/bin/crictl /usr/bin/crictl 2>/dev/null || true
 sudo rm -f /usr/local/bin/crun   /usr/bin/crun   2>/dev/null || true
 sudo rm -f /usr/sbin/runc /usr/local/sbin/runc   2>/dev/null || true
 sudo rm -f /usr/sbin/criu                         2>/dev/null || true
-sudo rm -f /usr/bin/crio                          2>/dev/null || true
+sudo rm -f /usr/bin/crio /usr/local/bin/crio       2>/dev/null || true
 sudo rm -f /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || true
+
+sudo rm -rf /etc/cdi 2>/dev/null || true
 
 sudo rm -f /var/lib/node-bootstrap-complete 2>/dev/null || true
 
