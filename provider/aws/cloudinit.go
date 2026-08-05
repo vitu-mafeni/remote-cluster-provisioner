@@ -1,6 +1,8 @@
 package aws
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"fmt"
 	"strings"
@@ -39,11 +41,18 @@ type CloudInitParams struct {
 	NvidiaContainerToolkitVersion string
 }
 
-// BuildUserData renders an idempotent cloud-init bash script and returns it
-// base64-encoded, ready for use as EC2 UserData.
+// BuildUserData renders an idempotent cloud-init bash script, gzip-compresses
+// it, and returns the result base64-encoded, ready for use as EC2 UserData.
+// EC2 supports gzip-compressed user data (the instance metadata service
+// decompresses it before handing it to cloud-init).  Compression keeps the
+// script well under the 16 KB raw user-data limit even for GPU nodes.
 func BuildUserData(p CloudInitParams) string {
 	script := renderBootstrapScript(p)
-	return base64.StdEncoding.EncodeToString([]byte(script))
+	var buf bytes.Buffer
+	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	_, _ = gz.Write([]byte(script))
+	_ = gz.Close()
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 
 func renderBootstrapScript(p CloudInitParams) string {
