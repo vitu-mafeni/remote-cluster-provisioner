@@ -119,3 +119,154 @@ type: Opaque
 stringData:
   username: vitu1
   password: CHANGE ME
+---
+# ════════════════════════════════════════════════════════════════════════════
+# AWS CREDENTIAL MODES
+# ════════════════════════════════════════════════════════════════════════════
+#
+# The controller supports four credential modes.  They compose as a pipeline:
+#
+#   [base credentials] ──optional──▶ [sts:AssumeRole]
+#
+# Base credential options (pick one):
+#
+#   Mode 1 — Static IAM key pair
+#     Keys: awsAccessKeyId + awsSecretAccessKey
+#     Long-lived credentials used directly.  Simple but does not enforce MFA.
+#
+#   Mode 2 — Pre-obtained STS session token
+#     Keys: awsAccessKeyId + awsSecretAccessKey + awsSessionToken
+#     Bring your own session token (e.g. from `aws sts get-session-token`).
+#     The controller uses it as-is and does NOT refresh it automatically.
+#     Useful for one-off runs when you already have a valid session.
+#
+#   Mode 3 — MFA-backed auto-refresh (sts:GetSessionToken)
+#     Keys: awsAccessKeyId + awsSecretAccessKey + mfaSerialNumber + mfaTotpSecret
+#     The controller generates TOTP codes from the seed and calls
+#     sts:GetSessionToken automatically.  The resulting session token is
+#     cached in awsSessionToken / awsSessionExpiry and refreshed in the
+#     background before it expires (default 12 h, min 15 min, max 36 h).
+#
+# AssumeRole (optional, stacks on top of any base mode):
+#
+#   Mode 4 — AssumeRole
+#     Key: roleArn (+ optional roleSessionName, externalId, roleDurationSeconds)
+#     After resolving base credentials the controller calls sts:AssumeRole
+#     and uses the resulting temporary credentials for all AWS API calls.
+#     The role session is cached in roleSessionToken / roleSessionExpiry and
+#     refreshed automatically (default 1 h, min 15 min, max 12 h).
+#     Use this for cross-account access or to enforce least-privilege roles.
+#
+# ── Multiple accounts ───────────────────────────────────────────────────────
+#   Create one Secret per AWS account and set credentialsRef in each
+#   NodeProvision CR to point at the appropriate Secret.  NodeProvision CRs
+#   backed by different Secrets are completely independent — the controller
+#   keeps separate credential caches for each Secret and binds each EC2
+#   instance to the account that created it (the controller-owned credential
+#   copy is used for termination even if the user-managed Secret is updated).
+#
+# ── How to obtain mfaTotpSecret ─────────────────────────────────────────────
+#   mfaTotpSecret is the base32 seed AWS shows ONCE when you register a
+#   virtual MFA device.
+#
+#   New device:
+#     1. IAM → Users → <your user> → Security credentials → Assign MFA device
+#     2. Choose "Authenticator app" → Next
+#     3. Click "Show QR code", then "show secret key" below the image
+#     4. Copy that key — this is mfaTotpSecret
+#     5. Also scan the QR code with your authenticator app as usual
+#
+#   Already-registered device:
+#     AWS does not re-expose the seed.  Options:
+#     - Authy, 1Password, or Bitwarden can export/display the secret.
+#       Google Authenticator cannot.
+#     - Deregister and re-register the device in IAM, saving the key shown.
+#
+#   Hardware MFA (YubiKey, etc.) does not expose its TOTP seed and is
+#   incompatible with mfaTotpSecret.  Use a virtual authenticator app.
+#
+#   Verify with: oathtool --totp --base32 <mfaTotpSecret>
+#
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── Example: Mode 1 — Static key pair ───────────────────────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-credentials-static
+  namespace: default
+type: Opaque
+stringData:
+  awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE"
+  awsSecretAccessKey: "CHANGE ME"
+---
+# ── Example: Mode 3 — MFA-backed auto-refresh ───────────────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-credentials-mfa
+  namespace: default
+type: Opaque
+stringData:
+  awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE"
+  awsSecretAccessKey: "CHANGE ME"
+  # ARN of the already-registered virtual MFA device.
+  mfaSerialNumber: "arn:aws:iam::123456789012:mfa/mydevice"
+  # Base32 TOTP seed — see "How to obtain mfaTotpSecret" above.
+  mfaTotpSecret: "CHANGE ME"
+  # Optional: session lifetime in seconds (900–129600). Default: 43200 (12 h).
+  # mfaDurationSeconds: "43200"
+
+  # Written automatically by the controller — do not set manually:
+  # awsSessionToken: ""
+  # awsSessionExpiry: ""
+---
+# ── Example: Mode 4 — AssumeRole (cross-account, no MFA) ────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-credentials-role
+  namespace: default
+type: Opaque
+stringData:
+  # Base credentials belong to an IAM user/role in the SOURCE account.
+  awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE"
+  awsSecretAccessKey: "CHANGE ME"
+  # ARN of the role to assume (may be in a different AWS account).
+  roleArn: "arn:aws:iam::999999999999:role/RemoteClusterProvisioner"
+  # Optional fields:
+  # roleSessionName: "remote-cluster-provisioner"  # default
+  # externalId: "CHANGE ME"                        # required by some trust policies
+  # roleDurationSeconds: "3600"                    # 900–43200, default 3600 (1 h)
+
+  # Written automatically by the controller — do not set manually:
+  # roleAccessKeyId: ""
+  # roleSecretAccessKey: ""
+  # roleSessionToken: ""
+  # roleSessionExpiry: ""
+---
+# ── Example: Mode 3+4 — MFA-backed GetSessionToken then AssumeRole ──────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-credentials-mfa-role
+  namespace: default
+type: Opaque
+stringData:
+  awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE"
+  awsSecretAccessKey: "CHANGE ME"
+  mfaSerialNumber: "arn:aws:iam::123456789012:mfa/mydevice"
+  mfaTotpSecret: "CHANGE ME"
+  roleArn: "arn:aws:iam::999999999999:role/RemoteClusterProvisioner"
+  # roleSessionName: "remote-cluster-provisioner"
+  # externalId: ""
+  # roleDurationSeconds: "3600"
+  # mfaDurationSeconds: "43200"
+
+  # Written automatically — do not set manually:
+  # awsSessionToken: ""
+  # awsSessionExpiry: ""
+  # roleAccessKeyId: ""
+  # roleSecretAccessKey: ""
+  # roleSessionToken: ""
+  # roleSessionExpiry: ""

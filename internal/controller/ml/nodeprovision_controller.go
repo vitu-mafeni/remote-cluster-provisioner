@@ -18,6 +18,11 @@ package ml
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"strings"
 	"sync"
@@ -30,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/yaml"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
 	"dcn.ssu.ac.kr/infra/pkg/ssh"
@@ -55,6 +61,8 @@ type npPrepullJobResult struct {
 type NodeProvisionReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// CredMgr handles background refresh of AWS STS / MFA-backed sessions.
+	CredMgr *awsprovision.CredentialManager
 	// onPremJobs holds in-flight on-prem provisioning goroutines.
 	// Key: "<namespace>/<name>", Value: <-chan onPremJobResult
 	onPremJobs sync.Map
@@ -169,6 +177,7 @@ echo "node reset complete"
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisionnetconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch;update;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get,namespace=kube-public
 
 func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -431,7 +440,12 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	}
 	log.Info("Creating EC2 instance")
 
-	result, err := awsprovision.ProvisionEC2Node(ctx, np, secret, vpnServerClient, netConfig)
+	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+	if err != nil {
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving AWS credentials: %v", err))
+	}
+
+	result, err := awsprovision.ProvisionEC2Node(ctx, np, creds, vpnServerClient, netConfig)
 	// Always persist VPN allocation immediately — even on EC2 failure — so that
 	// cleanupVPNPeer can find and release the peer on the next retry instead of
 	// leaving it as an orphan and allocating yet another IP.
@@ -565,7 +579,10 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		return false, nil // nothing to resolve
 	}
 
-	creds := awsprovision.ResolveAWSCredentials(secret)
+	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+	if err != nil {
+		return false, fmt.Errorf("resolving AWS credentials: %w", err)
+	}
 	base := np.DeepCopy()
 	if np.Spec.AWSConfig == nil {
 		np.Spec.AWSConfig = &mlv1alpha1.AWSConfig{}
@@ -646,7 +663,12 @@ func (r *NodeProvisionReconciler) reconcileWaitingForInstance(
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	privateIP, publicIP, err := awsprovision.WaitForInstanceRunning(ctx, np, secret, np.Status.InstanceID)
+	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("resolving AWS credentials: %w", err)
+	}
+
+	privateIP, publicIP, err := awsprovision.WaitForInstanceRunning(ctx, np, creds, np.Status.InstanceID)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("polling instance state: %w", err)
 	}
@@ -1361,7 +1383,12 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 				}
 			}
 			if secret != nil {
-				if err := awsprovision.TerminateInstance(ctx, np, secret, np.Status.InstanceID); err != nil {
+				terminateCreds, credsErr := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+				if credsErr != nil {
+					log.Error(credsErr, "resolving AWS credentials for termination — using static fallback")
+					terminateCreds = awsprovision.ResolveAWSCredentials(secret)
+				}
+				if err := awsprovision.TerminateInstance(ctx, np, terminateCreds, np.Status.InstanceID); err != nil {
 					log.Error(err, "terminating EC2 instance", "instanceId", np.Status.InstanceID)
 				} else {
 					log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
@@ -1570,6 +1597,14 @@ func (r *NodeProvisionReconciler) cleanupOnPremNode(ctx context.Context, np *mlv
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
+// joinTokenMaxAge is the window before the 24-hour kubeadm token expiry in
+// which the NodeProvision controller proactively issues a fresh bootstrap token.
+const joinTokenMaxAge = 20 * time.Hour
+
+// requireNetConfig returns the NodeProvisionNetConfig for this cluster.
+// If the bootstrap token is absent or older than joinTokenMaxAge, the controller
+// creates a new one directly via the Kubernetes API — no SSH or external
+// dependency required.
 func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1alpha1.NodeProvision) (*mlv1alpha1.NodeProvisionNetConfig, error) {
 	log := logf.FromContext(ctx)
 	netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
@@ -1581,11 +1616,145 @@ func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1
 		return nil, fmt.Errorf("no NodeProvisionNetConfig")
 	}
 	nc := &netConfigList.Items[0]
-	if nc.Status.ClusterJoinCommand == "" {
-		log.Info("Cluster join command not ready yet; requeueing")
-		return nil, fmt.Errorf("join command not ready")
+
+	needsRefresh := nc.Status.ClusterJoinCommand == "" ||
+		nc.Status.JoinTokenRefreshedAt == nil ||
+		time.Since(nc.Status.JoinTokenRefreshedAt.Time) > joinTokenMaxAge
+
+	if needsRefresh {
+		log.Info("Bootstrap token missing or too old — refreshing via local Kubernetes API")
+		if err := r.refreshLocalJoinToken(ctx, nc); err != nil {
+			log.Error(err, "Failed to refresh bootstrap token")
+			return nil, fmt.Errorf("refreshing bootstrap token: %w", err)
+		}
+		// Re-fetch so callers see the updated join command.
+		if err := r.Get(ctx, client.ObjectKeyFromObject(nc), nc); err != nil {
+			return nil, fmt.Errorf("re-fetching NodeProvisionNetConfig after token refresh: %w", err)
+		}
 	}
 	return nc, nil
+}
+
+// refreshLocalJoinToken creates a new kubeadm bootstrap token Secret in
+// kube-system, derives the CA certificate hash from the cluster-info
+// ConfigMap, builds a kubeadm join command, and patches it into the
+// NodeProvisionNetConfig status.
+//
+// This runs entirely against the local Kubernetes API — the controller
+// already has in-cluster credentials and does not need SSH access to the
+// control-plane node.
+//
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch,namespace=kube-system
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get,namespace=kube-public
+func (r *NodeProvisionReconciler) refreshLocalJoinToken(ctx context.Context, nc *mlv1alpha1.NodeProvisionNetConfig) error {
+	// ── 1. Generate token ID (6 chars) and secret (16 chars) ─────────────────
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	randStr := func(n int) (string, error) {
+		b := make([]byte, n)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		for i := range b {
+			b[i] = charset[int(b[i])%len(charset)]
+		}
+		return string(b), nil
+	}
+	tokenID, err := randStr(6)
+	if err != nil {
+		return fmt.Errorf("generating token ID: %w", err)
+	}
+	tokenSecret, err := randStr(16)
+	if err != nil {
+		return fmt.Errorf("generating token secret: %w", err)
+	}
+	token := tokenID + "." + tokenSecret
+
+	// ── 2. Create the bootstrap-token Secret in kube-system ──────────────────
+	expiry := metav1.NewTime(time.Now().Add(24 * time.Hour))
+	bootstrapSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "bootstrap-token-" + tokenID,
+			Namespace: "kube-system",
+		},
+		Type: "bootstrap.kubernetes.io/token",
+		StringData: map[string]string{
+			"token-id":                       tokenID,
+			"token-secret":                   tokenSecret,
+			"usage-bootstrap-authentication": "true",
+			"usage-bootstrap-signing":        "true",
+			"auth-extra-groups":              "system:bootstrappers:kubeadm:default-node-token",
+			"expiration":                     expiry.UTC().Format(time.RFC3339),
+		},
+	}
+	if err := r.Create(ctx, bootstrapSecret); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("creating bootstrap token secret: %w", err)
+	}
+
+	// ── 3. Read cluster-info to get API server URL and CA cert ───────────────
+	clusterInfo := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      "cluster-info",
+		Namespace: "kube-public",
+	}, clusterInfo); err != nil {
+		return fmt.Errorf("reading cluster-info configmap: %w", err)
+	}
+
+	kubeconfigYAML, ok := clusterInfo.Data["kubeconfig"]
+	if !ok {
+		return fmt.Errorf("cluster-info configmap has no 'kubeconfig' key")
+	}
+
+	// Minimal struct to extract server + CA from the kubeconfig YAML.
+	// sigs.k8s.io/yaml converts YAML→JSON then uses encoding/json, so json tags
+	// are required (yaml tags are silently ignored by the JSON decoder).
+	var kc struct {
+		Clusters []struct {
+			Cluster struct {
+				Server                   string `json:"server"`
+				CertificateAuthorityData string `json:"certificate-authority-data"`
+			} `json:"cluster"`
+		} `json:"clusters"`
+	}
+	if err := yaml.Unmarshal([]byte(kubeconfigYAML), &kc); err != nil {
+		return fmt.Errorf("parsing cluster-info kubeconfig: %w", err)
+	}
+	if len(kc.Clusters) == 0 {
+		return fmt.Errorf("cluster-info kubeconfig contains no clusters")
+	}
+	apiServer := kc.Clusters[0].Cluster.Server
+	caData, err := base64.StdEncoding.DecodeString(kc.Clusters[0].Cluster.CertificateAuthorityData)
+	if err != nil {
+		return fmt.Errorf("decoding CA cert from cluster-info: %w", err)
+	}
+
+	// ── 4. Compute SHA256 of the DER-encoded CA certificate ──────────────────
+	block, _ := pem.Decode(caData)
+	if block == nil {
+		return fmt.Errorf("CA data in cluster-info is not PEM-encoded")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parsing CA certificate: %w", err)
+	}
+	caHash := fmt.Sprintf("sha256:%x", sha256.Sum256(cert.RawSubjectPublicKeyInfo))
+
+	// ── 5. Build join command and update NetConfig status ────────────────────
+	joinCmd := fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s",
+		strings.TrimPrefix(strings.TrimPrefix(apiServer, "https://"), "http://"),
+		token,
+		caHash,
+	)
+
+	now := metav1.Now()
+	patch := nc.DeepCopy()
+	patch.Status.ClusterJoinCommand = joinCmd
+	patch.Status.JoinTokenRefreshedAt = &now
+	if err := r.Status().Patch(ctx, patch, client.MergeFrom(nc)); err != nil {
+		return fmt.Errorf("patching NodeProvisionNetConfig with new join command: %w", err)
+	}
+
+	logf.FromContext(ctx).Info("Refreshed bootstrap token", "tokenID", tokenID, "apiServer", apiServer)
+	return nil
 }
 
 func (r *NodeProvisionReconciler) getSecret(ctx context.Context, np *mlv1alpha1.NodeProvision) (*corev1.Secret, error) {
@@ -1597,6 +1766,17 @@ func (r *NodeProvisionReconciler) getSecret(ctx context.Context, np *mlv1alpha1.
 		return nil, fmt.Errorf("getting credentials secret: %w", err)
 	}
 	return secret, nil
+}
+
+// resolveAWSCreds returns AWS credentials for the given secret via the
+// CredentialManager, which maintains an in-memory cache and refreshes
+// STS/MFA-backed sessions in the background before they expire.
+func (r *NodeProvisionReconciler) resolveAWSCreds(
+	ctx context.Context,
+	region string,
+	secret *corev1.Secret,
+) (awsprovision.AWSCredentials, error) {
+	return r.CredMgr.Get(ctx, secret.Namespace, secret.Name, region)
 }
 
 // getControllerCredsSecret retrieves the controller-owned copy of the credentials

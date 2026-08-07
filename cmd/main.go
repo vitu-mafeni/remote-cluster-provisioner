@@ -39,6 +39,7 @@ import (
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/internal/controller"
 	mlcontroller "dcn.ssu.ac.kr/infra/internal/controller/ml"
+	awsprovision "dcn.ssu.ac.kr/infra/provider/aws"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -67,7 +68,7 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8083", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -188,9 +189,15 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "RemoteCluster")
 		os.Exit(1)
 	}
+	credMgr := awsprovision.NewCredentialManager(mgr.GetClient(), ctrl.Log.WithName("aws-cred-manager"))
+	if err := mgr.Add(credMgr); err != nil {
+		setupLog.Error(err, "Failed to register AWS credential manager")
+		os.Exit(1)
+	}
 	if err := (&mlcontroller.NodeProvisionReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		CredMgr: credMgr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "NodeProvision")
 		os.Exit(1)

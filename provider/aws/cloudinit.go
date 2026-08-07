@@ -1,417 +1,785 @@
 package aws
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"fmt"
+	"regexp"
 	"strings"
+	"text/template"
 
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 )
 
-// CloudInitParams holds all values needed to render the bootstrap user-data script.
+// CloudInitParams contains the values required to bootstrap an EC2 Kubernetes worker.
+//
+// NVIDIA/GPU configuration is intentionally absent. GPU Operator owns the NVIDIA
+// driver, container toolkit, CRI-O NVIDIA integration, CDI and device plugin after
+// the node joins the cluster.
 type CloudInitParams struct {
-	// WireGuard client configuration file content.
-	WGConfig string
-	// VPN IP assigned to this node (used as kubelet node-ip).
-	VpnIP string
-	// kubeadm join command (without leading "sudo").
-	JoinCommand string
-	// Kubernetes full version, e.g. "1.34.2" (no leading "v"). Used for package pin.
-	KubernetesVersion string
-	// Kubernetes minor version, e.g. "1.34". Used for the apt repo URL.
+	WGConfig               string
+	VpnIP                  string
+	JoinCommand            string
+	KubernetesVersion      string
 	KubernetesMinorVersion string
-	// CRI-O minor version, e.g. "1.34".
-	CRIOVersion string
-	// NodeName to set as hostname (optional).
-	NodeName string
-	// Extra labels to apply after join, formatted as "key=value" pairs.
-	Labels []string
-	// SSHUsername is the OS user that will SSH into the node post-join
-	// (e.g. for image pre-pull).  NOPASSWD sudo is granted to this user so
-	// that non-interactive SSH sessions can run privileged commands.
-	// When empty, no sudoers entry is written.
-	SSHUsername string
+	CRIOVersion            string
+	NodeName               string
+	Labels                 []string // Extra labels reserved for the control-plane reconciler.
+	SSHUsername            string
+	// IsGPUNode identifies this worker as a GPU node. It controls Kubernetes
+	// node labels only; GPU Operator owns all NVIDIA software/runtime setup.
+	IsGPUNode bool
 }
 
-// BuildUserData renders an idempotent cloud-init bash script and returns it
-// base64-encoded, ready for use as EC2 UserData.
+const (
+	crioSocket = "/var/run/crio/crio.sock"
+)
+
+var (
+	versionRE = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+	minorRE   = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
+	ipRE      = regexp.MustCompile(`^[0-9A-Fa-f:.]+$`)
+	nameRE    = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$`)
+	userRE    = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+)
+
+// BuildUserData renders the bootstrap script, gzip-compresses it and returns
+// standard-base64 encoded user-data suitable for EC2.
+//
+// Invalid input is rendered as an explicit shell failure rather than silently
+// generating a potentially dangerous bootstrap script. Existing callers use a
+// string-returning API, so the function cannot return validation errors.
 func BuildUserData(p CloudInitParams) string {
-	script := renderBootstrapScript(p)
-	return base64.StdEncoding.EncodeToString([]byte(script))
+	if err := validateParams(p); err != nil {
+		return encodeScript(fmt.Sprintf("#!/bin/bash\necho %q >&2\nexit 2\n", "invalid cloud-init parameters: "+err.Error()))
+	}
+
+	script, err := renderBootstrapScript(p)
+	if err != nil {
+		return encodeScript(fmt.Sprintf("#!/bin/bash\necho %q >&2\nexit 2\n", "failed to render cloud-init: "+err.Error()))
+	}
+	return encodeScript(script)
 }
 
-func renderBootstrapScript(p CloudInitParams) string {
-	labelCmd := ""
-	if len(p.Labels) > 0 {
-		labelCmd = fmt.Sprintf("kubectl label node \"$(hostname)\" %s --overwrite 2>/dev/null || true", strings.Join(p.Labels, " "))
+func validateParams(p CloudInitParams) error {
+	if strings.TrimSpace(p.WGConfig) == "" {
+		return fmt.Errorf("WGConfig must not be empty")
+	}
+	if !ipRE.MatchString(strings.TrimSpace(p.VpnIP)) {
+		return fmt.Errorf("VpnIP contains invalid characters")
+	}
+	if !versionRE.MatchString(strings.TrimPrefix(strings.TrimSpace(p.KubernetesVersion), "v")) {
+		return fmt.Errorf("KubernetesVersion must be a full semantic version such as 1.35.0")
+	}
+	if !minorRE.MatchString(strings.TrimPrefix(strings.TrimSpace(p.KubernetesMinorVersion), "v")) {
+		return fmt.Errorf("KubernetesMinorVersion must be a minor version such as 1.35")
+	}
+	if !minorRE.MatchString(strings.TrimPrefix(strings.TrimSpace(p.CRIOVersion), "v")) {
+		return fmt.Errorf("CRIOVersion must be a minor version such as 1.35")
+	}
+	join := strings.TrimSpace(p.JoinCommand)
+	if join == "" {
+		return fmt.Errorf("JoinCommand must not be empty")
+	}
+	if strings.Contains(join, "--cri-socket") {
+		return fmt.Errorf("JoinCommand must not already contain --cri-socket; cloud-init adds the CRI-O endpoint")
+	}
+	if p.NodeName != "" && !nameRE.MatchString(strings.ToLower(p.NodeName)) {
+		return fmt.Errorf("NodeName is not a valid Kubernetes/DNS hostname")
+	}
+	if p.SSHUsername != "" && !userRE.MatchString(p.SSHUsername) {
+		return fmt.Errorf("SSHUsername is not a valid Linux username")
+	}
+	return nil
+}
+
+func encodeScript(script string) string {
+	var buf bytes.Buffer
+	gz, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return base64.StdEncoding.EncodeToString([]byte(script))
+	}
+	if _, err := gz.Write([]byte(script)); err != nil {
+		_ = gz.Close()
+		return base64.StdEncoding.EncodeToString([]byte(script))
+	}
+	if err := gz.Close(); err != nil {
+		return base64.StdEncoding.EncodeToString([]byte(script))
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+type templateData struct {
+	WGConfigB64       string
+	VpnIP             string
+	JoinCommand       string
+	JoinCommandB64    string
+	KubernetesVersion string
+	KubernetesMinor   string
+	CRIOVersion       string
+	NodeName          string
+	SSHUsername       string
+	HasSSHUsername    bool
+	IsGPUNode         bool
+	KubeletNodeLabels string
+	CRIOAsset         string
+	CRIOCommit        string
+	CRIUAsset         string
+	CRIUGitID         string
+	RuncVersion       string
+	CRIOSocket        string
+}
+
+func kubeletNodeLabels(p CloudInitParams) string {
+	if !p.IsGPUNode {
+		return ""
+	}
+	// These are the same GPU identity labels applied authoritatively by the
+	// kubeadm control-plane reconciler after the worker joins. Setting them at
+	// registration time avoids a window where the GPU worker is unclassified.
+	return "hardware-type=gpu,gpu=on,ml.dcn.ssu.ac.kr/provider=OnPrem"
+}
+
+func renderBootstrapScript(p CloudInitParams) (string, error) {
+	tmpl, err := template.New("aws-cloud-init").Parse(bootstrapTemplate)
+	if err != nil {
+		return "", fmt.Errorf("parse bootstrap template: %w", err)
 	}
 
-	nopasswdBlock := ""
-	if p.SSHUsername != "" {
-		nopasswdBlock = fmt.Sprintf(
-			"echo '%s ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/nopasswd-%s\nchmod 0440 /etc/sudoers.d/nopasswd-%s\n",
-			p.SSHUsername, p.SSHUsername, p.SSHUsername,
-		)
+	d := templateData{
+		WGConfigB64:       base64.StdEncoding.EncodeToString([]byte(p.WGConfig)),
+		VpnIP:             p.VpnIP,
+		JoinCommand:       p.JoinCommand,
+		JoinCommandB64:    base64.StdEncoding.EncodeToString([]byte(p.JoinCommand)),
+		KubernetesVersion: strings.TrimPrefix(p.KubernetesVersion, "v"),
+		KubernetesMinor:   strings.TrimPrefix(p.KubernetesMinorVersion, "v"),
+		CRIOVersion:       strings.TrimPrefix(p.CRIOVersion, "v"),
+		NodeName:          p.NodeName,
+		SSHUsername:       p.SSHUsername,
+		HasSSHUsername:    p.SSHUsername != "",
+		IsGPUNode:         p.IsGPUNode,
+		KubeletNodeLabels: kubeletNodeLabels(p),
+		CRIOAsset:         kubeadm.CrioAsset,
+		CRIOCommit:        kubeadm.CrioCommit,
+		CRIUAsset:         kubeadm.CriuAsset,
+		CRIUGitID:         kubeadm.CriuGitID,
+		RuncVersion:       kubeadm.RuncVersion,
+		CRIOSocket:        crioSocket,
 	}
 
-	// Escape the WireGuard config for embedding in heredoc.
-	wgConf := strings.ReplaceAll(p.WGConfig, `\`, `\\`)
+	var out bytes.Buffer
+	if err := tmpl.Execute(&out, d); err != nil {
+		return "", fmt.Errorf("execute bootstrap template: %w", err)
+	}
+	return out.String(), nil
+}
 
-	return fmt.Sprintf(`#!/bin/bash
-set -eEuo pipefail
+const bootstrapTemplate = `#!/bin/bash
+set -Eeuo pipefail
 
 LOG=/var/log/node-bootstrap.log
 STATUS_FILE=/var/lib/node-bootstrap-status
+COMPLETE_FILE=/var/lib/node-bootstrap-complete
+LOCK_FILE=/var/lock/node-bootstrap.lock
 
-# Write directly to log file from the ERR trap to avoid tee buffering on exit.
-err_trap() {
-  local code=$? line=$1 cmd=$2
-  echo "[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] FAILED at line $line: $cmd (exit $code)" \
-    | tee -a "$LOG" >&2
-  echo "FAILED" > "$STATUS_FILE"
-  sync
-}
-trap 'err_trap "$LINENO" "$BASH_COMMAND"' ERR
-
+mkdir -p /var/log /var/lib
 exec > >(tee -a "$LOG") 2>&1
 
 report() {
-  local msg="[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] $*"
-  echo "$msg"
-  echo "$*" > "$STATUS_FILE"
+  local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+  printf '%s\n' "$msg"
+  printf '%s\n' "$msg" > "$STATUS_FILE"
   sync
 }
 
-report "Bootstrap started"
+on_error() {
+  local rc=$?
+  local line=${1:-unknown}
+  local cmd=${2:-unknown}
+  printf '[%s] FAILED at line %s: %s (exit %s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" "$cmd" "$rc" | tee -a "$LOG" >&2
+  printf 'FAILED\n' > "$STATUS_FILE"
+  {
+    echo '===== systemd: crio ====='
+    systemctl status crio --no-pager -l || true
+    echo '===== journal: crio ====='
+    journalctl -u crio --no-pager -n 120 || true
+    echo '===== systemd: kubelet ====='
+    systemctl status kubelet --no-pager -l || true
+    echo '===== journal: kubelet ====='
+    journalctl -u kubelet --no-pager -n 80 || true
+  } >> "$LOG" 2>&1 || true
+  exit "$rc"
+}
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
-# ── Clean up previous provisioning state ──────────────────────────────────────
-# Remove any leftover CRI-O and kubelet state to avoid image cache corruption
-report "Cleaning up previous provisioning state"
-systemctl stop kubelet crio 2>/dev/null || true
-umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
-umount -l /var/lib/crio 2>/dev/null || true
-rm -rf /var/lib/crio /run/crio /var/lib/containers/storage /var/lib/kubelet/kubeadm-flags.env 2>/dev/null || true
+# Serialize bootstrap and make retries safe. A second invocation must never
+# destructively wipe a node that already completed provisioning.
+exec 9>"$LOCK_FILE"
+flock -n 9 || { report "Another bootstrap process is already running"; exit 0; }
 
-# Store Kubernetes version for crictl installation
-K8S_VERSION=v%s
-
-# ── Idempotency guard ────────────────────────────────────────────────────────
-if [ -f /var/lib/node-bootstrap-complete ]; then
-  report "Bootstrap already completed, skipping"
+if [[ -f "$COMPLETE_FILE" ]]; then
+  report "Bootstrap already completed; nothing to do"
   exit 0
 fi
 
-# ── Passwordless sudo for SSH user ──────────────────────────────────────────
-# Written only when SSHUsernameOverride is set on the NodeProvision.
-%s
-# ── Kill anything holding apt/dpkg locks ────────────────────────────────────
-report "Disabling unattended-upgrades"
-systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
-systemctl disable unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-# Give the services a moment to release locks
-sleep 3
-# Force-kill any remaining apt/dpkg processes
-pkill -9 -x unattended-upgrades 2>/dev/null || true
-pkill -9 -f "apt-get" 2>/dev/null || true
-sleep 2
+K8S_VERSION="{{.KubernetesVersion}}"
+K8S_MINOR="{{.KubernetesMinor}}"
+CRIO_VERSION="{{.CRIOVersion}}"
+CRIO_SOCKET="{{.CRIOSocket}}"
+NODE_IP="{{.VpnIP}}"
+NODE_NAME="{{.NodeName}}"
 
-# Repair any interrupted dpkg state from prior runs
-dpkg --configure -a 2>/dev/null || true
+report "Bootstrap started"
+report "Kubernetes version: v${K8S_VERSION}; Kubernetes repo: ${K8S_MINOR}; CRI-O repo: ${CRIO_VERSION}"
 
-# Remove stale lock files (safe on a fresh instance that just booted)
-rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
+# -----------------------------------------------------------------------------
+# Validation and helpers
+# -----------------------------------------------------------------------------
+command -v bash >/dev/null 2>&1 || { echo 'bash is required'; exit 1; }
+command -v systemctl >/dev/null 2>&1 || { echo 'systemd is required'; exit 1; }
 
-export DEBIAN_FRONTEND=noninteractive
-APT="apt-get -y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confnew"
+apt_update() {
+  DEBIAN_FRONTEND=noninteractive apt-get \
+    -o DPkg::Lock::Timeout=300 \
+    -o Acquire::Retries=5 update
+}
 
-# ── OS base packages ─────────────────────────────────────────────────────────
-report "Running apt-get update"
-$APT update
+apt_install() {
+  # IMPORTANT: this helper owns the install verb. Callers pass packages only.
+  DEBIAN_FRONTEND=noninteractive apt-get \
+    -y \
+    -o DPkg::Lock::Timeout=300 \
+    -o Acquire::Retries=5 \
+    -o Dpkg::Options::=--force-confnew \
+    install "$@"
+}
 
-report "Installing base packages"
-$APT install -y ca-certificates curl gnupg apt-transport-https lsof
+wait_for_apt() {
+  local i holders
+  for i in $(seq 1 36); do
+    holders="$(fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true)"
+    if [[ -z "${holders//[[:space:]]/}" ]]; then
+      return 0
+    fi
+    report "Waiting for apt/dpkg lock holders (${i}/36): ${holders}"
+    sleep 5
+  done
+  echo 'Timed out waiting for dpkg/apt locks' >&2
+  fuser -v /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
+  return 1
+}
 
-# Ensure crictl is in PATH for controller image pre-pull
-# CRI-tools releases use minor version (e.g., v1.34, not v1.34.2)
-if ! command -v crictl >/dev/null 2>&1; then
-  report "Installing crictl from GitHub"
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/$K8S_VERSION/crictl-${K8S_VERSION}-linux-amd64.tar.gz -o /tmp/crictl.tar.gz 2>/dev/null || \
-  curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz -o /tmp/crictl.tar.gz
-  sudo tar xzf /tmp/crictl.tar.gz -C /usr/local/bin/ crictl
-  sudo chmod 0755 /usr/local/bin/crictl
-  rm -f /tmp/crictl.tar.gz
-  sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl
+wait_for_service_active() {
+  local service="$1"
+  local timeout="${2:-90}"
+  local end=$((SECONDS + timeout))
+  while (( SECONDS < end )); do
+    if systemctl is-active --quiet "$service"; then
+      return 0
+    fi
+    sleep 2
+  done
+  systemctl status "$service" --no-pager -l || true
+  return 1
+}
+
+wait_for_crio() {
+  local i
+  mkdir -p /run/crio /var/run/crio
+  for i in $(seq 1 30); do
+    if systemctl is-active --quiet crio && \
+       crictl --runtime-endpoint "unix://${CRIO_SOCKET}" \
+              --image-endpoint "unix://${CRIO_SOCKET}" info >/dev/null 2>&1; then
+      report "CRI-O is ready"
+      return 0
+    fi
+    report "Waiting for CRI-O (${i}/30)"
+    sleep 3
+  done
+  report "CRI-O failed readiness check"
+  systemctl status crio --no-pager -l || true
+  journalctl -u crio --no-pager -n 150 || true
+  return 1
+}
+
+restart_crio_and_wait() {
+  systemctl daemon-reload
+  systemctl restart crio || {
+    systemctl status crio --no-pager -l || true
+    journalctl -u crio --no-pager -n 150 || true
+    return 1
+  }
+  wait_for_crio
+}
+
+# -----------------------------------------------------------------------------
+# Hostname
+# -----------------------------------------------------------------------------
+if [[ -n "$NODE_NAME" ]]; then
+  hostnamectl set-hostname "$NODE_NAME"
+  report "Hostname set to $NODE_NAME"
+else
+  report "Using existing hostname: $(hostname)"
 fi
-crictl --version 2>/dev/null || { report "ERROR: crictl not found"; exit 1; }
 
-report "Installing WireGuard"
-$APT install -y wireguard wireguard-tools iputils-ping
-
-# ── Kernel modules & sysctl ─────────────────────────────────────────────────
-report "Configuring kernel"
-cat > /etc/modules-load.d/k8s.conf <<'EOF'
+# -----------------------------------------------------------------------------
+# Kubernetes host prerequisites
+# -----------------------------------------------------------------------------
+report "Applying Kubernetes host prerequisites"
+swapoff -a || true
+sed -i -E '/[[:space:]]swap[[:space:]]/ s/^[[:space:]]*([^#])/#\1/' /etc/fstab || true
+cat > /etc/modules-load.d/k8s.conf <<'MODULES'
 overlay
 br_netfilter
-EOF
+MODULES
 modprobe overlay
 modprobe br_netfilter
-
-cat > /etc/sysctl.d/k8s.conf <<'EOF'
+cat > /etc/sysctl.d/99-kubernetes-cri.conf <<'SYSCTL'
 net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
 net.ipv4.ip_forward=1
-EOF
-sysctl --system
+SYSCTL
+sysctl --system >/dev/null
 
-# ── Disable swap ─────────────────────────────────────────────────────────────
-swapoff -a
-sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+# -----------------------------------------------------------------------------
+# Network / WireGuard
+# -----------------------------------------------------------------------------
+report "Installing base OS packages"
 
-# ── WireGuard VPN ────────────────────────────────────────────────────────────
-report "Configuring WireGuard VPN"
+# Stop Ubuntu's scheduled package jobs before waiting for the package database.
+# Do not kill arbitrary apt/dpkg processes: cloud-init itself can be running apt.
+systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+systemctl disable unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
+wait_for_apt
+dpkg --configure -a
+apt_update
+apt_install ca-certificates curl gnupg apt-transport-https lsof jq git build-essential pkg-config \
+  autoconf automake libtool python3-dev libyajl-dev libjson-c-dev \
+  libcap2 libnl-3-200 libbsd0 libgnutls30 \
+  wireguard iproute2 socat conntrack
+
+report "Configuring WireGuard"
 mkdir -p /etc/wireguard
-cat > /etc/wireguard/wg0.conf <<'WGEOF'
-%s
-WGEOF
-chmod 600 /etc/wireguard/wg0.conf
+printf '%s' '{{.WGConfigB64}}' | base64 -d > /etc/wireguard/wg0.conf
+chmod 0600 /etc/wireguard/wg0.conf
 systemctl enable wg-quick@wg0
 systemctl restart wg-quick@wg0
 
-# Wait for VPN tunnel to come up (up to 60s)
-report "Waiting for WireGuard tunnel"
-vpn_up=false
-for i in $(seq 1 12); do
-  if ip addr show wg0 2>/dev/null | grep -q 'inet '; then
-    vpn_up=true
+# Verify the tunnel and requested VPN address. Do not continue with a kubelet
+# node-ip that does not exist on the host.
+for i in $(seq 1 30); do
+  if ip -4 addr show wg0 2>/dev/null | grep -Eq 'inet[[:space:]]+'"$NODE_IP"'([/[:space:]]|$)'; then
     break
   fi
-  sleep 5
+  sleep 2
 done
-if [ "$vpn_up" != "true" ]; then
-  report "ERROR: WireGuard tunnel failed to start"
-  wg show wg0 2>&1 || true
-  ip link show wg0 2>&1 || true
+ip -4 addr show wg0 | grep -Eq 'inet[[:space:]]+'"$NODE_IP"'([/[:space:]]|$)' || {
+  report "WireGuard did not acquire expected VPN IP ${NODE_IP}"
+  wg show wg0 || true
+  ip -4 addr show wg0 || true
   exit 1
+}
+report "WireGuard is ready on ${NODE_IP}"
+
+# -----------------------------------------------------------------------------
+# CRI-O / CRI-O dependencies
+# -----------------------------------------------------------------------------
+report "Preparing CRI-O build dependencies"
+apt_install build-essential gcc make pkg-config git \
+  libgpgme-dev libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+  python3-protobuf uuid-dev libbsd-dev libnftables-dev libcap-dev libnl-3-dev \
+  libnet1-dev libaio-dev libgnutls28-dev libdrm-dev xmlto asciidoc \
+  libassuan-dev libglib2.0-dev libc6-dev libgpg-error-dev libseccomp-dev \
+  libsystemd-dev libselinux1-dev libbtrfs-dev libudev-dev software-properties-common \
+  go-md2man runc crun
+
+dpkg --configure -a
+
+# The custom CRI-O branch requires Go 1.26.4. Install it explicitly instead of
+# depending on the Ubuntu release's older golang package.
+report "Installing Go 1.26.4 for custom CRI-O"
+GO_VERSION="1.26.4"
+case "$(dpkg --print-architecture)" in
+  amd64) GO_ARCH=amd64 ;;
+  arm64) GO_ARCH=arm64 ;;
+  *) echo "Unsupported architecture for Go: $(dpkg --print-architecture)" >&2; exit 1 ;;
+esac
+if [[ ! -x /usr/local/go/bin/go ]] || [[ "$(/usr/local/go/bin/go version 2>/dev/null || true)" != *"go${GO_VERSION}"* ]]; then
+  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf /tmp/go.tar.gz
+  rm -f /tmp/go.tar.gz
 fi
-report "VPN tunnel established"
 
-# ── CRI-O ────────────────────────────────────────────────────────────────────
-report "Installing CRI-O"
-if ! which crio > /dev/null 2>&1; then
-  rm -f /etc/apt/keyrings/cri-o-apt-keyring.gpg
-  curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/Release.key \
-    | gpg --dearmor | tee /etc/apt/keyrings/cri-o-apt-keyring.gpg > /dev/null
-  echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v%s/deb/ /" \
-    > /etc/apt/sources.list.d/cri-o.list
-  $APT update
-  $APT install -y jq criu crun conmon cri-o
-  CRUN_VER=$(curl -fsSL https://api.github.com/repos/containers/crun/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null || echo "")
-  { [ -n "$CRUN_VER" ] && [ "$CRUN_VER" != "null" ]; } || CRUN_VER=1.17
-  curl -fsSL "https://github.com/containers/crun/releases/download/${CRUN_VER}/crun-${CRUN_VER}-linux-amd64" \
-    -o /usr/local/bin/crun
-  chmod 0755 /usr/local/bin/crun
-  cp -f /usr/local/bin/crun /usr/bin/crun
-  crun --version
-  mkdir -p /etc/crio/crio.conf.d
-  printf '[crio.runtime.runtimes.crun]\nruntime_path = "/usr/local/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
-    > /etc/crio/crio.conf.d/10-crun.conf
-  systemctl enable crio --now || { journalctl -xeu crio.service --no-pager >&2; false; }
+# cloud-init may execute scripts with HOME unset. Go's build system requires a
+# writable cache location and otherwise fails with:
+#   build cache is required, but could not be located: GOCACHE is not defined
+# Set all relevant Go cache/module variables explicitly because the custom CRI-O
+# build invokes go build through Make.
+export HOME=/root
+export USER=root
+export LOGNAME=root
+export XDG_CACHE_HOME=/root/.cache
+export GOCACHE=/root/.cache/go-build
+export GOPATH=/root/go
+export GOMODCACHE=/root/go/pkg/mod
+mkdir -p "$XDG_CACHE_HOME" "$GOCACHE" "$GOPATH" "$GOMODCACHE"
+/usr/local/go/bin/go env HOME XDG_CACHE_HOME GOCACHE GOPATH GOMODCACHE
+/usr/local/go/bin/go version
+export PATH="/usr/local/go/bin:${PATH}"
+
+# Build conmon from source. CRI-O searches /usr/libexec/crio/conmon on Ubuntu;
+# provide the exact path explicitly rather than relying on PATH lookup.
+report "Building conmon"
+rm -rf /tmp/conmon
+git clone --depth=1 https://github.com/containers/conmon /tmp/conmon
+(
+  cd /tmp/conmon
+  HOME="${HOME}" XDG_CACHE_HOME="${XDG_CACHE_HOME}" GOCACHE="${GOCACHE}" GOPATH="${GOPATH}" GOMODCACHE="${GOMODCACHE}" PATH="/usr/local/go/bin:${PATH}" make
+  make install
+)
+mkdir -p /usr/libexec/crio
+ln -sfn /usr/local/bin/conmon /usr/libexec/crio/conmon
+command -v conmon
+
+# Build the exact custom CRI-O tree used by pkg/kubeadm. This is important for
+# checkpoint/restore behavior and avoids running the distribution CRI-O binary.
+report "Building custom CRI-O"
+rm -rf /tmp/custom-crio
+git clone --depth=1 --branch 22-07-2026-checkpoint-restore \
+  https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio
+(
+  cd /tmp/custom-crio
+  HOME="${HOME}" XDG_CACHE_HOME="${XDG_CACHE_HOME}" GOCACHE="${GOCACHE}" GOPATH="${GOPATH}" GOMODCACHE="${GOMODCACHE}" PATH="/usr/local/go/bin:${PATH}" make
+  make install
+  make install.config
+  make install.systemd
+)
+rm -rf /tmp/custom-crio
+
+# The source-built CRI-O service must point to /usr/local/bin/crio. Do not allow
+# an apt-provided /usr/bin/crio service and the custom binary to race each other.
+if [[ -x /usr/local/bin/crio ]]; then
+  ln -sfn /usr/local/bin/crio /usr/bin/crio
 fi
+command -v crio
 
-# Ensure criu runtime dependencies are installed (libnl, libcap, libbsd, libgnutls)
-$APT install -y libcap2 libnl-3-200 libbsd0 libgnutls30
-
-# Swap in custom criu (device-restore-with-hook), idempotent on GitID
-WANT="%s"
-CRIU_BIN=$(command -v criu || echo /usr/sbin/criu)
-HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}' || true)
-if [ "$HAVE" = "$WANT" ]; then
-  echo "custom criu $WANT already at $CRIU_BIN, skipping"
-else
-  curl -fsSL %s -o /tmp/criu
-  chmod 0755 /tmp/criu
-  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}' || true)
-  [ "$GOT" = "$WANT" ] && \
-  install -m 0755 /tmp/criu "$CRIU_BIN" && \
-  rm -f /tmp/criu && \
-  echo "installed custom criu $WANT at $CRIU_BIN"
-fi
-criu --version || true
-# Grant CAP_CHECKPOINT_RESTORE capability so criu can run
-sudo setcap cap_checkpoint_restore+eip /usr/sbin/criu || true
-criu check 2>&1 | head -1 || true
-
-# Install latest runc, idempotent on version
-WANT="%s"
-RUNC_BIN=$(command -v runc || echo /usr/local/sbin/runc)
-HAVE=$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}' || true)
-if [ "$HAVE" = "$WANT" ]; then
-  echo "runc $WANT already installed at $RUNC_BIN, skipping"
-else
-  curl -fsSL https://github.com/opencontainers/runc/releases/download/$WANT/runc.amd64 -o /tmp/runc
-  curl -fsSL https://github.com/opencontainers/runc/releases/download/$WANT/runc.sha256sum -o /tmp/runc.sha256sum
-  WSHA=$(awk '/ runc\.amd64$/{print $1}' /tmp/runc.sha256sum)
-  GSHA=$(sha256sum /tmp/runc | awk '{print $1}')
-  [ -n "$WSHA" ] && [ "$WSHA" = "$GSHA" ] && \
-  install -m 0755 /tmp/runc "$RUNC_BIN" && \
-  rm -f /tmp/runc /tmp/runc.sha256sum && \
-  echo "installed runc $WANT at $RUNC_BIN"
-fi
-runc --version || true
-
-WANT="%s"
-HAVE=$(crio version --json 2>/dev/null | jq -r .gitCommit || true)
-if [ "$HAVE" != "$WANT" ]; then
-  curl -fsSL %s -o /tmp/crio
+# Replace the source-built executable with the exact release artifact used by
+# pkg/kubeadm. The source build installs the service/config/hooks; the release
+# asset makes the final executable deterministic and pins the expected commit.
+report "Installing pinned custom CRI-O artifact"
+CRIO_HAVE="$(crio version --json 2>/dev/null | jq -r '.gitCommit // empty' || true)"
+if [[ "$CRIO_HAVE" != "{{.CRIOCommit}}" ]]; then
+  curl -fsSL '{{.CRIOAsset}}' -o /tmp/crio
   chmod 0755 /tmp/crio
-  GOT=$(/tmp/crio version --json | jq -r .gitCommit || true)
-  if [ "$GOT" = "$WANT" ]; then
-    systemctl stop crio
-    install -m 0755 /tmp/crio /usr/bin/crio
-    systemctl daemon-reload
-    systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
-    rm -f /tmp/crio
-  fi
+  CRIO_GOT="$(/tmp/crio version --json 2>/dev/null | jq -r '.gitCommit // empty' || true)"
+  [[ "$CRIO_GOT" == "{{.CRIOCommit}}" ]] || {
+    echo "CRI-O artifact gitCommit mismatch: got '$CRIO_GOT', expected '{{.CRIOCommit}}'" >&2
+    exit 1
+  }
+  install -m 0755 /tmp/crio /usr/local/bin/crio
+  rm -f /tmp/crio
+  ln -sfn /usr/local/bin/crio /usr/bin/crio
 fi
+CRIO_FINAL="$(/usr/local/bin/crio version --json 2>/dev/null | jq -r '.gitCommit // empty' || true)"
+[[ "$CRIO_FINAL" == "{{.CRIOCommit}}" ]] || {
+  echo "Final CRI-O gitCommit mismatch: got '$CRIO_FINAL', expected '{{.CRIOCommit}}'" >&2
+  exit 1
+}
+report "Pinned custom CRI-O commit verified: ${CRIO_FINAL}"
 
-# Wipe ALL storage after binary swap — custom binary uses go.podman.io/storage,
-# packaged binary uses github.com/containers/storage; old metadata is unreadable.
-report "Rebuilding CRI-O image metadata cache"
-systemctl stop crio
-umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
-rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
-systemctl daemon-reload
-systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
-sleep 3
+# -----------------------------------------------------------------------------
+# CRI-O configuration
+# -----------------------------------------------------------------------------
+report "Configuring CRI-O"
+systemctl stop kubelet 2>/dev/null || true
+systemctl stop crio 2>/dev/null || true
+killall -9 crio conmon crun 2>/dev/null || true
+rm -rf /run/crio /var/run/crio
 
-# Unqualified image search registry — lets short image names (e.g. "busybox")
-# resolve against Docker Hub instead of failing with "short-name resolution enforced".
-mkdir -p /etc/containers
-tee /etc/containers/registries.conf >/dev/null <<EOF
+mkdir -p /run/crio /var/run/crio /var/lib/crio /var/lib/containers/storage
+mkdir -p /etc/crio/crio.conf.d /etc/containers /etc/cni/net.d /opt/cni/bin
+
+# Only [crio.runtime] owns listen/conmon. Do not put listen under [crio.image].
+cat > /etc/crio/crio.conf.d/10-paths.conf <<'CRIOPATHS'
+[crio.runtime]
+  listen = "/var/run/crio/crio.sock"
+  conmon = "/usr/libexec/crio/conmon"
+CRIOPATHS
+
+cat > /etc/crio/crio.conf.d/999-runc.conf <<'RUNTIME'
+[crio]
+
+  [crio.runtime]
+    default_runtime = "runc"
+
+    [crio.runtime.runtimes]
+      [crio.runtime.runtimes.runc]
+        runtime_path = "/usr/bin/runc"
+        runtime_type = "oci"
+
+      [crio.runtime.runtimes.nvidia]
+        runtime_path = "/usr/bin/nvidia-container-runtime"
+        runtime_type = "oci"
+RUNTIME
+
+cat > /etc/crio/crio.conf.d/9999-nvidia.conf <<'RUNTIME'
+[crio.runtime]
+  [crio.runtime.runtimes]
+    [crio.runtime.runtimes.nvidia]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+      runtime_type = "oci"
+    [crio.runtime.runtimes.nvidia-cdi]
+      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
+      runtime_type = "oci"
+RUNTIME
+
+cat > /etc/containers/policy.json <<'POLICY'
+{"default":[{"type":"insecureAcceptAnything"}]}
+POLICY
+
+cat > /etc/containers/registries.conf <<'REGCONF'
 unqualified-search-registries = ["docker.io"]
 
 [[registry]]
 location = "docker.io"
-EOF
+REGCONF
 
-test -f /usr/local/libexec/crio/criu-device-restorer.sh || \
+# CRIU runtime configuration used by the customized CRI-O/checkpoint path.
+mkdir -p /etc/criu
+cat > /etc/criu/runc.conf <<'CRIUCONF'
+tcp-close
+skip-in-flight
+log-file /tmp/criu.log
+ghost-limit 100M
+enable-external-masters
+external mnt[]
+irmap-scan-path /home/jovyan
+irmap-scan-path /usr
+irmap-scan-path /opt/conda
+irmap-scan-path /opt/remote-dev
+CRIUCONF
+cp -f /etc/criu/runc.conf /etc/criu/default.conf
+
+# Ensure the custom CRI-O restore hook is available if the custom installation
+# supplied it. This is non-fatal because the binary may provide the hook itself.
+if [[ -f /usr/libexec/crio/criu-device-restorer.sh ]]; then
   install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
-  /usr/local/libexec/crio/criu-device-restorer.sh 2>/dev/null || \
-  echo "WARN: criu-device-restorer.sh missing; restore-from-file may fail"
-systemctl enable crio --now || { journalctl -xeu crio.service --no-pager >&2; false; }
-systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
+    /usr/local/libexec/crio/criu-device-restorer.sh
+fi
 
-# CRIU configuration (matches crioBuildSteps in kubeadm.go)
-rm -f /etc/criu/runc.conf
-mkdir -p /etc/criu
-printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
-  | tee /etc/criu/runc.conf > /dev/null
+# Custom CRIU binary
+report "Installing custom CRIU"
+CRIU_BIN=/usr/sbin/criu
+CRIU_HAVE=""
+if command -v criu >/dev/null 2>&1; then
+  CRIU_HAVE="$(criu --version 2>&1 | awk '/GitID:/{print $2}' | head -1 || true)"
+fi
+if [[ "$CRIU_HAVE" != "{{.CRIUGitID}}" ]]; then
+  curl -fsSL '{{.CRIUAsset}}' -o /tmp/criu
+  chmod 0755 /tmp/criu
+  CRIU_GOT="$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}' | head -1 || true)"
+  [[ "$CRIU_GOT" == "{{.CRIUGitID}}" ]] || {
+    echo "CRIU GitID mismatch: got '$CRIU_GOT', expected '{{.CRIUGitID}}'" >&2
+    exit 1
+  }
+  install -m 0755 /tmp/criu "$CRIU_BIN"
+  rm -f /tmp/criu
+fi
+setcap cap_checkpoint_restore+eip "$CRIU_BIN" 2>/dev/null || true
+criu --version
 
-# Default CRIU config (used when criu is invoked without --config)
-rm -f /etc/criu/default.conf
-mkdir -p /etc/criu
-printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
-  | tee /etc/criu/default.conf > /dev/null
+# Custom runc, verified against the upstream checksum manifest.
+report "Installing runc {{.RuncVersion}}"
+RUNC_WANT="{{.RuncVersion}}"
+RUNC_BIN=/usr/local/sbin/runc
+RUNC_HAVE="$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}' || true)"
+if [[ "$RUNC_HAVE" != "$RUNC_WANT" ]]; then
+  case "$(dpkg --print-architecture)" in
+    amd64) RUNC_ARCH=amd64 ;;
+    arm64) RUNC_ARCH=arm64 ;;
+    *) echo "Unsupported architecture for runc: $(dpkg --print-architecture)" >&2; exit 1 ;;
+  esac
+  curl -fsSL "https://github.com/opencontainers/runc/releases/download/${RUNC_WANT}/runc.${RUNC_ARCH}" -o /tmp/runc
+  curl -fsSL "https://github.com/opencontainers/runc/releases/download/${RUNC_WANT}/runc.sha256sum" -o /tmp/runc.sha256sum
+  EXPECTED_SHA="$(awk -v f="runc.${RUNC_ARCH}" '$2 == f {print $1; exit}' /tmp/runc.sha256sum)"
+  ACTUAL_SHA="$(sha256sum /tmp/runc | awk '{print $1}')"
+  [[ -n "$EXPECTED_SHA" && "$EXPECTED_SHA" == "$ACTUAL_SHA" ]] || {
+    echo "runc checksum mismatch" >&2
+    exit 1
+  }
+  install -m 0755 /tmp/runc "$RUNC_BIN"
+  rm -f /tmp/runc /tmp/runc.sha256sum
+fi
+ln -sfn "$RUNC_BIN" /usr/bin/runc
+runc --version
 
-# CRI-O runc runtime drop-in — declares runc as the default OCI runtime
-mkdir -p /etc/crio/crio.conf.d
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/local/sbin/runc"\n        runtime_type = "oci"\n' \
-  | tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null
+# CRI-O uses crun only when explicitly configured. Build it so the same runtime
+# stack is available as in pkg/kubeadm, while keeping runc as the default.
+report "Building crun"
+rm -rf /tmp/crun
+git clone --depth=1 https://github.com/containers/crun /tmp/crun
+(
+  cd /tmp/crun
+  ./autogen.sh
+  ./configure --disable-man-page
+  make -j"$(nproc)"
+  make install
+)
+rm -rf /tmp/crun
+command -v crun
 
-report "CRI-O installed"
+# -----------------------------------------------------------------------------
+# Start and verify CRI-O before installing Kubernetes
+# -----------------------------------------------------------------------------
+# crictl from the Kubernetes SIG release, pinned to the Kubernetes version.
+# This avoids relying on whichever cri-tools package the CRI-O repository exposes.
+report "Installing crictl ${K8S_VERSION}"
+CRICTL_VERSION="v${K8S_VERSION}"
+case "$(dpkg --print-architecture)" in
+  amd64) CRICTL_ARCH=amd64 ;;
+  arm64) CRICTL_ARCH=arm64 ;;
+  *) echo "Unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;;
+esac
+curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${CRICTL_ARCH}.tar.gz" -o /tmp/crictl.tar.gz
+rm -f /usr/local/bin/crictl
+install -d -m 0755 /usr/local/bin
+tar -C /usr/local/bin -xzf /tmp/crictl.tar.gz crictl
+rm -f /tmp/crictl.tar.gz
+install -d -m 0755 /etc
+cat > /etc/crictl.yaml <<CRICTL
+runtime-endpoint: unix://${CRIO_SOCKET}
+image-endpoint: unix://${CRIO_SOCKET}
+timeout: 30s
+debug: false
+CRICTL
+chmod 0644 /etc/crictl.yaml
+crictl --version
+report "crictl is installed and configured"
 
-# Fix storage directory permissions (CRI-O may create with restrictive permissions)
-sudo chmod 0711 /var/lib/crio /var/lib/containers/storage 2>/dev/null || true
+systemctl daemon-reload
+systemctl enable crio
+restart_crio_and_wait
 
-# ── Kubernetes packages ──────────────────────────────────────────────────────
-report "Installing Kubernetes packages"
-rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+# -----------------------------------------------------------------------------
+# Kubernetes repository and packages
+# -----------------------------------------------------------------------------
+report "Configuring Kubernetes apt repository"
 mkdir -p /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key \
-  | gpg --dearmor | tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
-https://pkgs.k8s.io/core:/stable:/v%s/deb/ /" \
+rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/Release.key" \
+  | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+printf '%s\n' \
+  "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/ /" \
   > /etc/apt/sources.list.d/kubernetes.list
-$APT update
-$APT install -y \
-  kubelet=%s-* kubeadm=%s-* kubectl=%s-* \
+apt_update
+
+report "Installing Kubernetes packages"
+apt_install "kubelet=${K8S_VERSION}-*" "kubeadm=${K8S_VERSION}-*" "kubectl=${K8S_VERSION}-*" \
   --allow-change-held-packages --allow-downgrades
 apt-mark hold kubelet kubeadm kubectl
 systemctl enable kubelet
-report "Kubernetes packages installed"
+systemctl stop kubelet 2>/dev/null || true
 
-# ── Kubelet node-ip ──────────────────────────────────────────────────────────
-echo 'KUBELET_EXTRA_ARGS=--node-ip=%s' > /etc/default/kubelet
-systemctl daemon-reload
-systemctl restart kubelet
-
-# ── Join cluster ─────────────────────────────────────────────────────────────
-# Always restart CRI-O here to pick up any config changes made above
-# (e.g. new crun path). A passive "is-active || start" misses the case where
-# CRI-O is active but using stale config from a previous failed provisioning run.
-report "Restarting CRI-O and waiting for socket readiness"
-systemctl daemon-reload
-systemctl restart crio || { journalctl -xeu crio.service --no-pager >&2; false; }
-
-# Wait for CRI-O socket to be ready (up to 60s)
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  if test -S /var/run/crio/crio.sock; then
-    report "CRI-O socket ready"
-    break
-  fi
-  echo "Waiting for CRI-O socket ($i/20)..."
-  sleep 3
-done
-test -S /var/run/crio/crio.sock || { journalctl -xeu crio.service --no-pager -n 100 >&2; false; }
-
-# CRI-O recovery: when swapping binaries (especially custom CRI-O), the image cache
-# can become inconsistent, causing containers to fail with "image not found" errors.
-# Force a clean reset: stop services, unmount overlay storage, clear cache, restart.
-report "Checking CRI-O image cache consistency"
-if ! systemctl is-active crio >/dev/null 2>&1 || ! test -S /var/run/crio/crio.sock; then
-  report "CRI-O not responding, force-resetting image cache"
-  systemctl stop kubelet crio 2>/dev/null || true
-  umount -l /var/lib/containers/storage/overlay/*/merged 2>/dev/null || true
-  umount -l /var/lib/crio 2>/dev/null || true
-  rm -rf /var/lib/crio /run/crio /var/lib/containers/storage 2>/dev/null || true
-  systemctl restart crio
-  sleep 5
-  for i in 1 2 3 4 5; do
-    test -S /var/run/crio/crio.sock && break
-    sleep 3
-  done
-  systemctl restart kubelet
-  sleep 10
+KUBELET_ARGS="--node-ip=${NODE_IP}"
+if [[ -n "{{.KubeletNodeLabels}}" ]]; then
+  KUBELET_ARGS="${KUBELET_ARGS} --node-labels={{.KubeletNodeLabels}}"
 fi
+printf 'KUBELET_EXTRA_ARGS=%s\n' "$KUBELET_ARGS" > /etc/default/kubelet
+mkdir -p /etc/systemd/system/kubelet.service.d
+cat > /etc/systemd/system/kubelet.service.d/10-crio.conf <<'UNIT'
+[Unit]
+After=crio.service
+Requires=crio.service
+UNIT
+systemctl daemon-reload
 
+# -----------------------------------------------------------------------------
+# Final CRI-O gate immediately before kubeadm join
+# -----------------------------------------------------------------------------
+report "Performing final CRI-O health check before kubeadm join"
+restart_crio_and_wait
+crictl info >/dev/null
+
+# -----------------------------------------------------------------------------
+# kubeadm join
+# -----------------------------------------------------------------------------
 report "Joining cluster"
+JOIN_CMD="$(printf '%s' '{{.JoinCommandB64}}' | base64 -d)"
+
+# Join command is generated by the control plane. It is intentionally executed
+# only after CRI-O is proven healthy. --cri-socket prevents kubeadm from probing
+# an unintended container runtime.
 for attempt in 1 2 3 4 5; do
-  # Append --cri-socket to use CRI-O instead of defaulting to containerd
-  if %s --cri-socket=unix:///var/run/crio/crio.sock; then
+  if bash -c "$JOIN_CMD --cri-socket=unix://${CRIO_SOCKET}"; then
     report "Cluster join succeeded"
     break
   fi
-  [ "$attempt" -eq 5 ] && { report "ERROR: cluster join failed after 5 attempts"; exit 1; }
-  sleep $((attempt * 30))
+  if [[ "$attempt" == "5" ]]; then
+    report "ERROR: kubeadm join failed after 5 attempts"
+    exit 1
+  fi
+  sleep $((attempt * 15))
+  restart_crio_and_wait
 done
 
-# ── Labels ───────────────────────────────────────────────────────────────────
-%s
+# kubeadm should have created kubelet configuration. Do not blindly restart it
+# until CRI-O is healthy; the systemd dependency also enforces the relationship.
+systemctl daemon-reload
+systemctl restart kubelet
+wait_for_service_active kubelet 120
 
-# ── Done ─────────────────────────────────────────────────────────────────────
-touch /var/lib/node-bootstrap-complete
-report "Bootstrap complete"
-`, p.KubernetesVersion,
-		nopasswdBlock,
-		wgConf,
-		p.CRIOVersion, p.CRIOVersion,
-		kubeadm.CriuGitID, kubeadm.CriuAsset,
-		kubeadm.RuncVersion,
-		kubeadm.CrioCommit, kubeadm.CrioAsset,
-		p.KubernetesMinorVersion, p.KubernetesMinorVersion,
-		p.KubernetesVersion, p.KubernetesVersion, p.KubernetesVersion,
-		p.VpnIP,
-		p.JoinCommand,
-		labelCmd,
-	)
+# Verify kubelet is talking to CRI-O. A running process alone is insufficient.
+for i in $(seq 1 30); do
+  if systemctl is-active --quiet kubelet && crictl info >/dev/null 2>&1; then
+    break
+  fi
+  sleep 3
+done
+systemctl is-active --quiet kubelet || {
+  journalctl -u kubelet --no-pager -n 120 || true
+  exit 1
 }
+crictl info >/dev/null
+
+# -----------------------------------------------------------------------------
+# GPU ownership boundary
+# -----------------------------------------------------------------------------
+# There is deliberately NO NVIDIA setup in this script.
+# GPU Operator is expected to install and configure:
+#   - NVIDIA driver
+#   - NVIDIA container toolkit
+#   - CRI-O NVIDIA runtime integration
+#   - CDI
+#   - NVIDIA device plugin / GPU resources
+# Any NVIDIA runtime configuration here would race with GPU Operator and can
+# make CRI-O unavailable before the operator is ready.
+report "GPU configuration deferred entirely to GPU Operator"
+
+# GPU identity labels are supplied to kubelet at registration time when
+# IsGPUNode=true. The control-plane reconciler remains authoritative and will
+# re-apply the same labels and the GPU taint after resolving the joined node.
+# No kubectl/admin kubeconfig is required on the worker.
+
+# -----------------------------------------------------------------------------
+# SSH access
+# -----------------------------------------------------------------------------
+{{if .HasSSHUsername}}
+cat > /etc/sudoers.d/nopasswd-{{.SSHUsername}} <<'SUDOERS'
+{{.SSHUsername}} ALL=(ALL) NOPASSWD:ALL
+SUDOERS
+chmod 0440 /etc/sudoers.d/nopasswd-{{.SSHUsername}}
+visudo -cf /etc/sudoers.d/nopasswd-{{.SSHUsername}}
+{{end}}
+
+# -----------------------------------------------------------------------------
+# Completion marker
+# -----------------------------------------------------------------------------
+printf 'SUCCESS\n' > "$STATUS_FILE"
+touch "$COMPLETE_FILE"
+sync
+report "Bootstrap complete"
+`

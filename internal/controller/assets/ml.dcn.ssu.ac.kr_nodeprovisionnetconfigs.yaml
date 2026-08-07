@@ -109,6 +109,14 @@ spec:
                 description: ClusterJoinCommand is the kubeadm join command for worker
                   nodes.
                 type: string
+              joinTokenRefreshedAt:
+                description: |-
+                  JoinTokenRefreshedAt records when ClusterJoinCommand was last updated with
+                  a fresh kubeadm bootstrap token.  The NodeProvision controller uses this to
+                  ensure it never launches an EC2 instance with a token that is close to its
+                  24-hour expiry.
+                format: date-time
+                type: string
               kubeconfig:
                 description: |-
                   Kubeconfig is the base64-encoded admin kubeconfig for this cluster.

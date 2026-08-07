@@ -92,6 +92,12 @@ type NodeProvisionNetConfigStatus struct {
 	UsedIPAddresses []string `json:"usedIPAddresses,omitempty"`
 	// ClusterJoinCommand is the kubeadm join command for worker nodes.
 	ClusterJoinCommand string `json:"clusterJoinCommand,omitempty"`
+	// JoinTokenRefreshedAt records when ClusterJoinCommand was last updated with
+	// a fresh kubeadm bootstrap token.  The NodeProvision controller uses this to
+	// ensure it never launches an EC2 instance with a token that is close to its
+	// 24-hour expiry.
+	// +optional
+	JoinTokenRefreshedAt *metav1.Time `json:"joinTokenRefreshedAt,omitempty"`
 	// VPNPeers tracks every WireGuard peer registered on the VPN server.
 	// +optional
 	VPNPeers []VPNPeerStatus `json:"vpnPeers,omitempty"`

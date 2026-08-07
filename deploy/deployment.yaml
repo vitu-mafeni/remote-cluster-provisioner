@@ -42,13 +42,13 @@ spec:
           command: [/manager]
           args:
             - --leader-elect
-            - --health-probe-bind-address=:8081
+            - --health-probe-bind-address=:8083
             - --metrics-bind-address=:8443
             - --metrics-secure=true
 
           ports:
             - name: healthz
-              containerPort: 8081
+              containerPort: 8083
               protocol: TCP
             - name: metrics
               containerPort: 8443
@@ -57,7 +57,7 @@ spec:
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8081
+              port: 8083
             initialDelaySeconds: 15
             periodSeconds: 20
             failureThreshold: 3
@@ -65,7 +65,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 8081
+              port: 8083
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3
