@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
+	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 	onprem "dcn.ssu.ac.kr/infra/provider/onprem"
 	corev1 "k8s.io/api/core/v1"
@@ -126,6 +128,7 @@ func ProvisionEC2Node(
 	creds AWSCredentials,
 	vpnServerClient *sshhelper.Client,
 	netNodeConfig *mlv1alpha1.NodeProvisionNetConfig,
+	runtimeCfg pkgruntime.Config,
 ) (*ProvisionResult, error) {
 
 	name := nodeProvision.Name
@@ -157,7 +160,7 @@ func ProvisionEC2Node(
 		vpnIP,
 		*netNodeConfig.Spec.VPNRange,
 		netNodeConfig.Spec.VPNServerPublicConfig.PublicIP,
-		netNodeConfig.Spec.VPNServerPublicConfig.VPNPort,
+		parsePort(netNodeConfig.Spec.VPNServerPublicConfig.VPNPort, 51820),
 		privateKey,
 	)
 	if err != nil {
@@ -192,12 +195,16 @@ func ProvisionEC2Node(
 		JoinCommand:            netNodeConfig.Status.ClusterJoinCommand,
 		KubernetesVersion:      clean,
 		KubernetesMinorVersion: crioVersion,
-		CRIOVersion:            crioVersion,
 		NodeName:               name,
 		Labels:                 labels,
 		SSHUsername:            nodeProvision.Spec.SSHUsernameOverride,
 		IsGPUNode:              strings.EqualFold(nodeProvision.Spec.NodeLabel, "gpu"),
-		// NvidiaContainerToolkitVersion: netNodeConfig.Spec.SoftwareConfig.NvidiaContainerToolkitVersion,
+		RuntimeRegistryUser:    runtimeCfg.Username,
+		RuntimeRegistryToken:   runtimeCfg.Token,
+		RuntimeRegistry:        runtimeCfg.Registry,
+		RuntimeRepository:      runtimeCfg.Repository,
+		RuntimeVersion:         runtimeCfg.Version,
+		RuntimeOrasVersion:     runtimeCfg.OrasVersion,
 	})
 
 	// ── Create EC2 instance ────────────────────────────────────────────────
@@ -784,4 +791,17 @@ func tagInstance(ctx context.Context, client *ec2.Client, instanceID string, np 
 		time.Sleep(time.Duration(i+1) * 2 * time.Second)
 	}
 	return lastErr
+}
+
+// parsePort converts a string port value to int, returning defaultPort when
+// the string is empty or unparseable. Accepts port fields stored as strings in YAML.
+func parsePort(s string, defaultPort int) int {
+	if s == "" {
+		return defaultPort
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return defaultPort
+	}
+	return n
 }

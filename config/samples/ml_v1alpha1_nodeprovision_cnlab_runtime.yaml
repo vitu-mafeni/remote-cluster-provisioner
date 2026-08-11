@@ -1,0 +1,176 @@
+# ============================================================
+# cnlab-runtime registry credentials
+#
+# The controller reads "username" and "token" from this secret
+# when pulling the cnlab-runtime OCI artifact from the registry.
+# Token requires at minimum packages:read scope on GHCR.
+#
+# Referenced by NodeProvisionNetConfig.spec.softwareConfig
+#   .cnlabRuntime.credentialsRef
+# ============================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnlab-runtime-registry
+  namespace: default
+type: Opaque
+stringData:
+  username: "your-github-username"
+  token: "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # packages:read scope minimum
+
+---
+# ============================================================
+# NodeProvisionNetConfig — cluster-wide config that the
+# NodeProvision controller reads per reconcile cycle.
+#
+# softwareConfig.cnlabRuntime tells every node in this cluster
+# where to pull the prebuilt CRI-O runtime artifact and which
+# registry credentials to use.  All cnlabRuntime fields are
+# optional; the defaults below are shown for clarity.
+# ============================================================
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvisionNetConfig
+metadata:
+  name: my-cluster-netconfig
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  clusterName: my-cluster
+
+  # CIDR range from which each node receives a unique WireGuard IP.
+  vpnRange: "10.9.0.0/24"
+
+  vpnServerPublicConfig:
+    publicIP: "13.215.206.108"
+    sshPort: 22
+    sshUsername: ubuntu
+    vpnPort: 51820
+    vpnSshCredentialsRef:
+      name: vpn-server-secret
+      namespace: default
+      key: id_rsa
+
+  softwareConfig:
+    kubernetesVersion: "v1.34.2"
+    nvidiaDriverVersion: "550"
+    nvidiaContainerToolkitVersion: "1.17.3-1"
+    k8sDevicePluginVersion: "v0.17.1"
+
+    # cnlabRuntime configures the prebuilt CRI-O runtime OCI artifact.
+    # All fields are optional; defaults are listed as comments.
+    cnlabRuntime:
+      # OCI registry host. Default: ghcr.io
+      registry: "ghcr.io"
+      # Image repository path. Default: vitu-mafeni/cnlab-runtime
+      repository: "vitu-mafeni/cnlab-runtime"
+      # Artifact version tag. Default: 1.0.0-beta
+      version: "1.0.0-beta"
+      # ORAS CLI version used to pull the artifact. Default: 1.3.2
+      orasVersion: "1.3.2"
+      # Secret containing "username" and "token" keys for registry auth.
+      # Follows the same pattern as vpnSshCredentialsRef.
+      # Leave name empty to pull from a public registry without auth.
+      credentialsRef:
+        name: cnlab-runtime-registry
+        namespace: default
+
+---
+# SSH credential for the WireGuard VPN server.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vpn-server-secret
+  namespace: default
+type: Opaque
+stringData:
+  id_rsa: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    <paste VPN server private key here>
+    -----END OPENSSH PRIVATE KEY-----
+
+---
+# ============================================================
+# NodeProvision (OnPrem) — provisions a bare-metal or VM node
+# via SSH and joins it to the cluster above.
+# ============================================================
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: gpu-worker-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  provider: OnPrem
+  role: worker
+  nodeLabel: gpu
+  ipAddress: "192.168.28.150"
+  sshPort: 22
+  sshUsernameOverride: ubuntu
+  credentialsRef:
+    name: gpu-worker-01-ssh-secret
+    namespace: default
+    key: id_rsa
+
+---
+# SSH credential for the on-prem node being provisioned.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gpu-worker-01-ssh-secret
+  namespace: default
+type: Opaque
+stringData:
+  id_rsa: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    <paste node private key here>
+    -----END OPENSSH PRIVATE KEY-----
+
+---
+# ============================================================
+# NodeProvision (AWS) — launches an EC2 instance and joins it
+# to the cluster.  cnlab-runtime credentials are read from the
+# same NodeProvisionNetConfig above; no changes needed here.
+# ============================================================
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: aws-gpu-worker-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  provider: AWS
+  role: worker
+  # "gpu" → p3.2xlarge  |  "cpu" → t3.xlarge  (resolved automatically)
+  nodeLabel: gpu
+  region: ap-northeast-2
+  credentialsRef:
+    name: aws-node-credentials
+    namespace: default
+  # awsConfig is optional — uncomment to override auto-resolved values.
+  # awsConfig:
+  #   ami: ami-0c9c942bd7bf113a2
+  #   subnetId: subnet-0123456789abcdef0
+  #   securityGroupIds:
+  #     - sg-0123456789abcdef0
+  #   rootVolumeSizeGB: 100
+  #   tags:
+  #     environment: production
+
+---
+# AWS credentials secret for EC2 provisioning.
+# Omit awsAccessKeyId / awsSecretAccessKey to use the controller's IAM role.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-node-credentials
+  namespace: default
+type: Opaque
+stringData:
+  awsAccessKeyId: "AKIAIOSFODNN7EXAMPLE"
+  awsSecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"

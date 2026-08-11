@@ -24,6 +24,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
+	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	"dcn.ssu.ac.kr/infra/pkg/ssh"
 	awsprovision "dcn.ssu.ac.kr/infra/provider/aws"
 	remotenodeprovision "dcn.ssu.ac.kr/infra/provider/onprem"
@@ -445,7 +447,12 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving AWS credentials: %v", err))
 	}
 
-	result, err := awsprovision.ProvisionEC2Node(ctx, np, creds, vpnServerClient, netConfig)
+	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, netConfig.Spec.SoftwareConfig, netConfig.Namespace)
+	if err != nil {
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving cnlab-runtime config: %v", err))
+	}
+
+	result, err := awsprovision.ProvisionEC2Node(ctx, np, creds, vpnServerClient, netConfig, runtimeCfg)
 	// Always persist VPN allocation immediately — even on EC2 failure — so that
 	// cleanupVPNPeer can find and release the peer on the next retry instead of
 	// leaving it as an orphan and allocating yet another IP.
@@ -771,6 +778,15 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 		}
 	}
 
+	// Resolve runtime config before the goroutine so credentials are fetched
+	// within the reconcile context (which has a proper timeout and client).
+	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, netConfig.Spec.SoftwareConfig, netConfig.Namespace)
+	if err != nil {
+		sshClient.Conn.Close()
+		vpnServerClient.Conn.Close()
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving cnlab-runtime config: %v", err))
+	}
+
 	// Snapshot values needed by the goroutine before returning.
 	npCopy := np.DeepCopy()
 	secretCopy := secret.DeepCopy()
@@ -799,6 +815,7 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 			vpnServerClient,
 			netConfigCopy,
 			reportStep,
+			runtimeCfg,
 		)
 		ch <- onPremJobResult{vpnIP: vpnNodeIP, publicKey: publicKey, err: err}
 	}()
@@ -1350,8 +1367,8 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	// ── Provider-specific cleanup (must happen before secrets are deleted) ──────
 	switch np.Spec.Provider {
 	case mlv1alpha1.CloudProviderAWS:
-		// SSH reset before instance termination — mirrors resetNodeViaSSH in the
-		// RemoteCluster controller.  Best-effort: if SSH fails we still terminate.
+		// SSH reset before instance termination — best-effort; failure does not
+		// block termination.
 		if np.Status.VpnIP != "" {
 			if sshClient, sshErr := r.getSSHClientByProvider(ctx, np); sshErr != nil {
 				log.Error(sshErr, "Cannot SSH to AWS node for reset (continuing with termination)")
@@ -1377,23 +1394,25 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 				}
 				secret, err = r.getControllerCredsSecret(ctx, np)
 				if err != nil {
-					log.Error(err, "getting controller credential copy for EC2 termination (skipping)",
-						"instanceId", np.Status.InstanceID,
-						"hint", "manually terminate this EC2 instance")
+					// Neither the user secret nor the controller copy is available.
+					// Return an error so the controller requeues — do not delete
+					// secrets or remove the finalizer until the instance is gone.
+					return ctrl.Result{}, fmt.Errorf("no credentials to terminate EC2 instance %s; both user and controller-copy secrets unavailable: %w",
+						np.Status.InstanceID, err)
 				}
 			}
-			if secret != nil {
-				terminateCreds, credsErr := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
-				if credsErr != nil {
-					log.Error(credsErr, "resolving AWS credentials for termination — using static fallback")
-					terminateCreds = awsprovision.ResolveAWSCredentials(secret)
-				}
-				if err := awsprovision.TerminateInstance(ctx, np, terminateCreds, np.Status.InstanceID); err != nil {
-					log.Error(err, "terminating EC2 instance", "instanceId", np.Status.InstanceID)
-				} else {
-					log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
-				}
+			terminateCreds, credsErr := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+			if credsErr != nil {
+				log.Error(credsErr, "resolving AWS credentials for termination — using static fallback")
+				terminateCreds = awsprovision.ResolveAWSCredentials(secret)
 			}
+			if err := awsprovision.TerminateInstance(ctx, np, terminateCreds, np.Status.InstanceID); err != nil {
+				// Return the error so the controller requeues. Secrets and the
+				// finalizer must not be removed until the instance is confirmed
+				// gone — otherwise the instance is orphaned with no retry path.
+				return ctrl.Result{}, fmt.Errorf("terminating EC2 instance %s: %w", np.Status.InstanceID, err)
+			}
+			log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
 		}
 	case mlv1alpha1.CloudProviderOnPrem:
 		r.cleanupOnPremNode(ctx, np)
@@ -1889,10 +1908,7 @@ func (r *NodeProvisionReconciler) getVPNServerSSHClient(ctx context.Context, net
 	if username == "" {
 		username = "ubuntu"
 	}
-	port := cfg.SSHPort
-	if port == 0 {
-		port = 22
-	}
+	port := parsePort(cfg.SSHPort, 22)
 	return dialSSH(cfg.PublicIP, port, username, string(credBytes))
 }
 
@@ -2010,10 +2026,60 @@ func ensureFinalizer(np *mlv1alpha1.NodeProvision, finalizer string) bool {
 	return false
 }
 
+// resolveCnlabRuntimeConfig builds a pkgruntime.Config from the SoftwareConfig.
+// If CnlabRuntime.CredentialsRef is set, it reads the referenced Secret's
+// "username" and "token" keys. The token is kept in memory only and never logged.
+func (r *NodeProvisionReconciler) resolveCnlabRuntimeConfig(
+	ctx context.Context,
+	softwareCfg mlv1alpha1.SoftwareConfig,
+	namespace string,
+) (pkgruntime.Config, error) {
+	cfg := pkgruntime.Config{}
+	if softwareCfg.CnlabRuntime != nil {
+		cr := softwareCfg.CnlabRuntime
+		cfg.Registry = cr.Registry
+		cfg.Repository = cr.Repository
+		cfg.Version = cr.Version
+		cfg.OrasVersion = cr.OrasVersion
+
+		ref := cr.CredentialsRef
+		if ref.Name != "" {
+			ns := ref.NameSpace
+			if ns == "" {
+				ns = namespace
+			}
+			var secret corev1.Secret
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      ref.Name,
+				Namespace: ns,
+			}, &secret); err != nil {
+				return pkgruntime.Config{}, fmt.Errorf("reading cnlab-runtime credentials secret %s/%s: %w", ns, ref.Name, err)
+			}
+			cfg.Username = string(secret.Data["username"])
+			cfg.Token = string(secret.Data["token"]) // never log
+		}
+	}
+	cfg.ApplyDefaults()
+	return cfg, nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeProvisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mlv1alpha1.NodeProvision{}).
 		Named("ml-nodeprovision").
 		Complete(r)
+}
+
+// parsePort converts a string port value to int, returning defaultPort when
+// the string is empty or unparseable. Accepts port fields stored as strings in YAML.
+func parsePort(s string, defaultPort int) int {
+	if s == "" {
+		return defaultPort
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return defaultPort
+	}
+	return n
 }

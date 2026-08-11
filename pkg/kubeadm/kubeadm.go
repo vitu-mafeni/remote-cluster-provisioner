@@ -8,16 +8,11 @@ import (
 
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/pkg/argocd"
+	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
 
 const (
-	CrioAsset   = "https://github.com/vitu-mafeni/leehun-cri-o/releases/download/crio-v1.35.0-digest-lookup-fix/crio"
-	CrioCommit  = "ccd43393035e134a47f6b7eec6b28476c3647c6e"
-	CriuAsset   = "https://github.com/vitu-mafeni/leehun-criu/releases/download/criu-4.2-seccomp-fix/criu"
-	CriuGitID   = "8c1c54be6"
-	RuncVersion = "v1.5.0"
-
 	// crioSock = "unix:///var/run/crio/crio.sock"
 
 	// EGKernelspecsExportPath is the NFS export path Enterprise Gateway's Helm
@@ -51,180 +46,6 @@ echo "Waiting for CRI-O ($i/30)..."; sleep 3; \
 done; \
 sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
   || { sudo journalctl -xeu crio.service --no-pager -n 100 >&2; false; }`
-
-// crioBuildSteps returns the ordered shell commands that build conmon and CRI-O from
-// source, install them, and write all required runtime configuration.  The steps are
-// identical for control-plane and worker nodes.
-//
-// Key fixes vs the previous version:
-//   - sudo make install.systemd installs the source-built service file that points to
-//     /usr/local/bin/crio, preventing the "two binaries fighting" problem where the apt
-//     service file would start /usr/bin/crio instead of the custom binary.
-//   - /usr/bin/crio is symlinked to /usr/local/bin/crio as a belt-and-suspenders fallback.
-//   - conmon is symlinked to /usr/libexec/crio/conmon, which is CRI-O's hard-coded search
-//     path when it cannot find conmon via PATH.
-//   - crictl.yaml is written so crictl works without --runtime-endpoint.
-//   - CRI-O drop-in uses only [crio.runtime] — [crio.image] has no listen key and was
-//     silently breaking drop-in parsing.
-//   - CNI directories are created before CRI-O starts so the CNI plugin probe succeeds.
-func crioBuildSteps(clean string) []string {
-	return []string{
-		// ── Build deps ──────────────────────────────────────────────────────────────
-		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential libgpgme-dev gcc xmlto asciidoc " +
-			"libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler " +
-			"python3-protobuf uuid-dev libbsd-dev libnftables-dev libcap-dev libnl-3-dev " +
-			"libnet1-dev libaio-dev libgnutls28-dev libdrm-dev --no-install-recommends",
-		"sudo dpkg --configure -a",
-		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git make pkg-config libassuan-dev libglib2.0-dev " +
-			"libc6-dev libgpg-error-dev libseccomp-dev libsystemd-dev libselinux1-dev " +
-			"libbtrfs-dev libudev-dev software-properties-common go-md2man runc crun",
-
-		// ── Go 1.26.4 (golang-go from apt is ≤1.21; go.mod requires 1.26.4) ────────
-		`GO_VER=1.26.4; \
-curl -fsSL https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz -o /tmp/go.tar.gz && \
-sudo rm -rf /usr/local/go && \
-sudo tar -C /usr/local -xzf /tmp/go.tar.gz && \
-rm -f /tmp/go.tar.gz && \
-/usr/local/go/bin/go version`,
-
-		// ── conmon from source ────────────────────────────────────────────────────────
-		// CRI-O has a hard-coded search list that includes /usr/libexec/crio/conmon;
-		// symlink the source-built binary there so CRI-O finds it without extra config.
-		`sudo rm -rf /tmp/conmon && \
-git clone https://github.com/containers/conmon /tmp/conmon && \
-cd /tmp/conmon && \
-PATH=/usr/local/go/bin:$PATH make && \
-sudo make install && \
-sudo mkdir -p /usr/libexec/crio && \
-sudo ln -sf /usr/local/bin/conmon /usr/libexec/crio/conmon && \
-rm -rf /tmp/conmon`,
-
-		// ── CRI-O from source ─────────────────────────────────────────────────────────
-		// make install        → /usr/local/bin/crio
-		// make install.config → /etc/crio/ defaults
-		// make install.systemd → /usr/local/lib/systemd/system/crio.service  (points to
-		//                         /usr/local/bin/crio, not the apt binary at /usr/bin/crio)
-		`sudo rm -rf /tmp/custom-crio && \
-git clone https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio -b 22-07-2026-checkpoint-restore && \
-cd /tmp/custom-crio && \
-PATH=/usr/local/go/bin:$PATH make && \
-sudo make install && \
-sudo make install.config && \
-sudo make install.systemd 2>/dev/null || true && \
-rm -rf /tmp/custom-crio`,
-
-		// Belt-and-suspenders: if the apt service file (/lib/systemd/system/crio.service)
-		// is used instead of the source-built one, ensure /usr/bin/crio also resolves to
-		// the custom binary so systemd ExecStart=/usr/bin/crio runs the right thing.
-		`sudo ln -sf /usr/local/bin/crio /usr/bin/crio`,
-		`sudo ln -sf /usr/local/bin/crio-status /usr/bin/crio-status 2>/dev/null || true`,
-
-		// ── crictl ────────────────────────────────────────────────────────────────────
-		fmt.Sprintf(`curl -fsSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v%s/crictl-v%s-linux-amd64.tar.gz \
-  | sudo tar -C /usr/local/bin -xzf - crictl && \
-sudo chmod 0755 /usr/local/bin/crictl && \
-sudo ln -sf /usr/local/bin/crictl /usr/bin/crictl`, clean, clean),
-
-		// ── CRI-O configuration ──────────────────────────────────────────────────────
-		// crictl.yaml — without this crictl falls back to runtime detection which can
-		// pick containerd or an empty socket.
-		`printf 'runtime-endpoint: unix:///var/run/crio/crio.sock\n` +
-			`image-endpoint: unix:///var/run/crio/crio.sock\n` +
-			`timeout: 30\n` +
-			`debug: false\n' | sudo tee /etc/crictl.yaml > /dev/null`,
-
-		// Drop-in: socket path + conmon path.
-		// Only [crio.runtime] has a listen key; [crio.image] does not — the old config
-		// with [crio.image] listen = "..." was silently ignored or broke parsing.
-		`sudo mkdir -p /etc/crio/crio.conf.d && \
-printf '[crio.runtime]\nlisten = "/var/run/crio/crio.sock"\nconmon = "/usr/local/bin/conmon"\n' \
-  | sudo tee /etc/crio/crio.conf.d/10-paths.conf > /dev/null`,
-
-		// Container image pull policy.
-		`sudo mkdir -p /etc/containers && \
-printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' \
-  | sudo tee /etc/containers/policy.json > /dev/null`,
-
-		// Unqualified image search registry — lets short image names (e.g. "busybox")
-		// resolve against Docker Hub instead of failing with "short-name resolution enforced".
-		`sudo mkdir -p /etc/containers
-sudo tee /etc/containers/registries.conf >/dev/null <<EOF
-unqualified-search-registries = ["docker.io"]
-
-[[registry]]
-location = "docker.io"
-EOF`,
-
-		// CNI directories must exist before CRI-O starts so the CNI plugin probe passes.
-		`sudo mkdir -p /etc/cni/net.d /opt/cni/bin`,
-
-		// CRIU configuration for checkpoint/restore support.
-		// Remove any stale file first, then write fresh config.
-		`sudo rm -f /etc/criu/runc.conf && \
-sudo mkdir -p /etc/criu && \
-printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
-  | sudo tee /etc/criu/runc.conf > /dev/null`,
-
-		// Default CRIU config (used when criu is invoked without --config).
-		`sudo rm -f /etc/criu/default.conf && \
-sudo mkdir -p /etc/criu && \
-printf 'tcp-close\nskip-in-flight\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
-  | sudo tee /etc/criu/default.conf > /dev/null`,
-
-		// ── Custom CRIU binary (device-restore-with-hook) ────────────────────────────
-		// Ensure runtime shared libraries are present (libnl, libcap, libbsd, libgnutls).
-		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libcap2 libnl-3-200 libbsd0 libgnutls30 2>/dev/null || true",
-		// Idempotent install: skip if the binary already has the expected GitID.
-		fmt.Sprintf(`WANT="%s"; \
-CRIU_BIN=$(command -v criu || echo /usr/sbin/criu); \
-HAVE=$(criu --version 2>&1 | awk '/GitID:/{print $2}'); \
-if [ "$HAVE" = "$WANT" ]; then \
-  echo "custom criu $WANT already at $CRIU_BIN, skipping"; \
-else \
-  curl -fsSL %s -o /tmp/criu && \
-  chmod 0755 /tmp/criu && \
-  GOT=$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}') && \
-  [ "$GOT" = "$WANT" ] || { echo "GitID mismatch: got $GOT want $WANT"; false; } && \
-  sudo install -m 0755 /tmp/criu "$CRIU_BIN" && \
-  rm -f /tmp/criu && \
-  echo "installed custom criu $WANT at $CRIU_BIN"; \
-fi`, CriuGitID, CriuAsset),
-		"criu --version || true",
-		// Grant CAP_CHECKPOINT_RESTORE so criu can run without full root.
-		"sudo setcap cap_checkpoint_restore+eip /usr/sbin/criu || true",
-		"criu check 2>&1 | head -1 || true",
-
-		// ── crun from source ─────────────────────────────────────────────────────────
-		// The apt crun on Ubuntu 22.04 is ≈0.19 which predates OCI spec 1.0.2; CRI-O
-		// 1.35 generates specs that old crun rejects with "unknown version specified".
-		// Build the latest release from source to ensure compatibility.
-		`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
-		`sudo rm -rf /tmp/crun && \
-git clone --depth=1 https://github.com/containers/crun /tmp/crun && \
-cd /tmp/crun && \
-./autogen.sh && \
-./configure --disable-man-page && \
-make -j$(nproc) && \
-sudo make install && \
-rm -rf /tmp/crun`,
-
-		// CRI-O runtime drop-in: use crun as the default OCI runtime.
-		// crun built from source installs to /usr/local/bin/crun.
-		`sudo mkdir -p /etc/crio/crio.conf.d && \
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/bin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
-  | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
-		`sudo tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'EOF'
-[crio.runtime]
-  [crio.runtime.runtimes]
-    [crio.runtime.runtimes.nvidia]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
-      runtime_type = "oci"
-    [crio.runtime.runtimes.nvidia-cdi]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
-      runtime_type = "oci"
-EOF`,
-	}
-}
 
 // ProvisionPhase groups a set of related shell commands under a human-readable name.
 // InitializeControlPlane and JoinWorkerNode iterate over a []ProvisionPhase;
@@ -265,7 +86,7 @@ const (
 	CPPhaseNFS             = 1
 	CPPhaseSysSettings     = 2
 	CPPhaseAPTRepos        = 3
-	CPPhaseCRIOBuild       = 4
+	CPPhaseCRIOInstall     = 4
 	CPPhaseCRIOStart       = 5
 	CPPhaseK8sInstall      = 6
 	CPPhaseKubeadmInit     = 7
@@ -281,7 +102,7 @@ const (
 	WorkerPhaseCleanup     = 0
 	WorkerPhaseSysSettings = 1
 	WorkerPhaseAPTRepos    = 2
-	WorkerPhaseCRIOBuild   = 3
+	WorkerPhaseCRIOInstall = 3
 	WorkerPhaseCRIOStart   = 4
 	WorkerPhaseK8sInstall  = 5
 	WorkerPhaseGPUCDI      = 6
@@ -289,7 +110,7 @@ const (
 	WorkerPhaseJoin        = 8
 )
 
-func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster, startPhase int, onPhaseComplete func(int)) (string, error) {
+func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster, startPhase int, onPhaseComplete func(int), runtimeCfg pkgruntime.Config) (string, error) {
 	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
 
 	tunIP, err := GetTunIP(client)
@@ -458,37 +279,11 @@ fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 			"sudo apt-get update",
 		}},
 
-		// ── Phase 4: CRI-O build ─────────────────────────────────────────────────────
-		{Name: "CRI-O Build", Steps: crioBuildSteps(clean)},
+		// ── Phase 4: CRI-O Install ──────────────────────────────────────────────────
+		{Name: "CRI-O Install", Steps: pkgruntime.InstallSteps(runtimeCfg)},
 
 		// ── Phase 5: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
-			// Build crun from source unconditionally so a resume (skipping phase 4)
-			// also gets a version compatible with CRI-O 1.35. apt crun on Ubuntu 22.04
-			// is ≈0.19 which predates OCI spec 1.0.2 and fails with "unknown version".
-			`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
-			`sudo rm -rf /tmp/crun && \
-git clone --depth=1 https://github.com/containers/crun /tmp/crun && \
-cd /tmp/crun && \
-./autogen.sh && \
-./configure --disable-man-page && \
-make -j$(nproc) && \
-sudo make install && \
-rm -rf /tmp/crun`,
-			// Rewrite the runtime drop-in to use the source-built crun at /usr/local/bin/crun.
-			`sudo mkdir -p /etc/crio/crio.conf.d && \
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/bin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
-  | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
-			`sudo tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'EOF'
-[crio.runtime]
-  [crio.runtime.runtimes]
-    [crio.runtime.runtimes.nvidia]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
-      runtime_type = "oci"
-    [crio.runtime.runtimes.nvidia-cdi]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
-      runtime_type = "oci"
-EOF`,
 			// Stop any running CRI-O and kill stale conmon/crun child processes that
 			// may have survived from the previous cluster. Leftover processes hold
 			// open the socket or container storage, causing the new binary to fail
@@ -696,7 +491,7 @@ func getJoinCommand(client *sshhelper.Client) (string, error) {
 	return joinCmd, nil
 }
 
-func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string, clusterParent *infrav1.RemoteCluster, startPhase int, onPhaseComplete func(int)) (error, string) {
+func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string, clusterParent *infrav1.RemoteCluster, startPhase int, onPhaseComplete func(int), runtimeCfg pkgruntime.Config) (error, string) {
 	log.Printf("Joining worker node %s to cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)
 
 	if joinCmd == "" {
@@ -773,34 +568,11 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 			"sudo apt-get update",
 		}},
 
-		// ── Phase 3: CRI-O build ─────────────────────────────────────────────────────
-		{Name: "CRI-O Build", Steps: crioBuildSteps(clean)},
+		// ── Phase 3: CRI-O Install ──────────────────────────────────────────────────
+		{Name: "CRI-O Install", Steps: pkgruntime.InstallSteps(runtimeCfg)},
 
 		// ── Phase 4: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
-			// Build crun from source (handles resume that skipped phase 3).
-			`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake libtool python3-dev libyajl-dev libjson-c-dev 2>/dev/null || true`,
-			`sudo rm -rf /tmp/crun && \
-git clone --depth=1 https://github.com/containers/crun /tmp/crun && \
-cd /tmp/crun && \
-./autogen.sh && \
-./configure --disable-man-page && \
-make -j$(nproc) && \
-sudo make install && \
-rm -rf /tmp/crun`,
-			`sudo mkdir -p /etc/crio/crio.conf.d && \
-printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/bin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
-  | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
-			`sudo tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'EOF'
-[crio.runtime]
-  [crio.runtime.runtimes]
-    [crio.runtime.runtimes.nvidia]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
-      runtime_type = "oci"
-    [crio.runtime.runtimes.nvidia-cdi]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
-      runtime_type = "oci"
-EOF`,
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo killall -9 crio conmon crun 2>/dev/null || true",
 			"sudo rm -rf /run/crio /var/run/crio",
@@ -920,23 +692,23 @@ func InstallNvidiaContainerToolkit(client *sshhelper.Client, cluster *infrav1.Re
 
 	log.Printf("Installing NVIDIA container toolkit on GPU node %s", cluster.Spec.Host)
 
-	nvidiaToolkitVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
+	// nvidiaToolkitVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
 
 	var toolkitInstallCmd string
-	if nvidiaToolkitVersion == "" {
-		toolkitInstallCmd = `sudo DEBIAN_FRONTEND=noninteractive apt-get install --allow-downgrades -y \
-nvidia-container-toolkit \
-nvidia-container-toolkit-base \
-libnvidia-container-tools \
-libnvidia-container1`
-	} else {
-		toolkitInstallCmd = fmt.Sprintf(`sudo DEBIAN_FRONTEND=noninteractive apt-get install --allow-downgrades -y \
-nvidia-container-toolkit=%s \
-nvidia-container-toolkit-base=%s \
-libnvidia-container-tools=%s \
-libnvidia-container1=%s`,
-			nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion)
-	}
+	// 	if nvidiaToolkitVersion == "" {
+	// 		toolkitInstallCmd = `sudo DEBIAN_FRONTEND=noninteractive apt-get install --allow-downgrades -y \
+	// nvidia-container-toolkit \
+	// nvidia-container-toolkit-base \
+	// libnvidia-container-tools \
+	// libnvidia-container1`
+	// 	} else {
+	// 		toolkitInstallCmd = fmt.Sprintf(`sudo DEBIAN_FRONTEND=noninteractive apt-get install --allow-downgrades -y \
+	// nvidia-container-toolkit=%s \
+	// nvidia-container-toolkit-base=%s \
+	// libnvidia-container-tools=%s \
+	// libnvidia-container1=%s`,
+	// 			nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion)
+	// 	}
 
 	steps := []string{
 		"sudo apt-get update",
@@ -967,77 +739,78 @@ sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
 
 // InstallNvidiaDrivers11 installs the NVIDIA drivers on a GPU node.
 // A reboot is typically required after driver installation for the drivers to take effect.
-func InstallNvidiaDrivers11(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
-	log.Printf("Installing NVIDIA drivers on GPU node %s", cluster.Spec.Host)
 
-	nvidiaDriverVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion
-	nvidiaToolkitVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
+// func InstallNvidiaDrivers11(client *sshhelper.Client, cluster *infrav1.RemoteCluster, clusterParent *infrav1.RemoteCluster) error {
+// 	log.Printf("Installing NVIDIA drivers on GPU node %s", cluster.Spec.Host)
 
-	steps := []string{
-		"sudo apt-get update",
-		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
-		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
-		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
-		"sudo sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list",
-		"sudo apt-get update",
-		fmt.Sprintf(`sudo DEBIAN_FRONTEND=noninteractive apt-get install --allow-downgrades -y \
-nvidia-container-toolkit=%s \
-nvidia-container-toolkit-base=%s \
-libnvidia-container-tools=%s \
-libnvidia-container1=%s`,
-			nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion),
-		"sudo nvidia-ctk runtime configure --runtime=crio",
-		"sudo systemctl restart crio",
-		"sudo ubuntu-drivers list --gpgpu || true",
-		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-headers-$(uname -r) linux-headers-generic",
-		fmt.Sprintf("sudo ubuntu-drivers install nvidia:%s", nvidiaDriverVersion),
-		fmt.Sprintf("sudo ubuntu-drivers install --gpgpu nvidia:%s-server", nvidiaDriverVersion),
-		fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-dkms-%s-server", nvidiaDriverVersion),
-		fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-utils-%s-server", nvidiaDriverVersion),
-		"nvidia-smi || true",
-		"sudo nvidia-ctk --version",
-		`sudo rm -rf /etc/crio/crio.conf.d`,
-		`sudo mkdir -p /etc/crio/crio.conf.d`,
-		// Restore paths drop-in — rm -rf wiped it along with the nvidia config.
-		`printf '[crio.runtime]\nlisten = "/var/run/crio/crio.sock"\nconmon = "/usr/local/bin/conmon"\n' \
-  | sudo tee /etc/crio/crio.conf.d/10-paths.conf > /dev/null`,
-		// Restore crun as the default OCI runtime.
-		`printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/bin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
-  | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
-		`sudo tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'EOF'
-[crio.runtime]
-  [crio.runtime.runtimes]
-    [crio.runtime.runtimes.nvidia]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
-      runtime_type = "oci"
-    [crio.runtime.runtimes.nvidia-cdi]
-      runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
-      runtime_type = "oci"
-EOF`,
-		// Recreate 99-nvidia.conf — rm -rf wiped the one nvidia-ctk wrote earlier.
-		// Without this the nvidia runtime handler is absent from CRI-O's runtime map
-		// and pods with runtimeClassName=nvidia fail with "failed to find runtime handler nvidia".
-		// Guard: install the toolkit if nvidia-ctk is not in PATH (e.g. retry after partial failure).
-		`command -v nvidia-ctk >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit`,
-		`sudo nvidia-ctk runtime configure --runtime=crio`,
-		`sudo sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf 2>/dev/null || true`,
-		`sudo ln -sf /usr/libexec/crio/conmon /usr/local/bin/conmon 2>/dev/null || true`,
-		"sudo systemctl restart crio",
-		`sudo crictl info | python3 -m json.tool | grep '"DefaultRuntime"' || true`,
-	}
+// 	nvidiaDriverVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion
+// 	nvidiaToolkitVersion := clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion
 
-	for _, cmd := range steps {
-		output, err := sshhelper.Run(client, cmd)
-		if err != nil {
-			return fmt.Errorf("nvidia driver install failed: %s\nOutput:\n%s", cmd, output)
-		}
-	}
+// 	steps := []string{
+// 		"sudo apt-get update",
+// 		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg2",
+// 		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
+// 		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+// sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+// sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
+// 		"sudo sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list",
+// 		"sudo apt-get update",
+// 		fmt.Sprintf(`sudo DEBIAN_FRONTEND=noninteractive apt-get install --allow-downgrades -y \
+// nvidia-container-toolkit=%s \
+// nvidia-container-toolkit-base=%s \
+// libnvidia-container-tools=%s \
+// libnvidia-container1=%s`,
+// 			nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion, nvidiaToolkitVersion),
+// 		"sudo nvidia-ctk runtime configure --runtime=crio",
+// 		"sudo systemctl restart crio",
+// 		"sudo ubuntu-drivers list --gpgpu || true",
+// 		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y linux-headers-$(uname -r) linux-headers-generic",
+// 		fmt.Sprintf("sudo ubuntu-drivers install nvidia:%s", nvidiaDriverVersion),
+// 		fmt.Sprintf("sudo ubuntu-drivers install --gpgpu nvidia:%s-server", nvidiaDriverVersion),
+// 		fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-dkms-%s-server", nvidiaDriverVersion),
+// 		fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-utils-%s-server", nvidiaDriverVersion),
+// 		"nvidia-smi || true",
+// 		"sudo nvidia-ctk --version",
+// 		`sudo rm -rf /etc/crio/crio.conf.d`,
+// 		`sudo mkdir -p /etc/crio/crio.conf.d`,
+// 		// Restore paths drop-in — rm -rf wiped it along with the nvidia config.
+// 		`printf '[crio.runtime]\nlisten = "/var/run/crio/crio.sock"\nconmon = "/usr/local/bin/conmon"\n' \
+//   | sudo tee /etc/crio/crio.conf.d/10-paths.conf > /dev/null`,
+// 		// Restore crun as the default OCI runtime.
+// 		`printf '[crio]\n\n  [crio.runtime]\n    default_runtime = "runc"\n\n    [crio.runtime.runtimes]\n      [crio.runtime.runtimes.runc]\n        runtime_path = "/usr/bin/runc"\n        runtime_type = "oci"\n\n      [crio.runtime.runtimes.nvidia]\n        runtime_path = "/usr/bin/nvidia-container-runtime"\n        runtime_type = "oci"\n' \
+//   | sudo tee /etc/crio/crio.conf.d/999-runc.conf > /dev/null`,
+// 		`sudo tee /etc/crio/crio.conf.d/9999-nvidia.conf >/dev/null <<'EOF'
+// [crio.runtime]
+//   [crio.runtime.runtimes]
+//     [crio.runtime.runtimes.nvidia]
+//       runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime"
+//       runtime_type = "oci"
+//     [crio.runtime.runtimes.nvidia-cdi]
+//       runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
+//       runtime_type = "oci"
+// EOF`,
+// 		// Recreate 99-nvidia.conf — rm -rf wiped the one nvidia-ctk wrote earlier.
+// 		// Without this the nvidia runtime handler is absent from CRI-O's runtime map
+// 		// and pods with runtimeClassName=nvidia fail with "failed to find runtime handler nvidia".
+// 		// Guard: install the toolkit if nvidia-ctk is not in PATH (e.g. retry after partial failure).
+// 		`command -v nvidia-ctk >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit`,
+// 		`sudo nvidia-ctk runtime configure --runtime=crio`,
+// 		`sudo sed -i '/monitor_path/d' /etc/crio/crio.conf.d/99-nvidia.conf 2>/dev/null || true`,
+// 		`sudo ln -sf /usr/libexec/crio/conmon /usr/local/bin/conmon 2>/dev/null || true`,
+// 		"sudo systemctl restart crio",
+// 		`sudo crictl info | python3 -m json.tool | grep '"DefaultRuntime"' || true`,
+// 	}
 
-	log.Printf("NVIDIA drivers installed on %s — a reboot is required for drivers to take effect", cluster.Spec.Host)
-	return nil
-}
+// 	for _, cmd := range steps {
+// 		output, err := sshhelper.Run(client, cmd)
+// 		if err != nil {
+// 			return fmt.Errorf("nvidia driver install failed: %s\nOutput:\n%s", cmd, output)
+// 		}
+// 	}
+
+// 	log.Printf("NVIDIA drivers installed on %s — a reboot is required for drivers to take effect", cluster.Spec.Host)
+// 	return nil
+// }
 
 // GenerateCDI generates the CDI spec for the NVIDIA GPUs on the node.
 // Must be called after the node has rebooted post driver installation.
