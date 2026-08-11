@@ -12,6 +12,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -24,6 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 	"golang.org/x/crypto/ssh"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
@@ -80,6 +82,31 @@ func ResolveAWSCredentials(secret *corev1.Secret) AWSCredentials {
 		c.SessionToken = strings.TrimSpace(string(v))
 	}
 	return c
+}
+
+// IsAWSAuthFailure reports whether err is an AWS AuthFailure or
+// InvalidClientTokenId response — both indicate that the credentials
+// presented to the AWS API were rejected as invalid or expired.
+func IsAWSAuthFailure(err error) bool {
+	var apiErr *smithy.GenericAPIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case "AuthFailure", "InvalidClientTokenId":
+			return true
+		}
+	}
+	return false
+}
+
+// StaticCredsNoSession returns a copy of creds with SessionToken cleared.
+// Use this as a last-resort fallback when a cached STS session is expired:
+// if the IAM key itself is still valid and the policy does not require MFA,
+// a bare access-key + secret call will succeed.
+func StaticCredsNoSession(creds AWSCredentials) AWSCredentials {
+	return AWSCredentials{
+		AccessKeyID:     creds.AccessKeyID,
+		SecretAccessKey: creds.SecretAccessKey,
+	}
 }
 
 // ValidateAWSConfig checks that all required AWS parameters are present.

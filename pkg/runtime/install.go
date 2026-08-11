@@ -54,6 +54,8 @@ CNLAB_HAVE=$(cnlab-runtime version 2>/dev/null | head -1 || true)
 if echo "$CNLAB_HAVE" | grep -qF "$CNLAB_VERSION"; then
   report "cnlab-runtime $CNLAB_VERSION already installed, skipping"
 else
+  # cloud-init runs without a user environment; oras needs $HOME for its config store.
+  export HOME="${HOME:-/root}"
   # Login only when credentials are provided; omit for public registries.
   if [ -n "${CNLAB_REGISTRY_TOKEN:-}" ]; then
     printf '%%s' "$CNLAB_REGISTRY_TOKEN" | oras login "$CNLAB_REGISTRY" \
@@ -71,7 +73,7 @@ else
     exit 1
   }
   DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite \
-    /tmp/cnlab-runtime/artifact/cnlab-runtime_${CNLAB_VERSION}_${CNLAB_ARCH}.deb
+    /tmp/cnlab-runtime/artifact/cnlab-runtime_${CNLAB_VERSION}_${CNLAB_ARCH}.deb || true
   DEBIAN_FRONTEND=noninteractive apt-get install -f -y
   rm -f /var/cache/apt/archives/cnlab-runtime_*.deb
   cnlab-runtime version
@@ -143,7 +145,7 @@ oras pull "$REF" -o /tmp/cnlab-runtime
   exit 1
 }
 sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite \
-  /tmp/cnlab-runtime/artifact/cnlab-runtime_${VERSION}_${ARCH}.deb
+  /tmp/cnlab-runtime/artifact/cnlab-runtime_${VERSION}_${ARCH}.deb || true
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y
 sudo rm -f /var/cache/apt/archives/cnlab-runtime_*.deb
 cnlab-runtime version

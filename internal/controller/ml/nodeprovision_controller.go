@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -100,6 +101,12 @@ const (
 	// GC'd automatically after the CR is fully removed.  During teardown the
 	// controller falls back to this copy when the user-managed secret is gone.
 	controllerCredsSuffix = "-controller-creds"
+
+	// registryCredsSuffix is appended to the NodeProvision name to form the
+	// name of the controller-owned copy of the image-pull registry credentials.
+	// Used by the image pre-pull path as a fallback when the user-managed
+	// registry secret has been deleted.
+	registryCredsSuffix = "-registry-creds"
 
 	// requeueShort is used when waiting for external state (instance running, VPN).
 	requeueShort = 30 * time.Second
@@ -180,6 +187,7 @@ echo "node reset complete"
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch;update;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get,namespace=kube-public
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 
 func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -215,6 +223,22 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if userSecret, err := r.getSecret(ctx, np); err == nil {
 			if err := r.ensureControllerCredsSecret(ctx, np, userSecret); err != nil {
 				log.Error(err, "Failed to persist credential copy (non-fatal)")
+			}
+		}
+	}
+
+	// For AWS nodes, keep a controller-owned copy of the image-pull registry
+	// credentials so that the pre-pull path can still function if the user
+	// deletes the original secret after provisioning.
+	if np.Spec.Provider == mlv1alpha1.CloudProviderAWS {
+		if netConfig, ncErr := r.requireNetConfig(ctx, np); ncErr == nil {
+			if ref := netConfig.Spec.SoftwareConfig.ImagePullSecretRef; ref != nil {
+				regSecret := &corev1.Secret{}
+				if err := r.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: np.Namespace}, regSecret); err == nil {
+					if err := r.ensureRegistryCredsSecret(ctx, np, regSecret); err != nil {
+						log.Error(err, "Failed to persist registry credential copy (non-fatal)")
+					}
+				}
 			}
 		}
 	}
@@ -540,10 +564,21 @@ func (r *NodeProvisionReconciler) resolveAWSKeyPair(
 
 	// Persist the private key in a Secret when a new key was generated.
 	if result.PrivateKeyPEM != "" {
+		trueVal := true
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      secretName,
 				Namespace: np.Namespace,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         mlv1alpha1.GroupVersion.String(),
+						Kind:               "NodeProvision",
+						Name:               np.Name,
+						UID:                np.UID,
+						Controller:         &trueVal,
+						BlockOwnerDeletion: &trueVal,
+					},
+				},
 				Labels: map[string]string{
 					"app.kubernetes.io/managed-by": "node-provision-controller",
 					"ml.dcn.ssu.ac.kr/node":        np.Name,
@@ -1062,172 +1097,305 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// reconcileNPImagePrepull – background GPU image pre-pull for NodeProvision
+// reconcileNPImagePrepull – GPU image pre-pull for NodeProvision
 // ────────────────────────────────────────────────────────────────────────────
+//
+// AWS nodes: uses a Kubernetes Job that mounts crictl and the CRI socket
+// from the host — no SSH key required.
+//
+// On-prem nodes: uses an SSH goroutine via the VPN (existing behaviour).
 
-// reconcileNPImagePrepull manages the background goroutine that pre-pulls GPU
-// images on the node via crictl.  It follows the same pattern as
-// reconcileOnPremProvisioning / pollOnPremBootstrap:
-//
-//   - First call: opens a dedicated SSH connection, spawns the goroutine,
-//     stores a receive-only result channel in npPrepullJobs, returns RequeueAfter.
-//   - Subsequent calls: non-blocking poll of the channel; if done, stamp Ready;
-//     if still running, requeue again.
-//
-// Only the poll branch deletes from npPrepullJobs — not the goroutine — to
-// avoid the TOCTOU race described in reconcileOnPremProvisioning.
 func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 	ctx context.Context,
 	np *mlv1alpha1.NodeProvision,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	key := np.Namespace + "/" + np.Name
 
-	// Poll branch — hoisted to the top so credential lookups and SSH only
-	// happen once (when spawning), not on every 30s requeue.
-	if v, running := r.npPrepullJobs.Load(key); running {
-		ch := v.(<-chan npPrepullJobResult)
-		select {
-		case res := <-ch:
-			r.npPrepullJobs.Delete(key)
-			if res.err != nil {
-				// Do NOT fail the NodeProvision — the node is already joined.
-				// Log the error and let the next reconcile re-spawn for a retry.
-				log.Error(res.err, "Image pre-pull attempt failed, will retry on next reconcile",
-					"node", np.Status.NodeName)
+	// ── On-prem: poll the in-memory goroutine channel (fast path) ────────────
+	if np.Spec.Provider != mlv1alpha1.CloudProviderAWS {
+		key := np.Namespace + "/" + np.Name
+		if v, running := r.npPrepullJobs.Load(key); running {
+			ch := v.(<-chan npPrepullJobResult)
+			select {
+			case res := <-ch:
+				r.npPrepullJobs.Delete(key)
+				if res.err != nil {
+					log.Error(res.err, "Image pre-pull attempt failed, will retry on next reconcile",
+						"node", np.Status.NodeName)
+					return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+				}
+				log.Info("All GPU images pre-pulled successfully", "node", np.Status.NodeName)
+				return r.markNodeProvisionReady(ctx, np)
+			default:
+				log.V(1).Info("GPU image pre-pull in progress, requeueing")
 				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 			}
-			log.Info("All GPU images pre-pulled successfully", "node", np.Status.NodeName)
-
-			if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
-				return ctrl.Result{}, fmt.Errorf("refreshing NodeProvision after pre-pull: %w", err)
-			}
-			now := metav1.Now()
-			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
-			np.Status.Message = "Node successfully joined cluster"
-			np.Status.Progress = 100
-			np.Status.CompletionTime = &now
-			np.Status.LastUpdated = &now
-			if err := r.Status().Update(ctx, np); err != nil {
-				return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to Ready: %w", err)
-			}
-			return ctrl.Result{}, nil
-		default:
-			log.V(1).Info("GPU image pre-pull in progress, requeueing")
-			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 		}
 	}
 
-	// No goroutine in memory — fetch config and spawn one.
-	{
-		// Fetch the image list from NodeProvisionNetConfig.
-		netConfig, err := r.requireNetConfig(ctx, np)
-		if err != nil {
-			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-		}
-		images := netConfig.Spec.SoftwareConfig.ImagePrepulls
-		if len(images) == 0 {
-			// Nothing to pull — go straight to Ready.
-			if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
-				return ctrl.Result{}, err
-			}
-			now := metav1.Now()
-			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
-			np.Status.Message = "Node successfully joined cluster"
-			np.Status.Progress = 100
-			np.Status.CompletionTime = &now
-			np.Status.LastUpdated = &now
-			return ctrl.Result{}, r.Status().Update(ctx, np)
-		}
-
-		// Resolve registry credentials before spawning the goroutine.
-		// The controller has API access; the goroutine only has SSH.
-		var pullCreds string
-		if ref := netConfig.Spec.SoftwareConfig.ImagePullSecretRef; ref != nil {
-			credSecret := &corev1.Secret{}
-			if err := r.Get(ctx, types.NamespacedName{
-				Name:      ref.Name,
-				Namespace: np.Namespace,
-			}, credSecret); err != nil {
-				// Transient — do not fail the NodeProvision.
-				log.Error(err, "Cannot fetch image pull secret, will retry", "secret", ref.Name)
-				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-			}
-			username := strings.TrimSpace(string(credSecret.Data["username"]))
-			password := strings.TrimSpace(string(credSecret.Data["password"]))
-			if username == "" || password == "" {
-				log.Error(fmt.Errorf("missing keys"), "Image pull secret must have non-empty \"username\" and \"password\" keys — will retry", "secret", ref.Name)
-				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-			}
-			pullCreds = username + ":" + password
-			log.Info("Using registry credentials for image pre-pull",
-				"secret", ref.Name, "user", username)
-		}
-
-		// Open a dedicated SSH connection for the goroutine.  Use the provider-
-		// aware helper so AWS nodes use the EC2 SSH key secret (<name>-ssh-key)
-		// rather than the AWS credentials secret.
-		sshClient, err := r.getSSHClientByProvider(ctx, np)
-		if err != nil {
-			// SSH failure is transient — do not fail the NodeProvision.
-			log.Error(err, "Cannot open SSH connection for image pre-pull, will retry")
-			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-		}
-
-		imagesCopy := make([]string, len(images))
-		copy(imagesCopy, images)
-		credsCopy := pullCreds // immutable string — safe to close over
-		glog := log.WithValues("node", np.Status.NodeName)
-
-		ch := make(chan npPrepullJobResult, 1)
-		r.npPrepullJobs.Store(key, (<-chan npPrepullJobResult)(ch))
-
-		go func() {
-			defer sshClient.Conn.Close()
-			// Clear stale registry auth files when no explicit credentials are
-			// configured.  Stale docker.io entries cause 401 errors even for
-			// public images because the runtime always sends stored credentials.
-			if credsCopy == "" {
-				authFiles := []string{
-					"/root/.docker/config.json",
-					"/run/containers/0/auth.json",
-					"/etc/containers/auth.json",
-				}
-				for _, f := range authFiles {
-					_, _ = ssh.Run(sshClient, fmt.Sprintf("sudo rm -f %s", f))
-				}
-				glog.Info("Cleared stale registry auth files before anonymous pull")
-			}
-
-			for _, img := range imagesCopy {
-				img = strings.TrimSpace(img)
-				if img == "" {
-					continue
-				}
-				glog.Info("Pulling image", "image", img)
-				var cmd string
-				if credsCopy != "" {
-					// timeout prevents an indefinite hang if the TCP connection
-					// drops silently (no SSH keepalive through firewalls).
-					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull --creds %s %s", credsCopy, img)
-				} else {
-					cmd = fmt.Sprintf("sudo timeout 7200 crictl pull %s", img)
-				}
-				output, pullErr := ssh.Run(sshClient, cmd)
-				if pullErr != nil {
-					ch <- npPrepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
-					return
-				}
-				glog.Info("Pulled image successfully", "image", img)
-			}
-			ch <- npPrepullJobResult{err: nil}
-		}()
-
-		log.Info("GPU image pre-pull goroutine started",
-			"node", np.Status.NodeName, "images", len(imagesCopy),
-			"authenticated", pullCreds != "")
+	// Fetch the image list (needed for both paths when no work is in flight).
+	netConfig, err := r.requireNetConfig(ctx, np)
+	if err != nil {
 		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 	}
+	images := netConfig.Spec.SoftwareConfig.ImagePrepulls
+	if len(images) == 0 {
+		return r.markNodeProvisionReady(ctx, np)
+	}
+
+	// ── AWS: Job-based pull (no SSH) ─────────────────────────────────────────
+	if np.Spec.Provider == mlv1alpha1.CloudProviderAWS {
+		return r.reconcileAWSImagePrepullJob(ctx, np, netConfig, images)
+	}
+
+	// ── On-prem: SSH goroutine ────────────────────────────────────────────────
+	var pullCreds string
+	if ref := netConfig.Spec.SoftwareConfig.ImagePullSecretRef; ref != nil {
+		credSecret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: np.Namespace}, credSecret); err != nil {
+			log.Error(err, "Cannot fetch image pull secret, will retry", "secret", ref.Name)
+			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+		}
+		username := strings.TrimSpace(string(credSecret.Data["username"]))
+		password := strings.TrimSpace(string(credSecret.Data["password"]))
+		if username == "" || password == "" {
+			log.Error(fmt.Errorf("missing keys"), "Image pull secret must have \"username\" and \"password\" — will retry", "secret", ref.Name)
+			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+		}
+		pullCreds = username + ":" + password
+		log.Info("Using registry credentials for image pre-pull", "secret", ref.Name, "user", username)
+	}
+
+	sshClient, err := r.getSSHClientByProvider(ctx, np)
+	if err != nil {
+		log.Error(err, "Cannot open SSH connection for image pre-pull, will retry")
+		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+	}
+
+	imagesCopy := make([]string, len(images))
+	copy(imagesCopy, images)
+	credsCopy := pullCreds
+	glog := log.WithValues("node", np.Status.NodeName)
+	key := np.Namespace + "/" + np.Name
+	ch := make(chan npPrepullJobResult, 1)
+	r.npPrepullJobs.Store(key, (<-chan npPrepullJobResult)(ch))
+
+	go func() {
+		defer sshClient.Conn.Close()
+		if credsCopy == "" {
+			for _, f := range []string{"/root/.docker/config.json", "/run/containers/0/auth.json", "/etc/containers/auth.json"} {
+				_, _ = ssh.Run(sshClient, fmt.Sprintf("sudo rm -f %s", f))
+			}
+			glog.Info("Cleared stale registry auth files before anonymous pull")
+		}
+		for _, img := range imagesCopy {
+			img = strings.TrimSpace(img)
+			if img == "" {
+				continue
+			}
+			glog.Info("Pulling image", "image", img)
+			var cmd string
+			if credsCopy != "" {
+				cmd = fmt.Sprintf("sudo timeout 7200 crictl pull --creds %s %s", credsCopy, img)
+			} else {
+				cmd = fmt.Sprintf("sudo timeout 7200 crictl pull %s", img)
+			}
+			if output, pullErr := ssh.Run(sshClient, cmd); pullErr != nil {
+				ch <- npPrepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
+				return
+			}
+			glog.Info("Pulled image successfully", "image", img)
+		}
+		ch <- npPrepullJobResult{}
+	}()
+
+	log.Info("GPU image pre-pull goroutine started", "node", np.Status.NodeName, "images", len(imagesCopy))
+	return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+}
+
+// markNodeProvisionReady re-fetches np and stamps it as Ready.
+func (r *NodeProvisionReconciler) markNodeProvisionReady(ctx context.Context, np *mlv1alpha1.NodeProvision) (ctrl.Result, error) {
+	if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+		return ctrl.Result{}, fmt.Errorf("refreshing NodeProvision before marking Ready: %w", err)
+	}
+	now := metav1.Now()
+	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseReady
+	np.Status.Message = "Node successfully joined cluster"
+	np.Status.Progress = 100
+	np.Status.CompletionTime = &now
+	np.Status.LastUpdated = &now
+	return ctrl.Result{}, r.Status().Update(ctx, np)
+}
+
+// reconcileAWSImagePrepullJob manages a Kubernetes Job that pre-pulls images
+// by mounting crictl and the CRI socket from the host — no SSH required.
+func (r *NodeProvisionReconciler) reconcileAWSImagePrepullJob(
+	ctx context.Context,
+	np *mlv1alpha1.NodeProvision,
+	netConfig *mlv1alpha1.NodeProvisionNetConfig,
+	images []string,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	jobName := np.Name + "-prepull"
+
+	job := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: np.Namespace}, job)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("checking pre-pull job: %w", err)
+	}
+
+	if apierrors.IsNotFound(err) {
+		if createErr := r.createAWSImagePrepullJob(ctx, np, netConfig, images); createErr != nil {
+			return ctrl.Result{}, fmt.Errorf("creating image pre-pull job: %w", createErr)
+		}
+		log.Info("Created image pre-pull job", "job", jobName, "images", len(images))
+		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+	}
+
+	// Job exists — inspect conditions.
+	for _, cond := range job.Status.Conditions {
+		if cond.Type == batchv1.JobComplete && cond.Status == corev1.ConditionTrue {
+			log.Info("Image pre-pull job completed", "job", jobName)
+			return r.markNodeProvisionReady(ctx, np)
+		}
+		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+			log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed — deleting for retry", "job", jobName)
+			_ = r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))
+			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+		}
+	}
+
+	log.V(1).Info("Image pre-pull job running", "job", jobName)
+	return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+}
+
+// createAWSImagePrepullJob creates a Job that runs crictl pull for each image
+// on the target node, using the host's crictl binary and CRI socket.
+func (r *NodeProvisionReconciler) createAWSImagePrepullJob(
+	ctx context.Context,
+	np *mlv1alpha1.NodeProvision,
+	netConfig *mlv1alpha1.NodeProvisionNetConfig,
+	images []string,
+) error {
+	// Determine which registry secret to project into the Job env.
+	var registrySecretName string
+	if ref := netConfig.Spec.SoftwareConfig.ImagePullSecretRef; ref != nil {
+		copyName := np.Name + registryCredsSuffix
+		if err := r.Get(ctx, types.NamespacedName{Name: copyName, Namespace: np.Namespace}, &corev1.Secret{}); err == nil {
+			registrySecretName = copyName
+		} else {
+			registrySecretName = ref.Name
+		}
+	}
+
+	trueVal := true
+	privileged := true
+	hostPathFile := corev1.HostPathFile
+	hostPathSocket := corev1.HostPathSocket
+	ttl := int32(600)    // auto-delete 10 min after completion
+	backoff := int32(5)  // retry pod up to 5 times
+
+	env := []corev1.EnvVar{}
+	if registrySecretName != "" {
+		env = append(env,
+			corev1.EnvVar{
+				Name: "REGISTRY_USER",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: registrySecretName},
+					Key:                  "username",
+					Optional:             &trueVal,
+				}},
+			},
+			corev1.EnvVar{
+				Name: "REGISTRY_PASS",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: registrySecretName},
+					Key:                  "password",
+					Optional:             &trueVal,
+				}},
+			},
+		)
+	}
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      np.Name + "-prepull",
+			Namespace: np.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         mlv1alpha1.GroupVersion.String(),
+				Kind:               "NodeProvision",
+				Name:               np.Name,
+				UID:                np.UID,
+				Controller:         &trueVal,
+				BlockOwnerDeletion: &trueVal,
+			}},
+			Labels: map[string]string{nodeProvisionNameLabel: np.Name},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            &backoff,
+			TTLSecondsAfterFinished: &ttl,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					NodeName:      np.Status.NodeName,
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					// Tolerate any taint — new nodes often have not-ready taints.
+					Tolerations: []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
+					Containers: []corev1.Container{{
+						Name:    "prepull",
+						Image:   "ubuntu:22.04",
+						Command: []string{"/bin/bash", "-c"},
+						Args:    []string{buildPrepullScript(images)},
+						Env:     env,
+						SecurityContext: &corev1.SecurityContext{Privileged: &privileged},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "crictl", MountPath: "/usr/local/bin/crictl"},
+							{Name: "cri-socket", MountPath: "/var/run/crio/crio.sock"},
+						},
+					}},
+					Volumes: []corev1.Volume{
+						{
+							Name: "crictl",
+							VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+								Path: "/usr/local/bin/crictl",
+								Type: &hostPathFile,
+							}},
+						},
+						{
+							Name: "cri-socket",
+							VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+								Path: "/var/run/crio/crio.sock",
+								Type: &hostPathSocket,
+							}},
+						},
+					},
+				},
+			},
+		},
+	}
+	return r.Create(ctx, job)
+}
+
+// buildPrepullScript returns a bash script that pulls each image via crictl.
+func buildPrepullScript(images []string) string {
+	var b strings.Builder
+	b.WriteString("set -euo pipefail\n")
+	b.WriteString("CRICTL=/usr/local/bin/crictl\n")
+	b.WriteString("ENDPOINT=unix:///var/run/crio/crio.sock\n")
+	b.WriteString("if [ -n \"${REGISTRY_USER:-}\" ] && [ -n \"${REGISTRY_PASS:-}\" ]; then\n")
+	b.WriteString("  CREDS=\"--creds ${REGISTRY_USER}:${REGISTRY_PASS}\"\n")
+	b.WriteString("else\n")
+	b.WriteString("  CREDS=\"\"\n")
+	b.WriteString("fi\n")
+	for _, img := range images {
+		img = strings.TrimSpace(img)
+		if img == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "echo \"[prepull] Pulling %s...\"\n", img)
+		fmt.Fprintf(&b, "$CRICTL --runtime-endpoint \"$ENDPOINT\" pull $CREDS %q\n", img)
+	}
+	b.WriteString("echo \"[prepull] Done.\"\n")
+	return b.String()
 }
 
 // getSSHClientByProvider opens an SSH connection to the node using the correct
@@ -1367,20 +1535,8 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	// ── Provider-specific cleanup (must happen before secrets are deleted) ──────
 	switch np.Spec.Provider {
 	case mlv1alpha1.CloudProviderAWS:
-		// SSH reset before instance termination — best-effort; failure does not
-		// block termination.
-		if np.Status.VpnIP != "" {
-			if sshClient, sshErr := r.getSSHClientByProvider(ctx, np); sshErr != nil {
-				log.Error(sshErr, "Cannot SSH to AWS node for reset (continuing with termination)")
-			} else {
-				if out, resetErr := ssh.Run(sshClient, npNodeResetScript); resetErr != nil {
-					log.Error(resetErr, "AWS node SSH reset incomplete (continuing)", "output", out)
-				} else {
-					log.Info("AWS node SSH reset complete")
-				}
-				sshClient.Conn.Close()
-			}
-		}
+		// SSH reset is skipped for AWS: the EC2 key pair (.pem) is not reliably
+		// available post-provisioning. Terminating the instance is sufficient cleanup.
 		if np.Status.InstanceID != "" {
 			// Prefer the user-supplied secret; fall back to the controller-owned copy
 			// in case the user deleted their secret before deleting the NodeProvision.
@@ -1407,12 +1563,34 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 				terminateCreds = awsprovision.ResolveAWSCredentials(secret)
 			}
 			if err := awsprovision.TerminateInstance(ctx, np, terminateCreds, np.Status.InstanceID); err != nil {
-				// Return the error so the controller requeues. Secrets and the
-				// finalizer must not be removed until the instance is confirmed
-				// gone — otherwise the instance is orphaned with no retry path.
-				return ctrl.Result{}, fmt.Errorf("terminating EC2 instance %s: %w", np.Status.InstanceID, err)
+				if awsprovision.IsAWSAuthFailure(err) {
+					// Cached STS session is likely expired. Evict the CredMgr cache so
+					// the next reconcile forces a fresh credential resolution, then
+					// retry once now with static-only credentials (session token stripped)
+					// in case the IAM key itself is still valid.
+					r.CredMgr.Evict(secret.Namespace, secret.Name)
+					staticCreds := awsprovision.StaticCredsNoSession(awsprovision.ResolveAWSCredentials(secret))
+					if retryErr := awsprovision.TerminateInstance(ctx, np, staticCreds, np.Status.InstanceID); retryErr != nil {
+						log.Error(retryErr, "EC2 termination failed after static-credential retry — requeuing with delay",
+							"instanceId", np.Status.InstanceID)
+						return ctrl.Result{RequeueAfter: 30 * time.Second},
+							fmt.Errorf("terminating EC2 instance %s: %w", np.Status.InstanceID, retryErr)
+					}
+					// static-credential retry succeeded — fall through to cleanup
+				} else {
+					// Return the error so the controller requeues. Secrets and the
+					// finalizer must not be removed until the instance is confirmed
+					// gone — otherwise the instance is orphaned with no retry path.
+					return ctrl.Result{}, fmt.Errorf("terminating EC2 instance %s: %w", np.Status.InstanceID, err)
+				}
 			}
 			log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
+			// Clear InstanceID so any duplicate or requeued reconcile skips
+			// termination instead of retrying with potentially stale credentials.
+			np.Status.InstanceID = ""
+			if statusErr := r.Status().Update(ctx, np); statusErr != nil {
+				log.Error(statusErr, "clearing InstanceID from status after termination (non-fatal)")
+			}
 		}
 	case mlv1alpha1.CloudProviderOnPrem:
 		r.cleanupOnPremNode(ctx, np)
@@ -1854,6 +2032,50 @@ func (r *NodeProvisionReconciler) ensureControllerCredsSecret(ctx context.Contex
 	patch := client.MergeFrom(existing.DeepCopy())
 	existing.Data = userSecret.Data
 	existing.Type = userSecret.Type
+	return r.Patch(ctx, existing, patch)
+}
+
+// ensureRegistryCredsSecret creates (or updates) a controller-owned copy of
+// the image-pull registry credentials referenced by the NodeProvisionNetConfig.
+// The copy is named <np.Name>-registry-creds and carries an owner reference to
+// the NodeProvision so it is GC'd when the CR is deleted.  The image pre-pull
+// path falls back to this copy when the original user-managed secret is gone.
+func (r *NodeProvisionReconciler) ensureRegistryCredsSecret(ctx context.Context, np *mlv1alpha1.NodeProvision, registrySecret *corev1.Secret) error {
+	trueVal := true
+	copyName := np.Name + registryCredsSuffix
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, client.ObjectKey{Name: copyName, Namespace: np.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		desired := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      copyName,
+				Namespace: np.Namespace,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         mlv1alpha1.GroupVersion.String(),
+						Kind:               "NodeProvision",
+						Name:               np.Name,
+						UID:                np.UID,
+						Controller:         &trueVal,
+						BlockOwnerDeletion: &trueVal,
+					},
+				},
+				Labels: map[string]string{
+					nodeProvisionNameLabel: np.Name,
+					nodeProvisionUIDLabel:  string(np.UID),
+				},
+			},
+			Type: registrySecret.Type,
+			Data: registrySecret.Data,
+		}
+		return r.Create(ctx, desired)
+	} else if err != nil {
+		return fmt.Errorf("checking for registry credential copy: %w", err)
+	}
+	// Already exists — sync data in case credentials were rotated.
+	patch := client.MergeFrom(existing.DeepCopy())
+	existing.Data = registrySecret.Data
+	existing.Type = registrySecret.Type
 	return r.Patch(ctx, existing, patch)
 }
 
