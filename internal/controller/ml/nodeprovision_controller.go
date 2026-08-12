@@ -1292,8 +1292,8 @@ func (r *NodeProvisionReconciler) createAWSImagePrepullJob(
 	privileged := true
 	hostPathFile := corev1.HostPathFile
 	hostPathSocket := corev1.HostPathSocket
-	ttl := int32(600)    // auto-delete 10 min after completion
-	backoff := int32(5)  // retry pod up to 5 times
+	ttl := int32(600)   // auto-delete 10 min after completion
+	backoff := int32(5) // retry pod up to 5 times
 
 	env := []corev1.EnvVar{}
 	if registrySecretName != "" {
@@ -1341,11 +1341,11 @@ func (r *NodeProvisionReconciler) createAWSImagePrepullJob(
 					// Tolerate any taint — new nodes often have not-ready taints.
 					Tolerations: []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
 					Containers: []corev1.Container{{
-						Name:    "prepull",
-						Image:   "ubuntu:22.04",
-						Command: []string{"/bin/bash", "-c"},
-						Args:    []string{buildPrepullScript(images)},
-						Env:     env,
+						Name:            "prepull",
+						Image:           "ubuntu:22.04",
+						Command:         []string{"/bin/bash", "-c"},
+						Args:            []string{buildPrepullScript(images)},
+						Env:             env,
 						SecurityContext: &corev1.SecurityContext{Privileged: &privileged},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "crictl", MountPath: "/usr/local/bin/crictl"},

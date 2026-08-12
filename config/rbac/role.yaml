@@ -27,6 +27,16 @@ rules:
   - update
   - watch
 - apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
   - infra.dcn.ssu.ac.kr
   resources:
   - remoteclusters
