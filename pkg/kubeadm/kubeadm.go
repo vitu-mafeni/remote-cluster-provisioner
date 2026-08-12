@@ -197,6 +197,10 @@ mode: ipvs
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
 			"sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
+			// Remove cnlab-runtime so the CRI-O Install phase always performs a
+			// fresh install. dpkg --remove keeps config files in /etc/ but removes
+			// all binaries, ensuring crio/criu are reinstalled from the OCI artifact.
+			"sudo dpkg --remove cnlab-runtime 2>/dev/null || true",
 		}},
 
 		// ── Phase 1: NFS server ──────────────────────────────────────────────────────
@@ -540,6 +544,7 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
 			"sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
+			"sudo dpkg --remove cnlab-runtime 2>/dev/null || true",
 		}},
 
 		// ── Phase 1: System settings ─────────────────────────────────────────────────
