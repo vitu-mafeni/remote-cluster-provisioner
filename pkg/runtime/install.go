@@ -49,9 +49,12 @@ if [ "$CNLAB_ORAS_INSTALLED" != "$CNLAB_ORAS_VER" ]; then
 fi
 oras version
 
-# Idempotency: skip if already at the requested version
+# Idempotency: skip if already at the requested version AND crio binary is present.
+# Checking only the version is insufficient: dpkg --remove keeps config files
+# (including /etc/cnlab/runtime-release.yaml) but removes binaries, so the
+# version check can pass while /usr/local/bin/crio is gone.
 CNLAB_HAVE=$(cnlab-runtime version 2>/dev/null | head -1 || true)
-if echo "$CNLAB_HAVE" | grep -qF "$CNLAB_VERSION"; then
+if echo "$CNLAB_HAVE" | grep -qF "$CNLAB_VERSION" && command -v crio >/dev/null 2>&1; then
   report "cnlab-runtime $CNLAB_VERSION already installed, skipping"
 else
   # cloud-init runs without a user environment; oras needs $HOME for its config store.
