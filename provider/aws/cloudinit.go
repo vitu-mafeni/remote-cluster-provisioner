@@ -9,7 +9,7 @@ import (
 	"strings"
 	"text/template"
 
-	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
+	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 )
 
 // CloudInitParams contains the values required to bootstrap an EC2 Kubernetes worker.
@@ -23,13 +23,22 @@ type CloudInitParams struct {
 	JoinCommand            string
 	KubernetesVersion      string
 	KubernetesMinorVersion string
-	CRIOVersion            string
 	NodeName               string
 	Labels                 []string // Extra labels reserved for the control-plane reconciler.
 	SSHUsername            string
 	// IsGPUNode identifies this worker as a GPU node. It controls Kubernetes
 	// node labels only; GPU Operator owns all NVIDIA software/runtime setup.
 	IsGPUNode bool
+
+	// Runtime registry credentials for pulling the cnlab-runtime OCI artifact.
+	// These values come from a Kubernetes Secret resolved by the controller.
+	// Token must never be logged.
+	RuntimeRegistryUser  string
+	RuntimeRegistryToken string
+	RuntimeRegistry      string
+	RuntimeRepository    string
+	RuntimeVersion       string
+	RuntimeOrasVersion   string
 }
 
 const (
@@ -75,9 +84,6 @@ func validateParams(p CloudInitParams) error {
 	if !minorRE.MatchString(strings.TrimPrefix(strings.TrimSpace(p.KubernetesMinorVersion), "v")) {
 		return fmt.Errorf("KubernetesMinorVersion must be a minor version such as 1.35")
 	}
-	if !minorRE.MatchString(strings.TrimPrefix(strings.TrimSpace(p.CRIOVersion), "v")) {
-		return fmt.Errorf("CRIOVersion must be a minor version such as 1.35")
-	}
 	join := strings.TrimSpace(p.JoinCommand)
 	if join == "" {
 		return fmt.Errorf("JoinCommand must not be empty")
@@ -111,24 +117,20 @@ func encodeScript(script string) string {
 }
 
 type templateData struct {
-	WGConfigB64       string
-	VpnIP             string
-	JoinCommand       string
-	JoinCommandB64    string
-	KubernetesVersion string
-	KubernetesMinor   string
-	CRIOVersion       string
-	NodeName          string
-	SSHUsername       string
-	HasSSHUsername    bool
-	IsGPUNode         bool
-	KubeletNodeLabels string
-	CRIOAsset         string
-	CRIOCommit        string
-	CRIUAsset         string
-	CRIUGitID         string
-	RuncVersion       string
-	CRIOSocket        string
+	WGConfigB64          string
+	VpnIP                string
+	JoinCommand          string
+	JoinCommandB64       string
+	KubernetesVersion    string
+	KubernetesMinor      string
+	NodeName             string
+	SSHUsername          string
+	HasSSHUsername       bool
+	IsGPUNode            bool
+	KubeletNodeLabels    string
+	CRIOSocket           string
+	RuntimeCredentials   string // bash export block; Token value must never be logged
+	RuntimeInstallScript string // rendered by pkgruntime.InstallScript
 }
 
 func kubeletNodeLabels(p CloudInitParams) string {
@@ -147,25 +149,37 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 		return "", fmt.Errorf("parse bootstrap template: %w", err)
 	}
 
+	runtimeCfg := pkgruntime.Config{
+		Registry:    p.RuntimeRegistry,
+		Repository:  p.RuntimeRepository,
+		Version:     p.RuntimeVersion,
+		OrasVersion: p.RuntimeOrasVersion,
+		Username:    p.RuntimeRegistryUser,
+		Token:       p.RuntimeRegistryToken,
+	}
+	runtimeCfg.ApplyDefaults()
+
+	// Build the credentials block. Values are single-quoted; GitHub usernames and
+	// PATs contain only alphanumeric/dash/underscore chars so no escaping is needed.
+	// Token is embedded in user-data but never logged per security constraints.
+	runtimeCreds := "export CNLAB_REGISTRY_USER='" + runtimeCfg.Username + "'\n" +
+		"export CNLAB_REGISTRY_TOKEN='" + runtimeCfg.Token + "'"
+
 	d := templateData{
-		WGConfigB64:       base64.StdEncoding.EncodeToString([]byte(p.WGConfig)),
-		VpnIP:             p.VpnIP,
-		JoinCommand:       p.JoinCommand,
-		JoinCommandB64:    base64.StdEncoding.EncodeToString([]byte(p.JoinCommand)),
-		KubernetesVersion: strings.TrimPrefix(p.KubernetesVersion, "v"),
-		KubernetesMinor:   strings.TrimPrefix(p.KubernetesMinorVersion, "v"),
-		CRIOVersion:       strings.TrimPrefix(p.CRIOVersion, "v"),
-		NodeName:          p.NodeName,
-		SSHUsername:       p.SSHUsername,
-		HasSSHUsername:    p.SSHUsername != "",
-		IsGPUNode:         p.IsGPUNode,
-		KubeletNodeLabels: kubeletNodeLabels(p),
-		CRIOAsset:         kubeadm.CrioAsset,
-		CRIOCommit:        kubeadm.CrioCommit,
-		CRIUAsset:         kubeadm.CriuAsset,
-		CRIUGitID:         kubeadm.CriuGitID,
-		RuncVersion:       kubeadm.RuncVersion,
-		CRIOSocket:        crioSocket,
+		WGConfigB64:          base64.StdEncoding.EncodeToString([]byte(p.WGConfig)),
+		VpnIP:                p.VpnIP,
+		JoinCommand:          p.JoinCommand,
+		JoinCommandB64:       base64.StdEncoding.EncodeToString([]byte(p.JoinCommand)),
+		KubernetesVersion:    strings.TrimPrefix(p.KubernetesVersion, "v"),
+		KubernetesMinor:      strings.TrimPrefix(p.KubernetesMinorVersion, "v"),
+		NodeName:             p.NodeName,
+		SSHUsername:          p.SSHUsername,
+		HasSSHUsername:       p.SSHUsername != "",
+		IsGPUNode:            p.IsGPUNode,
+		KubeletNodeLabels:    kubeletNodeLabels(p),
+		CRIOSocket:           crioSocket,
+		RuntimeCredentials:   runtimeCreds,
+		RuntimeInstallScript: pkgruntime.InstallScript(runtimeCfg),
 	}
 
 	var out bytes.Buffer
@@ -226,13 +240,12 @@ fi
 
 K8S_VERSION="{{.KubernetesVersion}}"
 K8S_MINOR="{{.KubernetesMinor}}"
-CRIO_VERSION="{{.CRIOVersion}}"
 CRIO_SOCKET="{{.CRIOSocket}}"
 NODE_IP="{{.VpnIP}}"
 NODE_NAME="{{.NodeName}}"
 
 report "Bootstrap started"
-report "Kubernetes version: v${K8S_VERSION}; Kubernetes repo: ${K8S_MINOR}; CRI-O repo: ${CRIO_VERSION}"
+report "Kubernetes version: v${K8S_VERSION}; repo: ${K8S_MINOR}"
 
 # -----------------------------------------------------------------------------
 # Validation and helpers
@@ -356,9 +369,7 @@ systemctl disable unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>
 wait_for_apt
 dpkg --configure -a
 apt_update
-apt_install ca-certificates curl gnupg apt-transport-https lsof jq git build-essential pkg-config \
-  autoconf automake libtool python3-dev libyajl-dev libjson-c-dev \
-  libcap2 libnl-3-200 libbsd0 libgnutls30 \
+apt_install ca-certificates curl gnupg apt-transport-https lsof jq \
   wireguard iproute2 socat conntrack
 
 report "Configuring WireGuard"
@@ -385,132 +396,52 @@ ip -4 addr show wg0 | grep -Eq 'inet[[:space:]]+'"$NODE_IP"'([/[:space:]]|$)' ||
 report "WireGuard is ready on ${NODE_IP}"
 
 # -----------------------------------------------------------------------------
-# CRI-O / CRI-O dependencies
+# cnlab-runtime OCI artifact install (ORAS-based, replaces all source builds)
 # -----------------------------------------------------------------------------
-report "Preparing CRI-O build dependencies"
-apt_install build-essential gcc make pkg-config git \
-  libgpgme-dev libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
-  python3-protobuf uuid-dev libbsd-dev libnftables-dev libcap-dev libnl-3-dev \
-  libnet1-dev libaio-dev libgnutls28-dev libdrm-dev xmlto asciidoc \
-  libassuan-dev libglib2.0-dev libc6-dev libgpg-error-dev libseccomp-dev \
-  libsystemd-dev libselinux1-dev libbtrfs-dev libudev-dev software-properties-common \
-  go-md2man runc crun
+# Credentials are set here and consumed by the install script below.
+# Token is embedded in user-data which is only accessible from the instance
+# itself via IMDSv2. It is NOT logged by this script.
+{{.RuntimeCredentials}}
 
-dpkg --configure -a
+{{.RuntimeInstallScript}}
 
-# The custom CRI-O branch requires Go 1.26.4. Install it explicitly instead of
-# depending on the Ubuntu release's older golang package.
-report "Installing Go 1.26.4 for custom CRI-O"
-GO_VERSION="1.26.4"
-case "$(dpkg --print-architecture)" in
-  amd64) GO_ARCH=amd64 ;;
-  arm64) GO_ARCH=arm64 ;;
-  *) echo "Unsupported architecture for Go: $(dpkg --print-architecture)" >&2; exit 1 ;;
-esac
-if [[ ! -x /usr/local/go/bin/go ]] || [[ "$(/usr/local/go/bin/go version 2>/dev/null || true)" != *"go${GO_VERSION}"* ]]; then
-  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
-  rm -rf /usr/local/go
-  tar -C /usr/local -xzf /tmp/go.tar.gz
-  rm -f /tmp/go.tar.gz
-fi
-
-# cloud-init may execute scripts with HOME unset. Go's build system requires a
-# writable cache location and otherwise fails with:
-#   build cache is required, but could not be located: GOCACHE is not defined
-# Set all relevant Go cache/module variables explicitly because the custom CRI-O
-# build invokes go build through Make.
-export HOME=/root
-export USER=root
-export LOGNAME=root
-export XDG_CACHE_HOME=/root/.cache
-export GOCACHE=/root/.cache/go-build
-export GOPATH=/root/go
-export GOMODCACHE=/root/go/pkg/mod
-mkdir -p "$XDG_CACHE_HOME" "$GOCACHE" "$GOPATH" "$GOMODCACHE"
-/usr/local/go/bin/go env HOME XDG_CACHE_HOME GOCACHE GOPATH GOMODCACHE
-/usr/local/go/bin/go version
-export PATH="/usr/local/go/bin:${PATH}"
-
-# Build conmon from source. CRI-O searches /usr/libexec/crio/conmon on Ubuntu;
-# provide the exact path explicitly rather than relying on PATH lookup.
-report "Building conmon"
-rm -rf /tmp/conmon
-git clone --depth=1 https://github.com/containers/conmon /tmp/conmon
-(
-  cd /tmp/conmon
-  HOME="${HOME}" XDG_CACHE_HOME="${XDG_CACHE_HOME}" GOCACHE="${GOCACHE}" GOPATH="${GOPATH}" GOMODCACHE="${GOMODCACHE}" PATH="/usr/local/go/bin:${PATH}" make
-  make install
-)
-mkdir -p /usr/libexec/crio
-ln -sfn /usr/local/bin/conmon /usr/libexec/crio/conmon
-command -v conmon
-
-# Build the exact custom CRI-O tree used by pkg/kubeadm. This is important for
-# checkpoint/restore behavior and avoids running the distribution CRI-O binary.
-report "Building custom CRI-O"
-rm -rf /tmp/custom-crio
-git clone --depth=1 --branch 22-07-2026-checkpoint-restore \
-  https://github.com/vitu-mafeni/leehun-cri-o.git /tmp/custom-crio
-(
-  cd /tmp/custom-crio
-  HOME="${HOME}" XDG_CACHE_HOME="${XDG_CACHE_HOME}" GOCACHE="${GOCACHE}" GOPATH="${GOPATH}" GOMODCACHE="${GOMODCACHE}" PATH="/usr/local/go/bin:${PATH}" make
-  make install
-  make install.config
-  make install.systemd
-)
-rm -rf /tmp/custom-crio
-
-# The source-built CRI-O service must point to /usr/local/bin/crio. Do not allow
-# an apt-provided /usr/bin/crio service and the custom binary to race each other.
-if [[ -x /usr/local/bin/crio ]]; then
-  ln -sfn /usr/local/bin/crio /usr/bin/crio
-fi
-command -v crio
-
-# Replace the source-built executable with the exact release artifact used by
-# pkg/kubeadm. The source build installs the service/config/hooks; the release
-# asset makes the final executable deterministic and pins the expected commit.
-report "Installing pinned custom CRI-O artifact"
-CRIO_HAVE="$(crio version --json 2>/dev/null | jq -r '.gitCommit // empty' || true)"
-if [[ "$CRIO_HAVE" != "{{.CRIOCommit}}" ]]; then
-  curl -fsSL '{{.CRIOAsset}}' -o /tmp/crio
-  chmod 0755 /tmp/crio
-  CRIO_GOT="$(/tmp/crio version --json 2>/dev/null | jq -r '.gitCommit // empty' || true)"
-  [[ "$CRIO_GOT" == "{{.CRIOCommit}}" ]] || {
-    echo "CRI-O artifact gitCommit mismatch: got '$CRIO_GOT', expected '{{.CRIOCommit}}'" >&2
-    exit 1
-  }
-  install -m 0755 /tmp/crio /usr/local/bin/crio
-  rm -f /tmp/crio
-  ln -sfn /usr/local/bin/crio /usr/bin/crio
-fi
-CRIO_FINAL="$(/usr/local/bin/crio version --json 2>/dev/null | jq -r '.gitCommit // empty' || true)"
-[[ "$CRIO_FINAL" == "{{.CRIOCommit}}" ]] || {
-  echo "Final CRI-O gitCommit mismatch: got '$CRIO_FINAL', expected '{{.CRIOCommit}}'" >&2
-  exit 1
-}
-report "Pinned custom CRI-O commit verified: ${CRIO_FINAL}"
+# Unset credentials immediately after the install script runs.
+unset CNLAB_REGISTRY_USER CNLAB_REGISTRY_TOKEN
 
 # -----------------------------------------------------------------------------
-# CRI-O configuration
+# CRI-O configuration drop-ins
+# Each file is only written if cnlab-runtime did not already install it.
 # -----------------------------------------------------------------------------
-report "Configuring CRI-O"
+report "Configuring CRI-O drop-ins"
 systemctl stop kubelet 2>/dev/null || true
 systemctl stop crio 2>/dev/null || true
 killall -9 crio conmon crun 2>/dev/null || true
 rm -rf /run/crio /var/run/crio
 
 mkdir -p /run/crio /var/run/crio /var/lib/crio /var/lib/containers/storage
-mkdir -p /etc/crio/crio.conf.d /etc/containers /etc/cni/net.d /opt/cni/bin
+mkdir -p /etc/crio/crio.conf.d /etc/containers /etc/cni/net.d /opt/cni/bin /etc/criu
+
+if [ ! -f /etc/crictl.yaml ]; then
+  cat > /etc/crictl.yaml <<CRICTL
+runtime-endpoint: unix://${CRIO_SOCKET}
+image-endpoint: unix://${CRIO_SOCKET}
+timeout: 30s
+debug: false
+CRICTL
+  chmod 0644 /etc/crictl.yaml
+fi
 
 # Only [crio.runtime] owns listen/conmon. Do not put listen under [crio.image].
-cat > /etc/crio/crio.conf.d/10-paths.conf <<'CRIOPATHS'
+if [ ! -f /etc/crio/crio.conf.d/10-paths.conf ]; then
+  cat > /etc/crio/crio.conf.d/10-paths.conf <<'CRIOPATHS'
 [crio.runtime]
   listen = "/var/run/crio/crio.sock"
-  conmon = "/usr/libexec/crio/conmon"
+  conmon = "/usr/local/bin/conmon"
 CRIOPATHS
+fi
 
-cat > /etc/crio/crio.conf.d/999-runc.conf <<'RUNTIME'
+if [ ! -f /etc/crio/crio.conf.d/999-runc.conf ]; then
+  cat > /etc/crio/crio.conf.d/999-runc.conf <<'RUNTIME'
 [crio]
 
   [crio.runtime]
@@ -525,8 +456,10 @@ cat > /etc/crio/crio.conf.d/999-runc.conf <<'RUNTIME'
         runtime_path = "/usr/bin/nvidia-container-runtime"
         runtime_type = "oci"
 RUNTIME
+fi
 
-cat > /etc/crio/crio.conf.d/9999-nvidia.conf <<'RUNTIME'
+if [ ! -f /etc/crio/crio.conf.d/9999-nvidia.conf ]; then
+  cat > /etc/crio/crio.conf.d/9999-nvidia.conf <<'RUNTIME'
 [crio.runtime]
   [crio.runtime.runtimes]
     [crio.runtime.runtimes.nvidia]
@@ -536,21 +469,26 @@ cat > /etc/crio/crio.conf.d/9999-nvidia.conf <<'RUNTIME'
       runtime_path = "/usr/local/nvidia/toolkit/nvidia-container-runtime.cdi"
       runtime_type = "oci"
 RUNTIME
+fi
 
-cat > /etc/containers/policy.json <<'POLICY'
+if [ ! -f /etc/containers/policy.json ]; then
+  cat > /etc/containers/policy.json <<'POLICY'
 {"default":[{"type":"insecureAcceptAnything"}]}
 POLICY
+fi
 
-cat > /etc/containers/registries.conf <<'REGCONF'
+if [ ! -f /etc/containers/registries.conf ]; then
+  cat > /etc/containers/registries.conf <<'REGCONF'
 unqualified-search-registries = ["docker.io"]
 
 [[registry]]
 location = "docker.io"
 REGCONF
+fi
 
-# CRIU runtime configuration used by the customized CRI-O/checkpoint path.
-mkdir -p /etc/criu
-cat > /etc/criu/runc.conf <<'CRIUCONF'
+# CRIU runtime configuration used by the checkpoint/restore path.
+if [ ! -f /etc/criu/runc.conf ]; then
+  cat > /etc/criu/runc.conf <<'CRIUCONF'
 tcp-close
 skip-in-flight
 log-file /tmp/criu.log
@@ -562,103 +500,10 @@ irmap-scan-path /usr
 irmap-scan-path /opt/conda
 irmap-scan-path /opt/remote-dev
 CRIUCONF
-cp -f /etc/criu/runc.conf /etc/criu/default.conf
-
-# Ensure the custom CRI-O restore hook is available if the custom installation
-# supplied it. This is non-fatal because the binary may provide the hook itself.
-if [[ -f /usr/libexec/crio/criu-device-restorer.sh ]]; then
-  install -D -m 0755 /usr/libexec/crio/criu-device-restorer.sh \
-    /usr/local/libexec/crio/criu-device-restorer.sh
 fi
-
-# Custom CRIU binary
-report "Installing custom CRIU"
-CRIU_BIN=/usr/sbin/criu
-CRIU_HAVE=""
-if command -v criu >/dev/null 2>&1; then
-  CRIU_HAVE="$(criu --version 2>&1 | awk '/GitID:/{print $2}' | head -1 || true)"
+if [ ! -f /etc/criu/default.conf ]; then
+  cp -f /etc/criu/runc.conf /etc/criu/default.conf
 fi
-if [[ "$CRIU_HAVE" != "{{.CRIUGitID}}" ]]; then
-  curl -fsSL '{{.CRIUAsset}}' -o /tmp/criu
-  chmod 0755 /tmp/criu
-  CRIU_GOT="$(/tmp/criu --version 2>&1 | awk '/GitID:/{print $2}' | head -1 || true)"
-  [[ "$CRIU_GOT" == "{{.CRIUGitID}}" ]] || {
-    echo "CRIU GitID mismatch: got '$CRIU_GOT', expected '{{.CRIUGitID}}'" >&2
-    exit 1
-  }
-  install -m 0755 /tmp/criu "$CRIU_BIN"
-  rm -f /tmp/criu
-fi
-setcap cap_checkpoint_restore+eip "$CRIU_BIN" 2>/dev/null || true
-criu --version
-
-# Custom runc, verified against the upstream checksum manifest.
-report "Installing runc {{.RuncVersion}}"
-RUNC_WANT="{{.RuncVersion}}"
-RUNC_BIN=/usr/local/sbin/runc
-RUNC_HAVE="$(runc --version 2>/dev/null | awk '/^runc version/{print "v"$3}' || true)"
-if [[ "$RUNC_HAVE" != "$RUNC_WANT" ]]; then
-  case "$(dpkg --print-architecture)" in
-    amd64) RUNC_ARCH=amd64 ;;
-    arm64) RUNC_ARCH=arm64 ;;
-    *) echo "Unsupported architecture for runc: $(dpkg --print-architecture)" >&2; exit 1 ;;
-  esac
-  curl -fsSL "https://github.com/opencontainers/runc/releases/download/${RUNC_WANT}/runc.${RUNC_ARCH}" -o /tmp/runc
-  curl -fsSL "https://github.com/opencontainers/runc/releases/download/${RUNC_WANT}/runc.sha256sum" -o /tmp/runc.sha256sum
-  EXPECTED_SHA="$(awk -v f="runc.${RUNC_ARCH}" '$2 == f {print $1; exit}' /tmp/runc.sha256sum)"
-  ACTUAL_SHA="$(sha256sum /tmp/runc | awk '{print $1}')"
-  [[ -n "$EXPECTED_SHA" && "$EXPECTED_SHA" == "$ACTUAL_SHA" ]] || {
-    echo "runc checksum mismatch" >&2
-    exit 1
-  }
-  install -m 0755 /tmp/runc "$RUNC_BIN"
-  rm -f /tmp/runc /tmp/runc.sha256sum
-fi
-ln -sfn "$RUNC_BIN" /usr/bin/runc
-runc --version
-
-# CRI-O uses crun only when explicitly configured. Build it so the same runtime
-# stack is available as in pkg/kubeadm, while keeping runc as the default.
-report "Building crun"
-rm -rf /tmp/crun
-git clone --depth=1 https://github.com/containers/crun /tmp/crun
-(
-  cd /tmp/crun
-  ./autogen.sh
-  ./configure --disable-man-page
-  make -j"$(nproc)"
-  make install
-)
-rm -rf /tmp/crun
-command -v crun
-
-# -----------------------------------------------------------------------------
-# Start and verify CRI-O before installing Kubernetes
-# -----------------------------------------------------------------------------
-# crictl from the Kubernetes SIG release, pinned to the Kubernetes version.
-# This avoids relying on whichever cri-tools package the CRI-O repository exposes.
-report "Installing crictl ${K8S_VERSION}"
-CRICTL_VERSION="v${K8S_VERSION}"
-case "$(dpkg --print-architecture)" in
-  amd64) CRICTL_ARCH=amd64 ;;
-  arm64) CRICTL_ARCH=arm64 ;;
-  *) echo "Unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;;
-esac
-curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${CRICTL_ARCH}.tar.gz" -o /tmp/crictl.tar.gz
-rm -f /usr/local/bin/crictl
-install -d -m 0755 /usr/local/bin
-tar -C /usr/local/bin -xzf /tmp/crictl.tar.gz crictl
-rm -f /tmp/crictl.tar.gz
-install -d -m 0755 /etc
-cat > /etc/crictl.yaml <<CRICTL
-runtime-endpoint: unix://${CRIO_SOCKET}
-image-endpoint: unix://${CRIO_SOCKET}
-timeout: 30s
-debug: false
-CRICTL
-chmod 0644 /etc/crictl.yaml
-crictl --version
-report "crictl is installed and configured"
 
 systemctl daemon-reload
 systemctl enable crio

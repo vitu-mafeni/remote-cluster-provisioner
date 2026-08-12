@@ -44,6 +44,43 @@ spec:
                 type: string
               softwareConfig:
                 properties:
+                  cnlabRuntime:
+                    description: |-
+                      CnlabRuntime configures the prebuilt cnlab-runtime OCI artifact installation.
+                      All fields are optional; defaults apply when omitted.
+                    properties:
+                      credentialsRef:
+                        description: |-
+                          CredentialsRef references a Secret with "username" and "token" keys
+                          for authenticating to the OCI registry. Follows the same pattern as
+                          VPNSSHCredentialsRef — set Name to enable secret lookup.
+                        properties:
+                          key:
+                            description: Key is the data key within the secret that
+                              holds the credential.
+                            type: string
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                        type: object
+                      orasVersion:
+                        description: 'OrasVersion is the ORAS CLI version to install.
+                          Default: "1.3.2"'
+                        type: string
+                      registry:
+                        description: 'Registry is the OCI registry host. Default:
+                          "ghcr.io"'
+                        type: string
+                      repository:
+                        description: 'Repository is the image repository path. Default:
+                          "vitu-mafeni/cnlab-runtime"'
+                        type: string
+                      version:
+                        description: 'Version is the artifact version tag. Default:
+                          "1.0.0-beta"'
+                        type: string
+                    type: object
                   imagePrepulls:
                     items:
                       type: string
@@ -64,13 +101,7 @@ spec:
                     required:
                     - name
                     type: object
-                  k8sDevicePluginVersion:
-                    type: string
                   kubernetesVersion:
-                    type: string
-                  nvidiaContainerToolkitVersion:
-                    type: string
-                  nvidiaDriverVersion:
                     type: string
                 type: object
               vpnRange:
@@ -82,13 +113,13 @@ spec:
                   publicIP:
                     type: string
                   sshPort:
-                    type: integer
+                    type: string
                   sshUsername:
                     type: string
                   vpnPort:
                     description: VPNPort is the UDP port WireGuard listens on (default
                       51820).
-                    type: integer
+                    type: string
                   vpnSshCredentialsRef:
                     properties:
                       key:

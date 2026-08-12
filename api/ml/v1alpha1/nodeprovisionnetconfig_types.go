@@ -40,10 +40,10 @@ type NodeProvisionNetConfigSpec struct {
 
 type VPNServerConfig struct {
 	PublicIP    string `json:"publicIP,omitempty"`
-	SSHPort     int    `json:"sshPort,omitempty"`
+	SSHPort     string `json:"sshPort,omitempty"`
 	SSHUsername string `json:"sshUsername,omitempty"`
 	// VPNPort is the UDP port WireGuard listens on (default 51820).
-	VPNPort int `json:"vpnPort,omitempty"`
+	VPNPort string `json:"vpnPort,omitempty"`
 
 	VPNSSHCredentialsRef VPNSSHCredentialsRef `json:"vpnSshCredentialsRef,omitempty"`
 }
@@ -63,10 +63,10 @@ type VPNPeerStatus struct {
 }
 
 type SoftwareConfig struct {
-	KubernetesVersion             string `json:"kubernetesVersion,omitempty"`
-	NvidiaDriverVersion           string `json:"nvidiaDriverVersion,omitempty"`
-	NvidiaContainerToolkitVersion string `json:"nvidiaContainerToolkitVersion,omitempty"`
-	K8sDevicePluginVersion        string `json:"k8sDevicePluginVersion,omitempty"`
+	KubernetesVersion string `json:"kubernetesVersion,omitempty"`
+	// NvidiaDriverVersion           string `json:"nvidiaDriverVersion,omitempty"`
+	// NvidiaContainerToolkitVersion string `json:"nvidiaContainerToolkitVersion,omitempty"`
+	// K8sDevicePluginVersion        string `json:"k8sDevicePluginVersion,omitempty"`
 
 	ImagePrepulls []string `json:"imagePrepulls,omitempty"`
 
@@ -75,6 +75,32 @@ type SoftwareConfig struct {
 	// The Secret must have "username" and "password" keys.
 	// +optional
 	ImagePullSecretRef *SecretKeyReference `json:"imagePullSecretRef,omitempty"`
+
+	// CnlabRuntime configures the prebuilt cnlab-runtime OCI artifact installation.
+	// All fields are optional; defaults apply when omitted.
+	// +optional
+	CnlabRuntime *CnlabRuntimeConfig `json:"cnlabRuntime,omitempty"`
+}
+
+// CnlabRuntimeConfig defines how to obtain the prebuilt cnlab-runtime OCI artifact.
+type CnlabRuntimeConfig struct {
+	// Registry is the OCI registry host. Default: "ghcr.io"
+	// +optional
+	Registry string `json:"registry,omitempty"`
+	// Repository is the image repository path. Default: "vitu-mafeni/cnlab-runtime"
+	// +optional
+	Repository string `json:"repository,omitempty"`
+	// Version is the artifact version tag. Default: "1.0.0-beta"
+	// +optional
+	Version string `json:"version,omitempty"`
+	// OrasVersion is the ORAS CLI version to install. Default: "1.3.2"
+	// +optional
+	OrasVersion string `json:"orasVersion,omitempty"`
+	// CredentialsRef references a Secret with "username" and "token" keys
+	// for authenticating to the OCI registry. Follows the same pattern as
+	// VPNSSHCredentialsRef — set Name to enable secret lookup.
+	// +optional
+	CredentialsRef VPNSSHCredentialsRef `json:"credentialsRef,omitempty"`
 }
 
 // SecretKeyReference identifies a Kubernetes Secret by name and an optional key.

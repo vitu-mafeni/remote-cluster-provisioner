@@ -12,9 +12,11 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,9 +25,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 	"golang.org/x/crypto/ssh"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
+	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 	onprem "dcn.ssu.ac.kr/infra/provider/onprem"
 	corev1 "k8s.io/api/core/v1"
@@ -80,6 +84,31 @@ func ResolveAWSCredentials(secret *corev1.Secret) AWSCredentials {
 	return c
 }
 
+// IsAWSAuthFailure reports whether err is an AWS AuthFailure or
+// InvalidClientTokenId response — both indicate that the credentials
+// presented to the AWS API were rejected as invalid or expired.
+func IsAWSAuthFailure(err error) bool {
+	var apiErr *smithy.GenericAPIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case "AuthFailure", "InvalidClientTokenId":
+			return true
+		}
+	}
+	return false
+}
+
+// StaticCredsNoSession returns a copy of creds with SessionToken cleared.
+// Use this as a last-resort fallback when a cached STS session is expired:
+// if the IAM key itself is still valid and the policy does not require MFA,
+// a bare access-key + secret call will succeed.
+func StaticCredsNoSession(creds AWSCredentials) AWSCredentials {
+	return AWSCredentials{
+		AccessKeyID:     creds.AccessKeyID,
+		SecretAccessKey: creds.SecretAccessKey,
+	}
+}
+
 // ValidateAWSConfig checks that all required AWS parameters are present.
 func ValidateAWSConfig(spec mlv1alpha1.NodeProvisionSpec) error {
 	if spec.Region == "" {
@@ -126,6 +155,7 @@ func ProvisionEC2Node(
 	creds AWSCredentials,
 	vpnServerClient *sshhelper.Client,
 	netNodeConfig *mlv1alpha1.NodeProvisionNetConfig,
+	runtimeCfg pkgruntime.Config,
 ) (*ProvisionResult, error) {
 
 	name := nodeProvision.Name
@@ -157,7 +187,7 @@ func ProvisionEC2Node(
 		vpnIP,
 		*netNodeConfig.Spec.VPNRange,
 		netNodeConfig.Spec.VPNServerPublicConfig.PublicIP,
-		netNodeConfig.Spec.VPNServerPublicConfig.VPNPort,
+		parsePort(netNodeConfig.Spec.VPNServerPublicConfig.VPNPort, 51820),
 		privateKey,
 	)
 	if err != nil {
@@ -192,12 +222,16 @@ func ProvisionEC2Node(
 		JoinCommand:            netNodeConfig.Status.ClusterJoinCommand,
 		KubernetesVersion:      clean,
 		KubernetesMinorVersion: crioVersion,
-		CRIOVersion:            crioVersion,
 		NodeName:               name,
 		Labels:                 labels,
 		SSHUsername:            nodeProvision.Spec.SSHUsernameOverride,
 		IsGPUNode:              strings.EqualFold(nodeProvision.Spec.NodeLabel, "gpu"),
-		// NvidiaContainerToolkitVersion: netNodeConfig.Spec.SoftwareConfig.NvidiaContainerToolkitVersion,
+		RuntimeRegistryUser:    runtimeCfg.Username,
+		RuntimeRegistryToken:   runtimeCfg.Token,
+		RuntimeRegistry:        runtimeCfg.Registry,
+		RuntimeRepository:      runtimeCfg.Repository,
+		RuntimeVersion:         runtimeCfg.Version,
+		RuntimeOrasVersion:     runtimeCfg.OrasVersion,
 	})
 
 	// ── Create EC2 instance ────────────────────────────────────────────────
@@ -784,4 +818,17 @@ func tagInstance(ctx context.Context, client *ec2.Client, instanceID string, np 
 		time.Sleep(time.Duration(i+1) * 2 * time.Second)
 	}
 	return lastErr
+}
+
+// parsePort converts a string port value to int, returning defaultPort when
+// the string is empty or unparseable. Accepts port fields stored as strings in YAML.
+func parsePort(s string, defaultPort int) int {
+	if s == "" {
+		return defaultPort
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return defaultPort
+	}
+	return n
 }

@@ -35,7 +35,7 @@ type RemoteClusterSpec struct {
 	ClusterName string    `json:"clusterName"` // this has to be unique for each cluster, and will be used as the cluster name when provisioning, and also will be used as the parent cluster
 	Host        string    `json:"host"`
 	VPNConfig   VPNConfig `json:"vpnConfig,omitempty"`
-	Port        int       `json:"port"`
+	Port        string    `json:"port"`
 	User        string    `json:"user"`
 	NodeInfo    NodeInfo  `json:"nodeInfo,omitempty"`
 
@@ -46,7 +46,7 @@ type RemoteClusterSpec struct {
 type VPNConfig struct {
 	IP                   string               `json:"ip,omitempty"`
 	VPNServerPublicIP    string               `json:"vpnServerPublicIP,omitempty"`
-	VPNServerSSHPort     int                  `json:"vpnServerSSHPort,omitempty"`
+	VPNServerSSHPort     string               `json:"vpnServerSSHPort,omitempty"`
 	VPNServerSSHUsername string               `json:"vpnServerSSHUsername,omitempty"`
 	VPNSSHCredentialsRef VPNSSHCredentialsRef `json:"vpnSshCredentialsRef,omitempty"`
 }
@@ -64,17 +64,43 @@ type NodeInfo struct {
 }
 
 type SoftwareConfig struct {
-	NvidiaDriverVersion           string   `json:"nvidiaDriverVersion,omitempty"`
-	NvidiaContainerToolkitVersion string   `json:"nvidiaContainerToolkitVersion,omitempty"`
-	K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
-	KubernetesVersion             string   `json:"kubernetesVersion,omitempty"` // e.g., "v1.34.2"
-	ImagePrepulls                 []string `json:"imagePrepulls,omitempty"`     // list of container images to be prepulled on the node, e.g., ["nginx:latest", "redis:6.2"]
+	// NvidiaDriverVersion           string   `json:"nvidiaDriverVersion,omitempty"`
+	// NvidiaContainerToolkitVersion string   `json:"nvidiaContainerToolkitVersion,omitempty"`
+	// K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
+	KubernetesVersion string   `json:"kubernetesVersion,omitempty"` // e.g., "v1.34.2"
+	ImagePrepulls     []string `json:"imagePrepulls,omitempty"`     // list of container images to be prepulled on the node, e.g., ["nginx:latest", "redis:6.2"]
 
 	// ImagePullSecretRef optionally references a Secret containing registry
 	// credentials used when pre-pulling private images listed in ImagePrepulls.
 	// The Secret must have "username" and "password" keys.
 	// +optional
 	ImagePullSecretRef *SecretKeyReference `json:"imagePullSecretRef,omitempty"`
+
+	// CnlabRuntime configures the prebuilt cnlab-runtime OCI artifact installation.
+	// All fields are optional; defaults apply when omitted.
+	// +optional
+	CnlabRuntime *CnlabRuntimeConfig `json:"cnlabRuntime,omitempty"`
+}
+
+// CnlabRuntimeConfig defines how to obtain the prebuilt cnlab-runtime OCI artifact.
+type CnlabRuntimeConfig struct {
+	// Registry is the OCI registry host. Default: "ghcr.io"
+	// +optional
+	Registry string `json:"registry,omitempty"`
+	// Repository is the image repository path. Default: "vitu-mafeni/cnlab-runtime"
+	// +optional
+	Repository string `json:"repository,omitempty"`
+	// Version is the artifact version tag. Default: "1.0.0-beta"
+	// +optional
+	Version string `json:"version,omitempty"`
+	// OrasVersion is the ORAS CLI version to install. Default: "1.3.2"
+	// +optional
+	OrasVersion string `json:"orasVersion,omitempty"`
+	// CredentialsRef references a Secret with "username" and "token" keys
+	// for authenticating to the OCI registry. Follows the same pattern as
+	// VPNSSHCredentialsRef — set Name to enable secret lookup.
+	// +optional
+	CredentialsRef VPNSSHCredentialsRef `json:"credentialsRef,omitempty"`
 }
 
 type GitConfig struct {

@@ -31,6 +31,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -47,6 +48,7 @@ import (
 
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
+	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	"dcn.ssu.ac.kr/infra/pkg/ssh"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
@@ -419,6 +421,13 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 
 		clusterCopy := cluster.DeepCopy()
 
+		runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
+		if err != nil {
+			sshClient.Conn.Close()
+			return r.fail(ctx, cluster, "RuntimeConfigError",
+				fmt.Errorf("resolving cnlab-runtime config: %w", err))
+		}
+
 		ch := make(chan controlPlaneJobResult, 1)
 		r.controlPlaneJobs.Store(key, (<-chan controlPlaneJobResult)(ch))
 
@@ -426,7 +435,7 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 			defer sshClient.Conn.Close()
 			joinCommand, err := kubeadm.InitializeControlPlane(sshClient, clusterCopy, startPhase, func(phaseIdx int) {
 				r.controlPlaneProgress.Store(key, phaseIdx)
-			})
+			}, runtimeCfg)
 			ch <- controlPlaneJobResult{joinCommand: joinCommand, err: err}
 		}()
 
@@ -524,8 +533,13 @@ func (r *RemoteClusterReconciler) reconcilePackageVariants(ctx context.Context, 
 		return r.fail(ctx, cluster, "OverlayPackageVariantsFailed", fmt.Errorf("creating overlay PackageVariants: %w", err))
 	}
 
-	ensureAnnotations(cluster)[annotationPkgVariantsCreated] = "true"
-	if err := r.Update(ctx, cluster); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+			return err
+		}
+		ensureAnnotations(cluster)[annotationPkgVariantsCreated] = "true"
+		return r.Update(ctx, cluster)
+	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("marking package-variants as created: %w", err)
 	}
 
@@ -601,6 +615,12 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			}
 		}
 
+		workerRuntimeCfg, rErr := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
+		if rErr != nil {
+			return r.fail(ctx, cluster, "RuntimeConfigError",
+				fmt.Errorf("resolving cnlab-runtime config: %w", rErr))
+		}
+
 		err, nodeIP := kubeadm.JoinWorkerNode(
 			sshClient,
 			sshClientCP,
@@ -609,6 +629,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			clusterParent,
 			workerStartPhase,
 			onWorkerPhaseComplete,
+			workerRuntimeCfg,
 		)
 		if err != nil {
 			return r.fail(
@@ -995,8 +1016,8 @@ data:
 		}
 
 		vpnServerSSHPort := cluster.Spec.VPNConfig.VPNServerSSHPort
-		if vpnServerSSHPort == 0 {
-			vpnServerSSHPort = 22
+		if vpnServerSSHPort == "" {
+			vpnServerSSHPort = "22"
 		}
 		vpnServerSSHUsername := cluster.Spec.VPNConfig.VPNServerSSHUsername
 		if vpnServerSSHUsername == "" {
@@ -1013,13 +1034,10 @@ spec:
   clusterName: %s
   softwareConfig:
     kubernetesVersion: "%s"
-    nvidiaDriverVersion: "%s"
-    nvidiaContainerToolkitVersion: "%s"
-    k8sDevicePluginVersion: "%s"
 %s  vpnRange: %s
   vpnServerPublicConfig:
     publicIP: %s
-    sshPort: %d
+    sshPort: "%s"
     sshUsername: %s
     vpnSshCredentialsRef:
       name: %s
@@ -1029,9 +1047,6 @@ spec:
 			cluster.Namespace,
 			cluster.Spec.ClusterName,
 			clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion,
-			clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaDriverVersion,
-			clusterParent.Spec.NodeInfo.SoftwareConfig.NvidiaContainerToolkitVersion,
-			clusterParent.Spec.NodeInfo.SoftwareConfig.K8sDevicePluginVersion,
 			imagePrepullsYAML,
 			vpnCIDR,
 			cluster.Spec.VPNConfig.VPNServerPublicIP,
@@ -1439,12 +1454,14 @@ func (r *RemoteClusterReconciler) completeControlPlane(
 	}
 
 	// All side-effects done — now flip to Ready and persist the join command.
-	// Refresh to avoid resource-version conflicts before the status write.
-	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("refreshing cluster before status update: %w", err)
-	}
-	cluster.Status.JoinCommand = joinCommand
-	if err := r.setStatus(ctx, cluster, phaseReady, "Provisioned", "Cluster provisioned successfully", false); err != nil {
+	// Retry on conflict: long-running SSH work means our copy may be stale.
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+			return err
+		}
+		cluster.Status.JoinCommand = joinCommand
+		return r.setStatus(ctx, cluster, phaseReady, "Provisioned", "Cluster provisioned successfully", false)
+	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status to Ready: %w", err)
 	}
 
@@ -1766,13 +1783,14 @@ func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *inf
 	credential := string(credentialBytes)
 	var sshClient *ssh.Client
 	var err error
+	port := parsePort(cluster.Spec.Port, 22)
 	if strings.HasPrefix(strings.TrimSpace(credential), "-----BEGIN") {
-		sshClient, err = ssh.ConnectWithPrivateKey(host, cluster.Spec.Port, cluster.Spec.User, credential)
+		sshClient, err = ssh.ConnectWithPrivateKey(host, port, cluster.Spec.User, credential)
 	} else {
-		sshClient, err = ssh.Connect(host, cluster.Spec.Port, cluster.Spec.User, credential)
+		sshClient, err = ssh.Connect(host, port, cluster.Spec.User, credential)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("SSH connect to %s:%d: %w", host, cluster.Spec.Port, err)
+		return nil, fmt.Errorf("SSH connect to %s:%d: %w", host, port, err)
 	}
 	return sshClient, nil
 }
@@ -2196,10 +2214,7 @@ func (r *RemoteClusterReconciler) removeVPNPeer(ctx context.Context, cluster *in
 
 	cred := strings.TrimSpace(string(credBytes))
 	vpnHost := cluster.Spec.VPNConfig.VPNServerPublicIP
-	vpnPort := cluster.Spec.VPNConfig.VPNServerSSHPort
-	if vpnPort == 0 {
-		vpnPort = 22
-	}
+	vpnPort := parsePort(cluster.Spec.VPNConfig.VPNServerSSHPort, 22)
 	vpnUser := cluster.Spec.VPNConfig.VPNServerSSHUsername
 	if vpnUser == "" {
 		vpnUser = "ubuntu"
@@ -2642,6 +2657,43 @@ func (r *RemoteClusterReconciler) upsertPackageVariants(ctx context.Context, clu
 	return nil
 }
 
+// resolveCnlabRuntimeConfig resolves pkgruntime.Config from the cluster's SoftwareConfig.
+// If CnlabRuntime.CredentialsRef is set, the referenced Secret is read to extract
+// "username" and "token" keys. Token is kept in memory only and never logged.
+func (r *RemoteClusterReconciler) resolveCnlabRuntimeConfig(
+	ctx context.Context,
+	softwareCfg infrav1.SoftwareConfig,
+	namespace string,
+) (pkgruntime.Config, error) {
+	cfg := pkgruntime.Config{}
+	if softwareCfg.CnlabRuntime != nil {
+		cr := softwareCfg.CnlabRuntime
+		cfg.Registry = cr.Registry
+		cfg.Repository = cr.Repository
+		cfg.Version = cr.Version
+		cfg.OrasVersion = cr.OrasVersion
+
+		ref := cr.CredentialsRef
+		if ref.Name != "" {
+			ns := ref.NameSpace
+			if ns == "" {
+				ns = namespace
+			}
+			var secret corev1.Secret
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      ref.Name,
+				Namespace: ns,
+			}, &secret); err != nil {
+				return pkgruntime.Config{}, fmt.Errorf("reading cnlab-runtime credentials secret %s/%s: %w", ns, ref.Name, err)
+			}
+			cfg.Username = string(secret.Data["username"])
+			cfg.Token = string(secret.Data["token"]) // never log
+		}
+	}
+	cfg.ApplyDefaults()
+	return cfg, nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *RemoteClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -2649,4 +2701,18 @@ func (r *RemoteClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Named("remotecluster").
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(r)
+}
+
+// parsePort converts a string port value to int, returning defaultPort when
+// the string is empty or cannot be parsed. Used to accept port fields that
+// the API accepts as strings (e.g. port: "22" in YAML).
+func parsePort(s string, defaultPort int) int {
+	if s == "" {
+		return defaultPort
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return defaultPort
+	}
+	return n
 }
