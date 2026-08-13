@@ -90,6 +90,12 @@ type AWSConfig struct {
 type NodeProvisionSpec struct {
 	Provider CloudProvider `json:"provider,omitempty"`
 
+	// HardwareType classifies the node for image pre-pull targeting.
+	// "gpu" — node has GPUs; pulls images with nodeTarget "gpu" and "all".
+	// "cpu" (or empty) — pulls only images with nodeTarget "all".
+	// +optional
+	HardwareType string `json:"hardwareType,omitempty"`
+
 	Role string `json:"role,omitempty"`
 
 	NodeLabel string `json:"nodeLabel,omitempty"`

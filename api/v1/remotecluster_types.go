@@ -63,12 +63,24 @@ type NodeInfo struct {
 	SoftwareConfig SoftwareConfig `json:"softwareConfig,omitempty"`
 }
 
+// ImagePrepull describes a single image to pre-pull and which node types should pull it.
+type ImagePrepull struct {
+	// Image is the fully-qualified container image reference.
+	Image string `json:"image"`
+	// NodeTarget controls which worker nodes pull this image.
+	// "gpu"  — GPU workers only.
+	// "all"  — every worker node (CPU and GPU).
+	// +kubebuilder:validation:Enum=gpu;all
+	// +kubebuilder:default=all
+	NodeTarget string `json:"nodeTarget,omitempty"`
+}
+
 type SoftwareConfig struct {
 	// NvidiaDriverVersion           string   `json:"nvidiaDriverVersion,omitempty"`
 	// NvidiaContainerToolkitVersion string   `json:"nvidiaContainerToolkitVersion,omitempty"`
 	// K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
-	KubernetesVersion string   `json:"kubernetesVersion,omitempty"` // e.g., "v1.34.2"
-	ImagePrepulls     []string `json:"imagePrepulls,omitempty"`     // list of container images to be prepulled on the node, e.g., ["nginx:latest", "redis:6.2"]
+	KubernetesVersion string         `json:"kubernetesVersion,omitempty"` // e.g., "v1.34.2"
+	ImagePrepulls     []ImagePrepull `json:"imagePrepulls,omitempty"`
 
 	// ImagePullSecretRef optionally references a Secret containing registry
 	// credentials used when pre-pulling private images listed in ImagePrepulls.

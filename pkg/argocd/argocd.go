@@ -66,7 +66,6 @@ spec:
       allowEmpty: true
     syncOptions:
       - CreateNamespace=true
-      - ServerSideApply=true
       - SkipDryRunOnMissingResource=true
       - ApplyOutOfSyncOnly=true
       - PruneLast=true

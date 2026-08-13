@@ -137,7 +137,26 @@ spec:
                         type: object
                       imagePrepulls:
                         items:
-                          type: string
+                          description: ImagePrepull describes a single image to pre-pull
+                            and which node types should pull it.
+                          properties:
+                            image:
+                              description: Image is the fully-qualified container
+                                image reference.
+                              type: string
+                            nodeTarget:
+                              default: all
+                              description: |-
+                                NodeTarget controls which worker nodes pull this image.
+                                "gpu"  — GPU workers only.
+                                "all"  — every worker node (CPU and GPU).
+                              enum:
+                              - gpu
+                              - all
+                              type: string
+                          required:
+                          - image
+                          type: object
                         type: array
                       imagePullSecretRef:
                         description: |-

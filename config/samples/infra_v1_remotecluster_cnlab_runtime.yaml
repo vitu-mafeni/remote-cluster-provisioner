@@ -60,8 +60,10 @@ spec:
     softwareConfig:
       kubernetesVersion: "v1.35.0"
       imagePrepulls:
-        - "docker.io/vitu1/kernel-pytorch-gpu:3.2.3-cu121"
-        - "docker.io/vitu1/kernel-tf-gpu:3.2.3-cu121"
+        - image: "docker.io/vitu1/kernel-pytorch-gpu:3.2.3-cu121"
+          nodeTarget: "gpu"  # gpu or all download on all nodes
+        - image: "docker.io/vitu1/kernel-tf-gpu:3.2.3-cu121"
+          nodeTarget: "gpu"
       imagePullSecretRef:
         name: dockerhub-creds
 
@@ -118,7 +120,7 @@ type: Opaque
 stringData:
   id_rsa: |
     -----BEGIN RSA PRIVATE KEY-----
-    EXAMPLE PRIVATE KEY DATA
+    CHANGE ME
     -----END RSA PRIVATE KEY-----
 
 ---
@@ -131,7 +133,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: CHANGE ME
+  password: CHANGEME
 ---
 # ============================================================
 # RemoteCluster — GPU worker node
