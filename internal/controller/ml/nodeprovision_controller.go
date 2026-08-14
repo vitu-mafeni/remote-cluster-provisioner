@@ -996,6 +996,15 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 		if np.Spec.NodeLabel != "" {
 			found.Labels["hardware-type"] = np.Spec.NodeLabel
 		}
+		// DaemonSet targeting labels — used by prepull DaemonSets (deployed on CP
+		// during cluster init) to schedule image pre-pull pods on the right nodes.
+		// Mirrors the labeling done by RemoteCluster reconcileWorker for SSH-joined nodes.
+		found.Labels["infra.dcn.ssu.ac.kr/worker"] = "true"
+		hwType := "cpu"
+		if strings.EqualFold(np.Spec.HardwareType, "gpu") || strings.Contains(np.Spec.NodeLabel, "gpu") {
+			hwType = "gpu"
+		}
+		found.Labels["infra.dcn.ssu.ac.kr/hardware-type"] = hwType
 		// GPU-specific labels and taint — mirrors what RemoteCluster does for
 		// GPU workers via kubectl label/taint on the control-plane.
 		if strings.Contains(np.Spec.NodeLabel, "gpu") {

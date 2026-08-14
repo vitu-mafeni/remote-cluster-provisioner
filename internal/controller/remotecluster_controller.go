@@ -678,13 +678,14 @@ func deployPrepullDaemonSets(
 	log := logf.FromContext(ctx)
 
 	type dsSpec struct {
-		name         string
-		nodeSelector string
-		nodeTarget   string
+		name             string
+		nodeSelectorKey  string
+		nodeSelectorVal  string
+		nodeTarget       string
 	}
 	specs := []dsSpec{
-		{clusterName + "-prepull-all", "infra.dcn.ssu.ac.kr/worker", "all"},
-		{clusterName + "-prepull-gpu", "infra.dcn.ssu.ac.kr/hardware-type", "gpu"},
+		{clusterName + "-prepull-all", "infra.dcn.ssu.ac.kr/worker", "true", "all"},
+		{clusterName + "-prepull-gpu", "infra.dcn.ssu.ac.kr/hardware-type", "gpu", "gpu"},
 	}
 
 	for _, s := range specs {
@@ -701,7 +702,7 @@ func deployPrepullDaemonSets(
 			continue
 		}
 
-		manifest := rcBuildPrepullDaemonSetManifest(s.name, s.nodeSelector, s.nodeTarget, filtered, registrySecretName)
+		manifest := rcBuildPrepullDaemonSetManifest(s.name, s.nodeSelectorKey, s.nodeSelectorVal, filtered, registrySecretName)
 		encoded := base64.StdEncoding.EncodeToString([]byte(manifest))
 		applyCmd := fmt.Sprintf("echo '%s' | base64 -d | kubectl apply -f -", encoded)
 		out, err := sshhelper.Run(cpSSH, applyCmd)
@@ -746,13 +747,15 @@ func rcBuildPrepullDaemonSetManifest(dsName, nodeSelectorKey, nodeSelectorVal st
           "args": ["echo %s | base64 -d | bash"],
           "securityContext": {"privileged": true}%s,
           "volumeMounts": [
-            {"name": "crictl",     "mountPath": "/usr/local/bin/crictl"},
-            {"name": "cri-socket", "mountPath": "/var/run/crio/crio.sock"}
+            {"name": "crictl",      "mountPath": "/usr/local/bin/crictl"},
+            {"name": "cri-socket",  "mountPath": "/var/run/crio/crio.sock"},
+            {"name": "crictl-conf", "mountPath": "/etc/crictl.yaml"}
           ]
         }],
         "volumes": [
-          {"name": "crictl",     "hostPath": {"path": "/usr/local/bin/crictl",    "type": "File"}},
-          {"name": "cri-socket", "hostPath": {"path": "/var/run/crio/crio.sock", "type": "Socket"}}
+          {"name": "crictl",      "hostPath": {"path": "/usr/local/bin/crictl",    "type": "File"}},
+          {"name": "cri-socket",  "hostPath": {"path": "/var/run/crio/crio.sock", "type": "Socket"}},
+          {"name": "crictl-conf", "hostPath": {"path": "/etc/crictl.yaml",        "type": "File"}}
         ]
       }
     }
