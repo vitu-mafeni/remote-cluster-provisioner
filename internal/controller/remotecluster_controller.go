@@ -678,10 +678,10 @@ func deployPrepullDaemonSets(
 	log := logf.FromContext(ctx)
 
 	type dsSpec struct {
-		name             string
-		nodeSelectorKey  string
-		nodeSelectorVal  string
-		nodeTarget       string
+		name            string
+		nodeSelectorKey string
+		nodeSelectorVal string
+		nodeTarget      string
 	}
 	specs := []dsSpec{
 		{clusterName + "-prepull-all", "infra.dcn.ssu.ac.kr/worker", "true", "all"},
