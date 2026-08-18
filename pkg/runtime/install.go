@@ -75,8 +75,15 @@ else
     rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
     exit 1
   }
-  DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite \
-    /tmp/cnlab-runtime/artifact/cnlab-runtime_${CNLAB_VERSION}_${CNLAB_ARCH}.deb || true
+  CNLAB_DEB=$(ls /tmp/cnlab-runtime/artifact/cnlab-runtime_*_${CNLAB_ARCH}.deb 2>/dev/null | head -1)
+  if [ -z "$CNLAB_DEB" ]; then
+    echo "[cnlab-runtime] no .deb found in pulled artifact" >&2
+    ls /tmp/cnlab-runtime/artifact/ >&2 || true
+    rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
+    exit 1
+  fi
+  echo "[cnlab-runtime] installing $CNLAB_DEB"
+  DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite "$CNLAB_DEB" || true
   DEBIAN_FRONTEND=noninteractive apt-get install -f -y
   rm -f /var/cache/apt/archives/cnlab-runtime_*.deb
   cnlab-runtime version
@@ -147,8 +154,15 @@ oras pull "$REF" -o /tmp/cnlab-runtime
   rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
   exit 1
 }
-sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite \
-  /tmp/cnlab-runtime/artifact/cnlab-runtime_${VERSION}_${ARCH}.deb || true
+DEB=$(ls /tmp/cnlab-runtime/artifact/cnlab-runtime_*_${ARCH}.deb 2>/dev/null | head -1)
+if [ -z "$DEB" ]; then
+  echo "[cnlab-runtime] no .deb found in pulled artifact" >&2
+  ls /tmp/cnlab-runtime/artifact/ >&2 || true
+  rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
+  exit 1
+fi
+echo "[cnlab-runtime] installing $DEB"
+sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite "$DEB" || true
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y
 sudo rm -f /var/cache/apt/archives/cnlab-runtime_*.deb
 cnlab-runtime version

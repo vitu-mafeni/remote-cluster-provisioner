@@ -93,6 +93,12 @@ spec:
                   namespace:
                     type: string
                 type: object
+              hardwareType:
+                description: |-
+                  HardwareType classifies the node for image pre-pull targeting.
+                  "gpu" — node has GPUs; pulls images with nodeTarget "gpu" and "all".
+                  "cpu" (or empty) — pulls only images with nodeTarget "all".
+                type: string
               hostname:
                 type: string
               instanceId:

@@ -55,11 +55,6 @@ type onPremJobResult struct {
 	err       error
 }
 
-// npPrepullJobResult carries the outcome of a background image pre-pull run.
-type npPrepullJobResult struct {
-	err error
-}
-
 // NodeProvisionReconciler reconciles a NodeProvision object
 type NodeProvisionReconciler struct {
 	client.Client
@@ -72,9 +67,6 @@ type NodeProvisionReconciler struct {
 	// onPremProgress tracks the current provisioning step for each in-flight goroutine.
 	// Key: "<namespace>/<name>", Value: string
 	onPremProgress sync.Map
-	// npPrepullJobs holds in-flight image pre-pull goroutines.
-	// Key: "<namespace>/<name>", Value: <-chan npPrepullJobResult
-	npPrepullJobs sync.Map
 }
 
 const (
@@ -1004,6 +996,15 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 		if np.Spec.NodeLabel != "" {
 			found.Labels["hardware-type"] = np.Spec.NodeLabel
 		}
+		// DaemonSet targeting labels — used by prepull DaemonSets (deployed on CP
+		// during cluster init) to schedule image pre-pull pods on the right nodes.
+		// Mirrors the labeling done by RemoteCluster reconcileWorker for SSH-joined nodes.
+		found.Labels["infra.dcn.ssu.ac.kr/worker"] = "true"
+		hwType := "cpu"
+		if strings.EqualFold(np.Spec.HardwareType, "gpu") || strings.Contains(np.Spec.NodeLabel, "gpu") {
+			hwType = "gpu"
+		}
+		found.Labels["infra.dcn.ssu.ac.kr/hardware-type"] = hwType
 		// GPU-specific labels and taint — mirrors what RemoteCluster does for
 		// GPU workers via kubectl label/taint on the control-plane.
 		if strings.Contains(np.Spec.NodeLabel, "gpu") {
@@ -1099,118 +1100,30 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 // ────────────────────────────────────────────────────────────────────────────
 // reconcileNPImagePrepull – GPU image pre-pull for NodeProvision
 // ────────────────────────────────────────────────────────────────────────────
-//
-// AWS nodes: uses a Kubernetes Job that mounts crictl and the CRI socket
-// from the host — no SSH key required.
-//
-// On-prem nodes: uses an SSH goroutine via the VPN (existing behaviour).
+// All providers use a Kubernetes Job that mounts crictl and the CRI socket
+// from the host node — no SSH required for any path.
 
 func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 	ctx context.Context,
 	np *mlv1alpha1.NodeProvision,
 ) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
-	// ── On-prem: poll the in-memory goroutine channel (fast path) ────────────
-	if np.Spec.Provider != mlv1alpha1.CloudProviderAWS {
-		key := np.Namespace + "/" + np.Name
-		if v, running := r.npPrepullJobs.Load(key); running {
-			ch := v.(<-chan npPrepullJobResult)
-			select {
-			case res := <-ch:
-				r.npPrepullJobs.Delete(key)
-				if res.err != nil {
-					log.Error(res.err, "Image pre-pull attempt failed, will retry on next reconcile",
-						"node", np.Status.NodeName)
-					return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-				}
-				log.Info("All GPU images pre-pulled successfully", "node", np.Status.NodeName)
-				return r.markNodeProvisionReady(ctx, np)
-			default:
-				log.V(1).Info("GPU image pre-pull in progress, requeueing")
-				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-			}
-		}
-	}
-
-	// Fetch the image list (needed for both paths when no work is in flight).
 	netConfig, err := r.requireNetConfig(ctx, np)
 	if err != nil {
 		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 	}
-	images := netConfig.Spec.SoftwareConfig.ImagePrepulls
+	// Filter images by node target: GPU nodes pull "gpu" and "all"; CPU nodes pull "all" only.
+	hwType := strings.ToLower(np.Spec.HardwareType)
+	var images []mlv1alpha1.ImagePrepull
+	for _, ip := range netConfig.Spec.SoftwareConfig.ImagePrepulls {
+		if ip.NodeTarget == "gpu" && hwType != "gpu" {
+			continue
+		}
+		images = append(images, ip)
+	}
 	if len(images) == 0 {
 		return r.markNodeProvisionReady(ctx, np)
 	}
-
-	// ── AWS: Job-based pull (no SSH) ─────────────────────────────────────────
-	if np.Spec.Provider == mlv1alpha1.CloudProviderAWS {
-		return r.reconcileAWSImagePrepullJob(ctx, np, netConfig, images)
-	}
-
-	// ── On-prem: SSH goroutine ────────────────────────────────────────────────
-	var pullCreds string
-	if ref := netConfig.Spec.SoftwareConfig.ImagePullSecretRef; ref != nil {
-		credSecret := &corev1.Secret{}
-		if err := r.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: np.Namespace}, credSecret); err != nil {
-			log.Error(err, "Cannot fetch image pull secret, will retry", "secret", ref.Name)
-			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-		}
-		username := strings.TrimSpace(string(credSecret.Data["username"]))
-		password := strings.TrimSpace(string(credSecret.Data["password"]))
-		if username == "" || password == "" {
-			log.Error(fmt.Errorf("missing keys"), "Image pull secret must have \"username\" and \"password\" — will retry", "secret", ref.Name)
-			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-		}
-		pullCreds = username + ":" + password
-		log.Info("Using registry credentials for image pre-pull", "secret", ref.Name, "user", username)
-	}
-
-	sshClient, err := r.getSSHClientByProvider(ctx, np)
-	if err != nil {
-		log.Error(err, "Cannot open SSH connection for image pre-pull, will retry")
-		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
-	}
-
-	imagesCopy := make([]string, len(images))
-	copy(imagesCopy, images)
-	credsCopy := pullCreds
-	glog := log.WithValues("node", np.Status.NodeName)
-	key := np.Namespace + "/" + np.Name
-	ch := make(chan npPrepullJobResult, 1)
-	r.npPrepullJobs.Store(key, (<-chan npPrepullJobResult)(ch))
-
-	go func() {
-		defer sshClient.Conn.Close()
-		if credsCopy == "" {
-			for _, f := range []string{"/root/.docker/config.json", "/run/containers/0/auth.json", "/etc/containers/auth.json"} {
-				_, _ = ssh.Run(sshClient, fmt.Sprintf("sudo rm -f %s", f))
-			}
-			glog.Info("Cleared stale registry auth files before anonymous pull")
-		}
-		for _, img := range imagesCopy {
-			img = strings.TrimSpace(img)
-			if img == "" {
-				continue
-			}
-			glog.Info("Pulling image", "image", img)
-			var cmd string
-			if credsCopy != "" {
-				cmd = fmt.Sprintf("sudo timeout 7200 crictl pull --creds %s %s", credsCopy, img)
-			} else {
-				cmd = fmt.Sprintf("sudo timeout 7200 crictl pull %s", img)
-			}
-			if output, pullErr := ssh.Run(sshClient, cmd); pullErr != nil {
-				ch <- npPrepullJobResult{err: fmt.Errorf("pulling %s: %w\nOutput:\n%s", img, pullErr, output)}
-				return
-			}
-			glog.Info("Pulled image successfully", "image", img)
-		}
-		ch <- npPrepullJobResult{}
-	}()
-
-	log.Info("GPU image pre-pull goroutine started", "node", np.Status.NodeName, "images", len(imagesCopy))
-	return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+	return r.reconcileImagePrepullJob(ctx, np, netConfig, images)
 }
 
 // markNodeProvisionReady re-fetches np and stamps it as Ready.
@@ -1227,13 +1140,13 @@ func (r *NodeProvisionReconciler) markNodeProvisionReady(ctx context.Context, np
 	return ctrl.Result{}, r.Status().Update(ctx, np)
 }
 
-// reconcileAWSImagePrepullJob manages a Kubernetes Job that pre-pulls images
-// by mounting crictl and the CRI socket from the host — no SSH required.
-func (r *NodeProvisionReconciler) reconcileAWSImagePrepullJob(
+// reconcileImagePrepullJob manages a Kubernetes Job that pre-pulls images by
+// mounting crictl and the CRI socket from the host node — works for all providers.
+func (r *NodeProvisionReconciler) reconcileImagePrepullJob(
 	ctx context.Context,
 	np *mlv1alpha1.NodeProvision,
 	netConfig *mlv1alpha1.NodeProvisionNetConfig,
-	images []string,
+	images []mlv1alpha1.ImagePrepull,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	jobName := np.Name + "-prepull"
@@ -1245,7 +1158,7 @@ func (r *NodeProvisionReconciler) reconcileAWSImagePrepullJob(
 	}
 
 	if apierrors.IsNotFound(err) {
-		if createErr := r.createAWSImagePrepullJob(ctx, np, netConfig, images); createErr != nil {
+		if createErr := r.createImagePrepullJob(ctx, np, netConfig, images); createErr != nil {
 			return ctrl.Result{}, fmt.Errorf("creating image pre-pull job: %w", createErr)
 		}
 		log.Info("Created image pre-pull job", "job", jobName, "images", len(images))
@@ -1269,15 +1182,18 @@ func (r *NodeProvisionReconciler) reconcileAWSImagePrepullJob(
 	return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 }
 
-// createAWSImagePrepullJob creates a Job that runs crictl pull for each image
-// on the target node, using the host's crictl binary and CRI socket.
-func (r *NodeProvisionReconciler) createAWSImagePrepullJob(
+// createImagePrepullJob creates a Job that runs crictl pull for each image on
+// the target node, mounting crictl and the CRI socket from the host.
+func (r *NodeProvisionReconciler) createImagePrepullJob(
 	ctx context.Context,
 	np *mlv1alpha1.NodeProvision,
 	netConfig *mlv1alpha1.NodeProvisionNetConfig,
-	images []string,
+	images []mlv1alpha1.ImagePrepull,
 ) error {
-	// Determine which registry secret to project into the Job env.
+	// Resolve which secret to project into the Job env.
+	// For AWS: the controller maintains a copy (<name>-registry-creds) that
+	// survives if the user deletes the original — prefer it.
+	// For all providers: fall back to the original secret name.
 	var registrySecretName string
 	if ref := netConfig.Spec.SoftwareConfig.ImagePullSecretRef; ref != nil {
 		copyName := np.Name + registryCredsSuffix
@@ -1376,7 +1292,7 @@ func (r *NodeProvisionReconciler) createAWSImagePrepullJob(
 }
 
 // buildPrepullScript returns a bash script that pulls each image via crictl.
-func buildPrepullScript(images []string) string {
+func buildPrepullScript(images []mlv1alpha1.ImagePrepull) string {
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
 	b.WriteString("CRICTL=/usr/local/bin/crictl\n")
@@ -1386,8 +1302,8 @@ func buildPrepullScript(images []string) string {
 	b.WriteString("else\n")
 	b.WriteString("  CREDS=\"\"\n")
 	b.WriteString("fi\n")
-	for _, img := range images {
-		img = strings.TrimSpace(img)
+	for _, ip := range images {
+		img := strings.TrimSpace(ip.Image)
 		if img == "" {
 			continue
 		}

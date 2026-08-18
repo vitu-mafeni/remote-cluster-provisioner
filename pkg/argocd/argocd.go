@@ -30,6 +30,13 @@ spec:
   namespaceResourceWhitelist:
     - group: '*'
       kind: '*'
+  roles:
+    - name: deny-overrides
+      description: Prevent live parameter overrides — all changes must go through git
+      policies:
+        - p, proj:default:deny-overrides, applications, override, default/*, deny
+      groups:
+        - '*'
 `, cluster.Spec.ClusterName)
 
 	applicationYAML := fmt.Sprintf(`
@@ -51,6 +58,7 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: default
+  revisionHistoryLimit: 10
   syncPolicy:
     automated:
       prune: true
@@ -60,6 +68,14 @@ spec:
       - CreateNamespace=true
       - SkipDryRunOnMissingResource=true
       - ApplyOutOfSyncOnly=true
+      - PruneLast=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2
   ignoreDifferences:
     - group: fn.kpt.dev
       kind: ApplyReplacements
