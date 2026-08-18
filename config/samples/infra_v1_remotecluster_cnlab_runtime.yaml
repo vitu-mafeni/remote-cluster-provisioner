@@ -120,7 +120,8 @@ type: Opaque
 stringData:
   id_rsa: |
     -----BEGIN RSA PRIVATE KEY-----
-    CHANGE ME
+    MIIEogIBAAKCAQEA6Kb5qGDJAPDt60rm8JhR4RpzlS9rwaz74ACSjjBRz7uCKvr0
+    jw05oU/cfvEekc7+PjX3O90kAEXAMPLE
     -----END RSA PRIVATE KEY-----
 
 ---
@@ -133,7 +134,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: CHANGEME
+  password: dckr_pat_EXAMPLE
 ---
 # ============================================================
 # RemoteCluster — GPU worker node
