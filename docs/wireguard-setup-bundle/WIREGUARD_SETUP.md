@@ -16,6 +16,9 @@ Run on BOTH server and clients:
 ```bash
 sudo apt update
 sudo apt install wireguard -y
+
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-wireguard-forwarding.conf
+sudo sysctl --system
 ```
 
 ---
