@@ -380,9 +380,9 @@ metadata:
   name: nvidia
 handler: nvidia
 EOF`,
-			"rm -rf /tmp/remote-cluster-provisioner",
-			"git clone https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
-			"kubectl apply -f /tmp/remote-cluster-provisioner/config/crd/bases/",
+			// "rm -rf /tmp/remote-cluster-provisioner",
+			// "git clone https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
+			// "kubectl apply -f /tmp/remote-cluster-provisioner/config/crd/bases/",
 			// Two-pass apply: pass 1 seeds namespaces and CRDs so that pass 2
 			// does not hit "namespace not found" for resources applied before their
 			// namespace YAML in alphabetical directory order.

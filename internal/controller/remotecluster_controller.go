@@ -2343,6 +2343,19 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		},
 
 		{
+			name: "remote-cluster-provisioner-variant",
+			upstream: packageRef{
+				pkg:      "remote-cluster-provisioner",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "remote-cluster-provisioner",
+				repo: cluster.Spec.ClusterName,
+			},
+		},
+
+		{
 			name: "prometheus-stack-variant",
 			upstream: packageRef{
 				pkg:      "prometheus-stack",
