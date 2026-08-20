@@ -11,7 +11,7 @@ func Run(client *Client, cmd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer session.Close()
+	defer session.Close() //nolint:errcheck
 
 	session.Stdin = strings.NewReader(cmd)
 	output, err := session.CombinedOutput("bash -s")

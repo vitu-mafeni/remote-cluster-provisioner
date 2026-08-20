@@ -15,6 +15,11 @@ rules:
     resources: [secrets]
     verbs: [get, list, watch, create, update, patch]
 
+  # Batch: jobs — NodeProvision controller creates/deletes image pre-pull Jobs
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, delete]
+
   # Custom: RemoteCluster (infra.dcn.ssu.ac.kr/v1)
   - apiGroups: [infra.dcn.ssu.ac.kr]
     resources: [remoteclusters]
