@@ -361,7 +361,7 @@ func (r *NodeProvisionReconciler) reconcileProvisioning(
 
 	case mlv1alpha1.CloudProviderAzure:
 		log.Info("Azure provisioning not yet implemented")
-		return ctrl.Result{}, fmt.Errorf("Azure provider not yet implemented")
+		return ctrl.Result{}, fmt.Errorf("azure provider not yet implemented")
 
 	default:
 		return ctrl.Result{}, fmt.Errorf("unsupported cloud provider: %s", np.Spec.Provider)
@@ -447,7 +447,7 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("connecting to VPN server: %w", err)
 	}
-	defer vpnServerClient.Conn.Close()
+	defer vpnServerClient.Conn.Close() //nolint:errcheck
 
 	// ── Launch EC2 instance with cloud-init ─────────────────────────────────
 	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseCreatingInstance, "Creating EC2 instance", 25)
@@ -799,8 +799,8 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseBootstrapping, "Installing packages and joining cluster (background)", 25)
 	if err := r.Status().Update(ctx, np); err != nil {
 		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
-			sshClient.Conn.Close()
-			vpnServerClient.Conn.Close()
+			sshClient.Conn.Close()        //nolint:errcheck
+			vpnServerClient.Conn.Close()  //nolint:errcheck
 			return ctrl.Result{}, ferr
 		}
 	}
@@ -809,8 +809,8 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	// within the reconcile context (which has a proper timeout and client).
 	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, netConfig.Spec.SoftwareConfig, netConfig.Namespace)
 	if err != nil {
-		sshClient.Conn.Close()
-		vpnServerClient.Conn.Close()
+		sshClient.Conn.Close()       //nolint:errcheck
+		vpnServerClient.Conn.Close() //nolint:errcheck
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving cnlab-runtime config: %v", err))
 	}
 
@@ -1113,7 +1113,7 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 	}
 	// Filter images by node target: GPU nodes pull "gpu" and "all"; CPU nodes pull "all" only.
 	hwType := strings.ToLower(np.Spec.HardwareType)
-	var images []mlv1alpha1.ImagePrepull
+	images := make([]mlv1alpha1.ImagePrepull, 0, len(netConfig.Spec.SoftwareConfig.ImagePrepulls))
 	for _, ip := range netConfig.Spec.SoftwareConfig.ImagePrepulls {
 		if ip.NodeTarget == "gpu" && hwType != "gpu" {
 			continue
@@ -1382,7 +1382,7 @@ func (r *NodeProvisionReconciler) getSSHClientPostJoin(ctx context.Context, np *
 // handleDelete – deprovisions and removes the finalizer
 // ────────────────────────────────────────────────────────────────────────────
 
-func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alpha1.NodeProvision) (ctrl.Result, error) {
+func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alpha1.NodeProvision) (ctrl.Result, error) { //nolint:unparam
 	log := logf.FromContext(ctx)
 
 	// Guard: if our finalizer is already gone a previous reconcile completed
@@ -1587,7 +1587,7 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 	if err != nil {
 		return fmt.Errorf("connecting to VPN server for peer removal: %w", err)
 	}
-	defer vpnClient.Conn.Close()
+	defer vpnClient.Conn.Close() //nolint:errcheck
 
 	// ── 3. Fallback: look up public key from live server when CR has no record ─
 	if peerPublicKey == "" && vpnIP != "" {
@@ -1718,7 +1718,7 @@ const joinTokenMaxAge = 20 * time.Hour
 // If the bootstrap token is absent or older than joinTokenMaxAge, the controller
 // creates a new one directly via the Kubernetes API — no SSH or external
 // dependency required.
-func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1alpha1.NodeProvision) (*mlv1alpha1.NodeProvisionNetConfig, error) {
+func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, _ *mlv1alpha1.NodeProvision) (*mlv1alpha1.NodeProvisionNetConfig, error) {
 	log := logf.FromContext(ctx)
 	netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
 	if err := r.List(ctx, netConfigList); err != nil {

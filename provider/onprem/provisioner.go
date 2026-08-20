@@ -651,7 +651,7 @@ func buildClientWGConfig(
 	if portErr == nil {
 		if p := strings.TrimSpace(portOut); p != "" && p != "(none)" {
 			vpnPort = 0
-			fmt.Sscanf(p, "%d", &vpnPort)
+			_, _ = fmt.Sscanf(p, "%d", &vpnPort)
 		}
 	}
 	if vpnPort == 0 {

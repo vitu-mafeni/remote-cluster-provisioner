@@ -23,7 +23,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,7 +48,6 @@ import (
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
-	"dcn.ssu.ac.kr/infra/pkg/ssh"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
 
@@ -146,11 +144,6 @@ const (
 
 	// sshOperationTimeout caps total time spent on SSH-heavy provisioning steps.
 	sshOperationTimeout = 30 * time.Minute
-
-	// postRebootWait is how long to wait after issuing a reboot before attempting
-	// to SSH back into the node.  Kernel + driver initialisation typically takes
-	// 60–90 s; 3 minutes gives comfortable headroom.
-	postRebootWait = 3 * time.Minute
 
 	// controlPlanePollInterval is how often the controller polls the background
 	// control-plane init goroutine.  kubeadm init + CNI setup typically takes
@@ -383,7 +376,7 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 
 		runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
 		if err != nil {
-			sshClient.Conn.Close()
+			sshClient.Conn.Close() //nolint:errcheck
 			return r.fail(ctx, cluster, "RuntimeConfigError",
 				fmt.Errorf("resolving cnlab-runtime config: %w", err))
 		}
@@ -392,7 +385,7 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 		r.controlPlaneJobs.Store(key, (<-chan controlPlaneJobResult)(ch))
 
 		go func() {
-			defer sshClient.Conn.Close()
+			defer sshClient.Conn.Close() //nolint:errcheck
 			joinCommand, err := kubeadm.InitializeControlPlane(sshClient, clusterCopy, startPhase, func(phaseIdx int) {
 				r.controlPlaneProgress.Store(key, phaseIdx)
 			}, runtimeCfg)
@@ -510,7 +503,7 @@ func (r *RemoteClusterReconciler) reconcilePackageVariants(ctx context.Context, 
 func (r *RemoteClusterReconciler) reconcileWorker(
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
-	sshClient *ssh.Client,
+	sshClient *sshhelper.Client,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx).WithValues("cluster", cluster.Name, "clusterName", cluster.Spec.ClusterName)
 	clusterParent, err := r.findControlPlane(ctx, cluster)
@@ -628,7 +621,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	// DaemonSets are already deployed on the CP; labels make the pods schedule.
 	if clusterParent != nil {
 		if sshClientCP, cpSSHErr := r.getSSHClient(ctx, clusterParent); cpSSHErr == nil {
-			defer sshClientCP.Conn.Close()
+			defer sshClientCP.Conn.Close() //nolint:errcheck
 			hwLabel := "cpu"
 			if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 				hwLabel = "gpu"
@@ -641,7 +634,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 						nodeName = h
 					}
 				}
-				workerSSH.Conn.Close()
+				workerSSH.Conn.Close() //nolint:errcheck
 			}
 			labelCmd := fmt.Sprintf(
 				"kubectl label node %s infra.dcn.ssu.ac.kr/worker=true infra.dcn.ssu.ac.kr/hardware-type=%s --overwrite",
@@ -670,7 +663,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 // (done by reconcileWorker after join) for the pods to schedule.
 func deployPrepullDaemonSets(
 	ctx context.Context,
-	cpSSH *ssh.Client,
+	cpSSH *sshhelper.Client,
 	clusterName string,
 	imagePrepulls []infrav1.ImagePrepull,
 	registrySecretName string,
@@ -788,11 +781,11 @@ func rcBuildDaemonSetPrepullScript(images []string) string {
 	return b.String()
 }
 
-func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig(
+func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig( //nolint:unparam
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
 	clusterParent *infrav1.RemoteCluster,
-	sshClient *ssh.Client,
+	sshClient *sshhelper.Client,
 	nodeIP,
 	action string,
 ) (ctrl.Result, error) {
@@ -1177,7 +1170,7 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 // and patches the NodeProvisionNetConfig status kubeconfig field.  The timer
 // fires every 30 days so certs are renewed well before the 1-year expiry.
 // Once installed it operates entirely locally — no management-cluster contact.
-func (r *RemoteClusterReconciler) deployKubeconfigRefreshTimer(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *ssh.Client) error {
+func (r *RemoteClusterReconciler) deployKubeconfigRefreshTimer(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *sshhelper.Client) error {
 	log := logf.FromContext(ctx)
 
 	clusterName := cluster.Spec.ClusterName
@@ -1268,7 +1261,7 @@ echo "kubeconfig-refresh timer enabled"
 // via SSH.  The timestamp lets the NodeProvision controller verify that the
 // embedded bootstrap token is still within its 24-hour lifetime before
 // launching a new EC2 instance.
-func (r *RemoteClusterReconciler) patchRemoteNetConfigJoinCmd(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *ssh.Client, joinCmd string) error {
+func (r *RemoteClusterReconciler) patchRemoteNetConfigJoinCmd(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *sshhelper.Client, joinCmd string) error {
 	log := logf.FromContext(ctx)
 	joinCmdJSON, _ := json.Marshal(joinCmd)
 	nowJSON, _ := json.Marshal(time.Now().UTC().Format(time.RFC3339))
@@ -1292,7 +1285,7 @@ func (r *RemoteClusterReconciler) patchRemoteNetConfigJoinCmd(ctx context.Contex
 // control-plane node and patches the kubeconfig status field.  Called both
 // during initial setup and during token refresh so the stored kubeconfig
 // stays current when the management cluster is connected.
-func (r *RemoteClusterReconciler) patchRemoteNetConfigKubeconfig(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *ssh.Client) error {
+func (r *RemoteClusterReconciler) patchRemoteNetConfigKubeconfig(ctx context.Context, cluster *infrav1.RemoteCluster, sshClient *sshhelper.Client) error {
 	log := logf.FromContext(ctx)
 	// Use sudo cat to read the root-owned admin.conf (mode 600).
 	// Guard with [ -n ] so kubectl never runs with an empty variable.
@@ -1370,7 +1363,7 @@ func (r *RemoteClusterReconciler) completeControlPlane(
 		return r.fail(ctx, cluster, "SSHConnectionFailed",
 			fmt.Errorf("post-init SSH connection to %s: %w", cluster.Spec.Host, err))
 	}
-	defer sshClient.Conn.Close()
+	defer sshClient.Conn.Close() //nolint:errcheck
 
 	if err := r.createClusterRepo(ctx, cluster); err != nil {
 		return r.fail(ctx, cluster, "ClusterRepoFailed",
@@ -1487,7 +1480,7 @@ func (r *RemoteClusterReconciler) findControlPlane(ctx context.Context, cluster 
 // credential secret.  This prevents the secret from being deleted while the
 // RemoteCluster exists, ensuring the controller can always SSH to the node
 // during deletion cleanup.
-func (r *RemoteClusterReconciler) ensureAuthSecretFinalizer(ctx context.Context, cluster *infrav1.RemoteCluster, secret *corev1.Secret) error {
+func (r *RemoteClusterReconciler) ensureAuthSecretFinalizer(ctx context.Context, _ *infrav1.RemoteCluster, secret *corev1.Secret) error {
 	if controllerutil.ContainsFinalizer(secret, authSecretFinalizer) {
 		return nil
 	}
@@ -1542,7 +1535,7 @@ func (r *RemoteClusterReconciler) getVPNSecret(ctx context.Context, cluster *inf
 
 // ensureVPNSecretFinalizer adds vpnSecretFinalizer to the VPN SSH credential
 // secret so it cannot be deleted while the RemoteCluster exists.
-func (r *RemoteClusterReconciler) ensureVPNSecretFinalizer(ctx context.Context, cluster *infrav1.RemoteCluster, secret *corev1.Secret) error {
+func (r *RemoteClusterReconciler) ensureVPNSecretFinalizer(ctx context.Context, _ *infrav1.RemoteCluster, secret *corev1.Secret) error {
 	if controllerutil.ContainsFinalizer(secret, vpnSecretFinalizer) {
 		return nil
 	}
@@ -1661,7 +1654,7 @@ func secretDataEqual(a, b map[string][]byte) bool {
 	return true
 }
 
-func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *infrav1.RemoteCluster) (*ssh.Client, error) {
+func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *infrav1.RemoteCluster) (*sshhelper.Client, error) {
 	var secretRef *infrav1.SecretKeyReference
 	if cluster.Spec.Auth.SSHPrivateKeySecretRef != nil {
 		secretRef = cluster.Spec.Auth.SSHPrivateKeySecretRef
@@ -1709,19 +1702,16 @@ func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *inf
 		host = cluster.Spec.Host
 	}
 
-	// VPNConfig is a struct (not a pointer) in the API; compare against its zero value.
-	if !reflect.DeepEqual(cluster.Spec.VPNConfig, infrav1.VPNConfig{}) {
-		// TODO: implement VPN-aware SSH connectivity (e.g., start tunnel) when needed.
-	}
+	// VPN-aware SSH tunnelling is not yet implemented; skip if VPNConfig is set.
 
 	credential := string(credentialBytes)
-	var sshClient *ssh.Client
+	var sshClient *sshhelper.Client
 	var err error
 	port := parsePort(cluster.Spec.Port, 22)
 	if strings.HasPrefix(strings.TrimSpace(credential), "-----BEGIN") {
-		sshClient, err = ssh.ConnectWithPrivateKey(host, port, cluster.Spec.User, credential)
+		sshClient, err = sshhelper.ConnectWithPrivateKey(host, port, cluster.Spec.User, credential)
 	} else {
-		sshClient, err = ssh.Connect(host, port, cluster.Spec.User, credential)
+		sshClient, err = sshhelper.Connect(host, port, cluster.Spec.User, credential)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("SSH connect to %s:%d: %w", host, port, err)
@@ -1895,7 +1885,7 @@ func (r *RemoteClusterReconciler) ensureNephioToken(
 	return r.Create(ctx, obj)
 }
 
-func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *infrav1.RemoteCluster) (ctrl.Result, error) {
+func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *infrav1.RemoteCluster) (ctrl.Result, error) { //nolint:unparam
 	log := logf.FromContext(ctx)
 	log.Info("Deprovisioning RemoteCluster", "name", cluster.Name, "nodeType", cluster.Spec.NodeInfo.NodeType)
 
@@ -1977,7 +1967,7 @@ func (r *RemoteClusterReconciler) drainWorkerFromCP(ctx context.Context, cluster
 				nodeName = h
 			}
 		}
-		nodeClient.Conn.Close()
+		nodeClient.Conn.Close() //nolint:errcheck
 	}
 
 	cp, err := r.findControlPlane(ctx, cluster)
@@ -1990,7 +1980,7 @@ func (r *RemoteClusterReconciler) drainWorkerFromCP(ctx context.Context, cluster
 		log.Error(err, "Cannot SSH to control-plane for drain (continuing without drain)")
 		return
 	}
-	defer cpClient.Conn.Close()
+	defer cpClient.Conn.Close() //nolint:errcheck
 
 	log.Info("Draining worker from control-plane", "nodeName", nodeName)
 	drainCmd := fmt.Sprintf(
@@ -2016,7 +2006,7 @@ func (r *RemoteClusterReconciler) resetNodeViaSSH(ctx context.Context, cluster *
 	if err != nil {
 		return fmt.Errorf("SSH connect for node reset: %w", err)
 	}
-	defer sshClient.Conn.Close()
+	defer sshClient.Conn.Close() //nolint:errcheck
 
 	log.Info("Resetting node via SSH", "host", cluster.Spec.Host)
 
@@ -2154,17 +2144,17 @@ func (r *RemoteClusterReconciler) removeVPNPeer(ctx context.Context, cluster *in
 		vpnUser = "ubuntu"
 	}
 
-	var vpnClient *ssh.Client
+	var vpnClient *sshhelper.Client
 	var err error
 	if strings.HasPrefix(cred, "-----BEGIN") {
-		vpnClient, err = ssh.ConnectWithPrivateKey(vpnHost, vpnPort, vpnUser, cred)
+		vpnClient, err = sshhelper.ConnectWithPrivateKey(vpnHost, vpnPort, vpnUser, cred)
 	} else {
-		vpnClient, err = ssh.Connect(vpnHost, vpnPort, vpnUser, cred)
+		vpnClient, err = sshhelper.Connect(vpnHost, vpnPort, vpnUser, cred)
 	}
 	if err != nil {
 		return fmt.Errorf("SSH to VPN server %s:%d as %s: %w", vpnHost, vpnPort, vpnUser, err)
 	}
-	defer vpnClient.Conn.Close()
+	defer vpnClient.Conn.Close() //nolint:errcheck
 
 	// Discover the peer's public key from the live WireGuard state.
 	dumpOut, err := sshhelper.Run(vpnClient, "sudo wg show wg0 dump 2>/dev/null || true")
@@ -2585,18 +2575,18 @@ func (r *RemoteClusterReconciler) upsertPackageVariants(ctx context.Context, clu
 		obj.SetLabels(labels)
 		obj.Object["spec"] = spec
 
-		if err := r.Client.Create(ctx, obj); err != nil {
+		if err := r.Create(ctx, obj); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
 				return fmt.Errorf("creating PackageVariant %q: %w", v.name, err)
 			}
 
 			existing := &unstructured.Unstructured{}
 			existing.SetGroupVersionKind(packageVariantGVK)
-			if err := r.Client.Get(ctx, client.ObjectKeyFromObject(obj), existing); err != nil {
+			if err := r.Get(ctx, client.ObjectKeyFromObject(obj), existing); err != nil {
 				return fmt.Errorf("fetching existing PackageVariant %q: %w", v.name, err)
 			}
 			existing.Object["spec"] = spec
-			if err := r.Client.Update(ctx, existing); err != nil {
+			if err := r.Update(ctx, existing); err != nil {
 				return fmt.Errorf("updating PackageVariant %q: %w", v.name, err)
 			}
 		}

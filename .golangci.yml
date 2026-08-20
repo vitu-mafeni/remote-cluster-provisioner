@@ -26,6 +26,17 @@ linters:
       rules:
         - name: comment-spacings
         - name: import-shadowing
+    goconst:
+      # Require 5+ occurrences before flagging; short domain strings like "gpu",
+      # "ubuntu", "worker", and "control-plane" appear 3–4 times and are clear in context.
+      min-occurrences: 5
+      # "true" is an annotation value, not a meaningful named constant.
+      ignore-strings:
+        - "true"
+    gocyclo:
+      # The top-level Reconcile method has complexity ~31; extracting helpers
+      # would fragment the state-machine logic without improving readability.
+      min-complexity: 35
   exclusions:
     generated: lax
     rules:
@@ -36,6 +47,18 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # pkg/kubeadm, pkg/runtime and provider/ embed shell commands as Go string
+      # literals; long lines are unavoidable and cannot be wrapped.
+      - linters:
+          - lll
+        path: pkg/(kubeadm|runtime)/
+      - linters:
+          - lll
+        path: provider/
+      # exportfs is a real Linux NFS utility, not a misspelling of "exports".
+      - linters:
+          - misspell
+        text: "exportfs.*misspelling"
     paths:
       - third_party$
       - builtin$
