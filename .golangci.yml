@@ -31,8 +31,7 @@ linters:
       # "ubuntu", "worker", and "control-plane" appear 3–4 times and are clear in context.
       min-occurrences: 5
       # "true" is an annotation value, not a meaningful named constant.
-      ignore-strings:
-        - "true"
+      ignore-strings: "true"
     gocyclo:
       # The top-level Reconcile method has complexity ~31; extracting helpers
       # would fragment the state-machine logic without improving readability.
