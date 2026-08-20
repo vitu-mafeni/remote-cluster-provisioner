@@ -64,6 +64,10 @@ spec:
           nodeTarget: "gpu"  # gpu or all download on all nodes
         - image: "docker.io/vitu1/kernel-tf-gpu:3.2.3-cu121"
           nodeTarget: "gpu"
+        - image: "docker.io/vitu1/kernel-pytorch-gpu-vscode:3.2.3-cu121"
+          nodeTarget: "gpu"
+        - image: "docker.io/vitu1/kernel-tf-gpu-vscode:3.2.3-cu121"
+          nodeTarget: "gpu"
       imagePullSecretRef:
         name: dockerhub-creds
 
@@ -121,7 +125,10 @@ stringData:
   id_rsa: |
     -----BEGIN RSA PRIVATE KEY-----
     MIIEogIBAAKCAQEA6Kb5qGDJAPDt60rm8JhR4RpzlS9rwaz74ACSjjBRz7uCKvr0
-    jw05oU/cfvEekc7+PjX3O90kAEXAMPLE
+    jw05oU/cfvEekc7+PjX3O90kAe6EhI3m56WWABoxvXrbyII4MyTIkPKcMBENC0L2
+    9JjZAP+Auo8EGriL2Kpz5DmGzqr/9uRMIjH5a87WCBJ3sxNrKW148b+8ZVO052bS
+    W+VAwH26iq0h31TAHZl8R4jxDMkGH1mbaLP5Q156A29NqPYPW4xh0NCfj3Vpzp4S
+    IcfnJv59rFuA8fBYn1XhtKDvIrQKSTI6igizC/H1/9kXph2fFSmHlvpaRU5HVUQxEXAMPLE
     -----END RSA PRIVATE KEY-----
 
 ---
@@ -134,7 +141,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: dckr_pat_EXAMPLE
+  password: dckr_pat_example
 ---
 # ============================================================
 # RemoteCluster — GPU worker node

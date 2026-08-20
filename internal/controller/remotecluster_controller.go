@@ -2262,10 +2262,11 @@ type packageRef struct {
 
 // packageVariantSpec is a typed description of a PackageVariant to create or update.
 type packageVariantSpec struct {
-	name        string
-	upstream    packageRef
-	downstream  packageRef
-	annotations map[string]interface{}
+	name           string
+	upstream       packageRef
+	downstream     packageRef
+	annotations    map[string]interface{}
+	packageContext map[string]string // injected into spec.packageContext.data
 }
 
 func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context, cluster *infrav1.RemoteCluster) error {
@@ -2319,18 +2320,18 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		// 	},
 		// },
 
-		{
-			name: "nfs-provisioner-variant",
-			upstream: packageRef{
-				pkg:      "nfs-provisioner",
-				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-				revision: cluster.Spec.GitConfig.PackageRevision,
-			},
-			downstream: packageRef{
-				pkg:  "nfs-provisioner",
-				repo: cluster.Spec.ClusterName,
-			},
-		},
+		// {
+		// 	name: "nfs-provisioner-variant",
+		// 	upstream: packageRef{
+		// 		pkg:      "nfs-provisioner",
+		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+		// 		revision: cluster.Spec.GitConfig.PackageRevision,
+		// 	},
+		// 	downstream: packageRef{
+		// 		pkg:  "nfs-provisioner",
+		// 		repo: cluster.Spec.ClusterName,
+		// 	},
+		// },
 
 		{
 			name: "remote-cluster-provisioner-variant",
@@ -2342,6 +2343,9 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 			downstream: packageRef{
 				pkg:  "remote-cluster-provisioner",
 				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
 			},
 		},
 
@@ -2451,9 +2455,10 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				pkg:  "jupyter-hub",
 				repo: cluster.Spec.ClusterName,
 			},
-			annotations: map[string]interface{}{
-				"approval.nephio.org/policy": "initial",
-			},
+			// annotations: map[string]interface{}{
+			// 	"approval.nephio.org/policy": "initial",
+			// },
+
 		},
 
 		{
@@ -2536,6 +2541,34 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 			},
 		},
 
+		{
+			name: "ml-system-variant",
+			upstream: packageRef{
+				pkg:      "ml-system",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "ml-system",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+			packageContext: func() map[string]string {
+				m := make(map[string]string, len(cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables))
+				for _, pv := range cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables {
+					m[pv.Key] = pv.Value
+				}
+				m["GRAFANA_URL"] = "http://prometheus-grafana.monitoring.svc.cluster.local:80"
+				m["CHECKPOINT_API_URL"] = "http://checkpoint-apiserver.stateful-migration.svc.cluster.local:8090"
+				m["HARBOR_BASE_URL"] = "http://harbor.harbor.svc.cluster.local:80"
+				m["NEXT_PUBLIC_QUOTA_API"] = cluster.Spec.Host + ":30082"
+				m["NEXT_PUBLIC_KC_URL"] = cluster.Spec.Host + ":30090"
+				return m
+			}(),
+		},
+
 		// Commented-out variants (re-enable as needed):
 		// minio-variant, enterprise-gateway-variant, gpu-operator-variant,
 		// harbor-variant, kai-scheduler-variant, keycloak-variant,
@@ -2566,6 +2599,19 @@ func (r *RemoteClusterReconciler) upsertPackageVariants(ctx context.Context, clu
 		}
 		if len(v.annotations) > 0 {
 			spec["annotations"] = v.annotations
+		}
+		// Build packageContext.data from cluster-level PlatformVariables (baseline),
+		// then overlay any per-variant overrides. Later entries win on duplicate keys.
+		ctxData := make(map[string]interface{},
+			len(cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables)+len(v.packageContext))
+		for _, pv := range cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables {
+			ctxData[pv.Key] = pv.Value
+		}
+		for k, val := range v.packageContext {
+			ctxData[k] = val
+		}
+		if len(ctxData) > 0 {
+			spec["packageContext"] = map[string]interface{}{"data": ctxData}
 		}
 
 		obj := &unstructured.Unstructured{}

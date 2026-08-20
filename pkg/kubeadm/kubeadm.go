@@ -229,8 +229,8 @@ fi`,
 			// with the whole block. Appends to /etc/exports (tee -a) rather than
 			// overwriting it, since the step above already wrote the /srv/nfs/k8s
 			// line to that file.
-			fmt.Sprintf(`sudo mkdir -p %[1]s
-sudo chmod 755 %[1]s
+			fmt.Sprintf(`sudo mkdir -p %[1]s /srv/nfs/k8s
+sudo chmod 755 %[1]s /srv/nfs/k8s
 grep -qxF '%[1]s *(rw,sync,no_subtree_check,no_root_squash)' /etc/exports || \
   echo '%[1]s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
 sudo exportfs -ra`, EGKernelspecsExportPath),
@@ -380,9 +380,9 @@ metadata:
   name: nvidia
 handler: nvidia
 EOF`,
-			// "rm -rf /tmp/remote-cluster-provisioner",
-			// "git clone https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
-			// "kubectl apply -f /tmp/remote-cluster-provisioner/config/crd/bases/",
+			"rm -rf /tmp/remote-cluster-provisioner",
+			"git clone https://github.com/vitu-mafeni/remote-cluster-provisioner.git /tmp/remote-cluster-provisioner",
+			"kubectl apply -f /tmp/remote-cluster-provisioner/config/crd/bases/",
 			// Two-pass apply: pass 1 seeds namespaces and CRDs so that pass 2
 			// does not hit "namespace not found" for resources applied before their
 			// namespace YAML in alphabetical directory order.
@@ -451,6 +451,7 @@ func installNFSProvisioner(client *sshhelper.Client, nfsServerIP string) error {
 	steps := []string{
 		// HelmRelease resources target the storage namespace.
 		"kubectl create namespace storage 2>/dev/null || true",
+		"sudo mkdir -p /srv/nfs/k8s 2>/dev/null || true",
 
 		// Patch every YAML file in the provisioner directory in-place.
 		//
