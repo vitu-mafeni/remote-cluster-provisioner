@@ -75,6 +75,13 @@ type ImagePrepull struct {
 	NodeTarget string `json:"nodeTarget,omitempty"`
 }
 
+// PlatformVariable is a single key/value pair injected into each PackageVariant's
+// spec.packageContext.data, overriding the package's committed defaults.
+type PlatformVariable struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
 type SoftwareConfig struct {
 	// NvidiaDriverVersion           string   `json:"nvidiaDriverVersion,omitempty"`
 	// NvidiaContainerToolkitVersion string   `json:"nvidiaContainerToolkitVersion,omitempty"`
@@ -92,6 +99,12 @@ type SoftwareConfig struct {
 	// All fields are optional; defaults apply when omitted.
 	// +optional
 	CnlabRuntime *CnlabRuntimeConfig `json:"cnlabRuntime,omitempty"`
+
+	// PlatformVariables holds cluster-specific key/value pairs injected into
+	// every PackageVariant's spec.packageContext.data.  Each key overrides the
+	// corresponding default in the package's committed package-context.yaml.
+	// +optional
+	PlatformVariables []PlatformVariable `json:"platformVariables,omitempty"`
 }
 
 // CnlabRuntimeConfig defines how to obtain the prebuilt cnlab-runtime OCI artifact.

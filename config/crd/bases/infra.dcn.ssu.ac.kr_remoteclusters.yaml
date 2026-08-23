@@ -177,6 +177,25 @@ spec:
                           NvidiaContainerToolkitVersion string   `json:"nvidiaContainerToolkitVersion,omitempty"`
                           K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
                         type: string
+                      platformVariables:
+                        description: |-
+                          PlatformVariables holds cluster-specific key/value pairs injected into
+                          every PackageVariant's spec.packageContext.data.  Each key overrides the
+                          corresponding default in the package's committed package-context.yaml.
+                        items:
+                          description: |-
+                            PlatformVariable is a single key/value pair injected into each PackageVariant's
+                            spec.packageContext.data, overriding the package's committed defaults.
+                          properties:
+                            key:
+                              type: string
+                            value:
+                              type: string
+                          required:
+                          - key
+                          - value
+                          type: object
+                        type: array
                     type: object
                 required:
                 - hardwareType

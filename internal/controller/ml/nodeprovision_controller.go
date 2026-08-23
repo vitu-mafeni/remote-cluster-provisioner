@@ -799,8 +799,8 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseBootstrapping, "Installing packages and joining cluster (background)", 25)
 	if err := r.Status().Update(ctx, np); err != nil {
 		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
-			sshClient.Conn.Close()        //nolint:errcheck
-			vpnServerClient.Conn.Close()  //nolint:errcheck
+			sshClient.Conn.Close()       //nolint:errcheck
+			vpnServerClient.Conn.Close() //nolint:errcheck
 			return ctrl.Result{}, ferr
 		}
 	}
