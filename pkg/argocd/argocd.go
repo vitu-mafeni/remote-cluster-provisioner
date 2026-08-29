@@ -89,6 +89,11 @@ spec:
 	)
 
 	commands := []string{
+		// Patch argocd-cm: set reconciliation interval so ArgoCD detects drift
+		// every 60 s and immediately applies changes (automated sync below).
+		`kubectl patch configmap argocd-cm -n argocd --type merge \
+  -p '{"data":{"timeout.reconciliation":"60s"}}'`,
+
 		// Apply AppProject
 		fmt.Sprintf("cat <<EOF | kubectl apply -f -\n%s\nEOF", appProjectYAML),
 
