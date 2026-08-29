@@ -4,29 +4,37 @@ ARG TARGETOS
 ARG TARGETARCH
 
 WORKDIR /workspace
-# Copy the Go Modules manifests
+
+# Download dependencies before copying source so that source changes
+# don't invalidate the cached dependency layer.
 COPY go.mod go.mod
 COPY go.sum go.sum
-# cache deps before building and copying source so that we don't need to re-download as much
-# and so that source changes don't invalidate our downloaded layer
 RUN go mod download
 
-# Copy the go source
+# Install garble for binary obfuscation.
+# Pin to a specific version for reproducible builds.
+RUN go install mvdan.cc/garble@v0.13.0
+
+# Copy source last so the garble install layer is cached.
 COPY cmd/main.go cmd/main.go
 COPY api/ api/
 COPY internal/ internal/
 COPY pkg/ pkg/
 COPY provider/ provider/
 
-# Build
-# the GOARCH has no default value to allow the binary to be built according to the host where the command
-# was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
-# the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
-# by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+# garble -literals  : obfuscate string literals (not just symbol names)
+# garble -tiny      : remove extra build metadata (timestamps, Go version, etc.)
+# -trimpath         : strip all local filesystem paths from the binary
+# -ldflags="-s -w"  : strip the symbol table and DWARF debug info
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    garble -literals -tiny build \
+      -trimpath \
+      -ldflags="-s -w" \
+      -o manager \
+      ./cmd/main.go
 
-# Use distroless as minimal base image to package the manager binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
+# Use distroless as minimal base image — no shell, no package manager,
+# nothing an attacker can pivot from even if the binary is compromised.
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/manager .
