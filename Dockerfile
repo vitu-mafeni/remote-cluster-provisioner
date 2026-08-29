@@ -13,7 +13,7 @@ RUN go mod download
 
 # Install garble for binary obfuscation.
 # Pin to a specific version for reproducible builds.
-RUN go install mvdan.cc/garble@v0.13.0
+RUN go install mvdan.cc/garble@latest
 
 # Copy source last so the garble install layer is cached.
 COPY cmd/main.go cmd/main.go
