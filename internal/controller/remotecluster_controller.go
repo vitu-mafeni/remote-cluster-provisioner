@@ -2509,7 +2509,7 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 					"JUPYTERHUB_PUBLIC_URL":                 "http://" + cluster.Spec.Host + ":30080",
 					"NEXT_PUBLIC_KC_URL":                    "http://" + cluster.Spec.Host + ":30090",
 					"NEXT_PUBLIC_QUOTA_API":                 "http://" + cluster.Spec.Host + ":30082",
-					"NEXT_PUBLIC_ADMIN_EXTERNAL_MONITORING": "http://" + cluster.Spec.Host + ":30802/dashboards",
+					"NEXT_PUBLIC_ADMIN_EXTERNAL_MONITORING": "http://" + cluster.Spec.Host + ":30802/",
 
 					"EG_KERNELSPECS_NFS_SERVER": cluster.Spec.Host,
 
