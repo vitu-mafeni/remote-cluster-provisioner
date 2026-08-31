@@ -2474,6 +2474,22 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 		},
 
 		{
+			name: "gpu-monitoring-variant",
+			upstream: packageRef{
+				pkg:      "ml-platform/gpu-monitoring",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "gpu-monitoring",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
+
+		{
 			name: "ml-system-variant",
 			upstream: packageRef{
 				pkg:      "ml-platform/ml-system",
@@ -2490,9 +2506,11 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 			setters: func() map[string]string {
 				m := map[string]string{
 					// Network locations derived from the cluster host.
-					"JUPYTERHUB_PUBLIC_URL":     "http://" + cluster.Spec.Host + ":30080",
-					"NEXT_PUBLIC_KC_URL":        "http://" + cluster.Spec.Host + ":30090",
-					"NEXT_PUBLIC_QUOTA_API":     "http://" + cluster.Spec.Host + ":30082",
+					"JUPYTERHUB_PUBLIC_URL":                 "http://" + cluster.Spec.Host + ":30080",
+					"NEXT_PUBLIC_KC_URL":                    "http://" + cluster.Spec.Host + ":30090",
+					"NEXT_PUBLIC_QUOTA_API":                 "http://" + cluster.Spec.Host + ":30082",
+					"NEXT_PUBLIC_ADMIN_EXTERNAL_MONITORING": "http://" + cluster.Spec.Host + ":30802/dashboards",
+
 					"EG_KERNELSPECS_NFS_SERVER": cluster.Spec.Host,
 
 					// In-cluster service defaults — override via PlatformVariables
