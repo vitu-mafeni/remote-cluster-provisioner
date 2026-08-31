@@ -393,7 +393,7 @@ EOF`,
 			// ClusterIssuer creation does not fail with "connection refused".
 			`kubectl -n cert-manager wait --for=condition=Available deployment/cert-manager-webhook --timeout=180s 2>/dev/null || true`,
 			`sleep 3`,
-			`kubectl apply -f /tmp/catalog/workloads/ml-platform/harbor/`,
+			// `kubectl apply -f /tmp/catalog/workloads/ml-platform/harbor/`,
 			// Pass 2: real apply. Capture output, print it, then fail only on
 			// actual server errors. Client-side "no matches for kind" errors for
 			// GCP-specific types (ApplyReplacements, RootSync, etc.) are expected

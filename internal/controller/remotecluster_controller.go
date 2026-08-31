@@ -573,6 +573,22 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			return r.fail(ctx, cluster, "RuntimeConfigError",
 				fmt.Errorf("resolving cnlab-runtime config: %w", rErr))
 		}
+		// If the worker CR has no registry credentials, inherit them from the
+		// control-plane CR. This avoids repeating credentialsRef on every worker.
+		if workerRuntimeCfg.Token == "" && clusterParent != nil {
+			parentCfg, pErr := r.resolveCnlabRuntimeConfig(ctx, clusterParent.Spec.NodeInfo.SoftwareConfig, clusterParent.Namespace)
+			if pErr != nil {
+				return r.fail(ctx, cluster, "RuntimeConfigError",
+					fmt.Errorf("resolving cnlab-runtime config from control-plane: %w", pErr))
+			}
+			workerRuntimeCfg.Username = parentCfg.Username
+			workerRuntimeCfg.Token = parentCfg.Token
+			// Inherit registry/repo/version from parent only when the worker
+			// has no cnlabRuntime block at all.
+			if cluster.Spec.NodeInfo.SoftwareConfig.CnlabRuntime == nil {
+				workerRuntimeCfg = parentCfg
+			}
+		}
 
 		err, nodeIP := kubeadm.JoinWorkerNode(
 			sshClient,
@@ -2263,11 +2279,15 @@ type packageRef struct {
 
 // packageVariantSpec is a typed description of a PackageVariant to create or update.
 type packageVariantSpec struct {
-	name           string
-	upstream       packageRef
-	downstream     packageRef
-	annotations    map[string]interface{}
-	packageContext map[string]string // injected into spec.packageContext.data
+	name        string
+	upstream    packageRef
+	downstream  packageRef
+	annotations map[string]interface{}
+	// setters is injected as spec.pipeline.mutators[0].configMap so that
+	// apply-setters processes every `# kpt-set: ${KEY}` comment in the package.
+	// Do NOT use spec.packageContext.data — that only writes into kpt's internal
+	// package-context.yaml and never reaches apply-setters.
+	setters map[string]string
 }
 
 func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context, cluster *infrav1.RemoteCluster) error {
@@ -2278,7 +2298,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "remote-cluster-provisioner-variant",
 			upstream: packageRef{
-				pkg:      "remote-cluster-provisioner",
+				pkg:      "ml-platform/remote-cluster-provisioner",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2292,9 +2312,25 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		},
 
 		{
+			name: "harbor-variant",
+			upstream: packageRef{
+				pkg:      "ml-platform/harbor",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "harbor",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
+
+		{
 			name: "prometheus-stack-variant",
 			upstream: packageRef{
-				pkg:      "prometheus-stack",
+				pkg:      "ml-platform/prometheus-stack",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2310,7 +2346,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "keycloak-variant",
 			upstream: packageRef{
-				pkg:      "keycloak",
+				pkg:      "ml-platform/keycloak",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2326,7 +2362,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "hami-variant",
 			upstream: packageRef{
-				pkg:      "hami",
+				pkg:      "ml-platform/hami",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2342,7 +2378,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "stateful-migration-variant",
 			upstream: packageRef{
-				pkg:      "stateful-migration",
+				pkg:      "ml-platform/stateful-migration",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2358,7 +2394,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "enterprise-gateway-variant",
 			upstream: packageRef{
-				pkg:      "enterprise-gateway",
+				pkg:      "ml-platform/enterprise-gateway",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2374,7 +2410,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "jupyter-hub-variant",
 			upstream: packageRef{
-				pkg:      "jupyter-hub",
+				pkg:      "ml-platform/jupyter-hub",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2391,7 +2427,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "gpu-operator-variant",
 			upstream: packageRef{
-				pkg:      "gpu-operator",
+				pkg:      "ml-platform/gpu-operator",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2421,41 +2457,10 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 	// No active variants; pending re-enablement:
 	// platform-overlays-variant, post-install-config-variant
 	variantsOverlays := []packageVariantSpec{
-		// {
-		// 	name: "k8s-dra-driver-gpu-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "k8s-dra-driver-gpu",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "k8s-dra-driver-gpu",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-		// {
-		// 	name: "gpu-operator-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "gpu-operator",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "gpu-operator",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-
 		{
 			name: "services-overlays-variant",
 			upstream: packageRef{
-				pkg:      "services-overlays",
+				pkg:      "ml-platform/services-overlays",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2469,20 +2474,20 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 		},
 
 		{
-			name: "ml-platform-deploy",
+			name: "ml-system-variant",
 			upstream: packageRef{
-				pkg:      "deploy/k8s",
+				pkg:      "ml-platform/ml-system",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
 			downstream: packageRef{
-				pkg:  "ml-platform-deploy",
-				repo: "ml-cluster-deploy",
+				pkg:  "ml-system",
+				repo: cluster.Spec.ClusterName,
 			},
 			annotations: map[string]interface{}{
 				"approval.nephio.org/policy": "initial",
 			},
-			packageContext: func() map[string]string {
+			setters: func() map[string]string {
 				m := map[string]string{
 					// Network locations derived from the cluster host.
 					"JUPYTERHUB_PUBLIC_URL":     "http://" + cluster.Spec.Host + ":30080",
@@ -2571,18 +2576,23 @@ func (r *RemoteClusterReconciler) upsertPackageVariants(ctx context.Context, clu
 		if len(v.annotations) > 0 {
 			spec["annotations"] = v.annotations
 		}
-		// Build packageContext.data from cluster-level PlatformVariables (baseline),
-		// then overlay any per-variant overrides. Later entries win on duplicate keys.
-		ctxData := make(map[string]interface{},
-			len(cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables)+len(v.packageContext))
-		for _, pv := range cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables {
-			ctxData[pv.Key] = pv.Value
-		}
-		for k, val := range v.packageContext {
-			ctxData[k] = val
-		}
-		if len(ctxData) > 0 {
-			spec["packageContext"] = map[string]interface{}{"data": ctxData}
+		// Inject setters as spec.pipeline.mutators[0].configMap so that
+		// apply-setters resolves every `# kpt-set: ${KEY}` comment in the package.
+		// spec.packageContext.data only writes into kpt's internal package-context.yaml
+		// and never reaches apply-setters — do not use it for setter values.
+		if len(v.setters) > 0 {
+			configMap := make(map[string]interface{}, len(v.setters))
+			for k, val := range v.setters {
+				configMap[k] = val
+			}
+			spec["pipeline"] = map[string]interface{}{
+				"mutators": []interface{}{
+					map[string]interface{}{
+						"image":     "ghcr.io/kptdev/krm-functions-catalog/apply-setters:v0.2.4",
+						"configMap": configMap,
+					},
+				},
+			}
 		}
 
 		obj := &unstructured.Unstructured{}
