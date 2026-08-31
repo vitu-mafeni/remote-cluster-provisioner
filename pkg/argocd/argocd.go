@@ -94,6 +94,16 @@ spec:
 		`kubectl patch configmap argocd-cm -n argocd --type merge \
   -p '{"data":{"timeout.reconciliation":"60s"}}'`,
 
+		// Expose ArgoCD server HTTPS port as NodePort 32210.
+		`kubectl patch svc argocd-server -n argocd --type json \
+  -p '[{"op":"replace","path":"/spec/type","value":"NodePort"},{"op":"add","path":"/spec/ports/1/nodePort","value":32210}]'`,
+
+		// Set admin password to admin123 (bcrypt-hashed on the node at runtime).
+		`python3 -c 'import bcrypt' 2>/dev/null || apt-get install -y -q python3-bcrypt 2>/dev/null
+ARGOCD_PASS=$(python3 -c 'import bcrypt; print(bcrypt.hashpw(b"admin123", bcrypt.gensalt(10)).decode())')
+kubectl -n argocd patch secret argocd-secret \
+  -p "{\"stringData\":{\"admin.password\":\"${ARGOCD_PASS}\",\"admin.passwordMtime\":\"$(date +%FT%T%Z)\"}}"`,
+
 		// Apply AppProject
 		fmt.Sprintf("cat <<EOF | kubectl apply -f -\n%s\nEOF", appProjectYAML),
 

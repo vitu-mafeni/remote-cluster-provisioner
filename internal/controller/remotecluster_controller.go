@@ -2229,6 +2229,7 @@ func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cl
 
 	for _, gvk := range []schema.GroupVersionKind{
 		{Group: "config.porch.kpt.dev", Version: "v1alpha1", Kind: "RepositoryList"},
+		{Group: "infra.nephio.org", Version: "v1alpha1", Kind: "RepositoryList"},
 		{Group: "infra.nephio.org", Version: "v1alpha1", Kind: "TokenList"},
 		{Group: "config.porch.kpt.dev", Version: "v1alpha1", Kind: "PackageVariantList"},
 	} {
@@ -2274,65 +2275,6 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 	log.Info("Creating Platform Core PackageVariants", "remotecluster", cluster.Name)
 
 	variants := []packageVariantSpec{
-		// {
-		// 	name: "k8s-dra-driver-gpu-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "k8s-dra-driver-gpu",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "k8s-dra-driver-gpu",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-		// {
-		// 	name: "gpu-operator-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "gpu-operator",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "gpu-operator",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-		// {
-		// 	name: "longhorn-storage-provisioner-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "longhorn-storage-provisioner",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "longhorn-storage-provisioner",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-
-		// {
-		// 	name: "nfs-provisioner-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "nfs-provisioner",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "nfs-provisioner",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// },
-
 		{
 			name: "remote-cluster-provisioner-variant",
 			upstream: packageRef{
@@ -2396,21 +2338,6 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				"approval.nephio.org/policy": "initial",
 			},
 		},
-		// {
-		// 	name: "hami-webui-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "hami-webui",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "hami-webui",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
 
 		{
 			name: "stateful-migration-variant",
@@ -2542,29 +2469,73 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 		},
 
 		{
-			name: "ml-system-variant",
+			name: "ml-platform-deploy",
 			upstream: packageRef{
-				pkg:      "ml-system",
+				pkg:      "deploy/k8s",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
 			downstream: packageRef{
-				pkg:  "ml-system",
-				repo: cluster.Spec.ClusterName,
+				pkg:  "ml-platform-deploy",
+				repo: "ml-cluster-deploy",
 			},
 			annotations: map[string]interface{}{
 				"approval.nephio.org/policy": "initial",
 			},
 			packageContext: func() map[string]string {
-				m := make(map[string]string, len(cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables))
+				m := map[string]string{
+					// Network locations derived from the cluster host.
+					"JUPYTERHUB_PUBLIC_URL":     "http://" + cluster.Spec.Host + ":30080",
+					"NEXT_PUBLIC_KC_URL":        "http://" + cluster.Spec.Host + ":30090",
+					"NEXT_PUBLIC_QUOTA_API":     "http://" + cluster.Spec.Host + ":30082",
+					"EG_KERNELSPECS_NFS_SERVER": cluster.Spec.Host,
+
+					// In-cluster service defaults — override via PlatformVariables
+					// when monitoring or an external Postgres is used.
+					"GRAFANA_URL":        "http://prometheus-grafana.monitoring.svc.cluster.local:80",
+					"ALERTMANAGER_URL":   "http://alertmanager-operated.monitoring.svc.cluster.local:9093",
+					"PROMETHEUS_URL":     "http://prometheus-operated.monitoring.svc.cluster.local:9090",
+					"HARBOR_BASE_URL":    "http://harbor.harbor.svc.cluster.local:80",
+					"CHECKPOINT_API_URL": "http://checkpoint-apiserver.stateful-migration.svc.cluster.local:8090",
+
+					// External Postgres — empty means use the bundled StatefulSet.
+					"DB_HOST": "",
+					"DB_PORT": "",
+
+					// Storage class for model artifacts / vLLM serving.
+					// Empty means the package's committed default applies.
+					"MODEL_ARTIFACT_STORAGE_CLASS": "",
+
+					// Credentials — no safe default; must be supplied via PlatformVariables.
+					"KEYCLOAK_ADMIN_PASSWORD": "",
+					"JUPYTERHUB_API_TOKEN":    "",
+					"QUOTA_API_TOKEN":         "",
+					"DB_PASSWORD":             "",
+					"CREDENTIAL_KEY":          "",
+					"GHCR_DOCKERCONFIGJSON":   "",
+
+					// Image tags — must match what was built and pushed.
+					"QUOTA_API_IMAGE": "",
+					"FRONTEND_IMAGE":  "",
+
+					// Idle GPU reclamation — empty means use the package's committed
+					// defaults (RECLAMATION_POLICY_SOURCE=db, i.e. admin-UI managed).
+					// Set RECLAMATION_POLICY_SOURCE to "env" via PlatformVariables to
+					// activate env-driven policy; the rest only take effect then.
+					"RECLAMATION_POLICY_SOURCE":    "",
+					"RECLAMATION_ENABLED":          "",
+					"RECLAMATION_GPU_UTIL_PCT":     "",
+					"RECLAMATION_WINDOW_MINUTES":   "",
+					"RECLAMATION_GRACE_MINUTES":    "",
+					"RECLAMATION_WARNING_MINUTES":  "",
+					"RECLAMATION_REQUIRE_CPU_IDLE": "",
+					"RECLAMATION_REQUIRE_GPU_IDLE": "",
+				}
+				// PlatformVariables override any default above, including credentials
+				// and any network location that differs from the computed values.
 				for _, pv := range cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables {
 					m[pv.Key] = pv.Value
 				}
-				m["GRAFANA_URL"] = "http://prometheus-grafana.monitoring.svc.cluster.local:80"
-				m["CHECKPOINT_API_URL"] = "http://checkpoint-apiserver.stateful-migration.svc.cluster.local:8090"
-				m["HARBOR_BASE_URL"] = "http://harbor.harbor.svc.cluster.local:80"
-				m["NEXT_PUBLIC_QUOTA_API"] = cluster.Spec.Host + ":30082"
-				m["NEXT_PUBLIC_KC_URL"] = cluster.Spec.Host + ":30090"
 				return m
 			}(),
 		},

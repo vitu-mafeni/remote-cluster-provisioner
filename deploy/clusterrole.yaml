@@ -10,12 +10,25 @@ rules:
     resources: [nodes]
     verbs: [get, list, watch, patch, update, delete]
 
-  # Core: secrets (kubeconfig, cloud credentials, WireGuard keys)
+  # Core: secrets — kubeconfig, SSH/VPN credentials, registry auth, WireGuard keys.
+  # delete is required for cleanup when a RemoteCluster is removed.
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, list, watch, create, update, patch]
+    verbs: [get, list, watch, create, update, patch, delete]
 
-  # Batch: jobs — NodeProvision controller creates/deletes image pre-pull Jobs
+  # Core: configmaps — read cluster-info from kube-public to build kubeadm
+  # join commands (CA cert hash + API server URL).
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+
+  # Core: events — CRs may live in any namespace; controller-runtime records
+  # events in the object's namespace, so this must be cluster-scoped.
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+
+  # Batch: jobs — NodeProvision controller creates/deletes image pre-pull Jobs.
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [get, list, watch, create, delete]
@@ -42,26 +55,32 @@ rules:
     resources: [nodeprovisions/finalizers, nodeprovisionnetconfigs/finalizers]
     verbs: [update]
 
-  # Core: configmaps — read cluster-info from kube-public to build kubeadm join
-  # commands (CA cert hash + API server URL).
-  - apiGroups: [""]
-    resources: [configmaps]
-    verbs: [get]
-
-  # Core: events — CRs may live in any namespace; controller-runtime records events
-  # in the object's namespace, so this must be cluster-scoped.
-  - apiGroups: [""]
-    resources: [events]
-    verbs: [create, patch]
-
   # Porch / Nephio — only needed when RemoteCluster GitConfig is enabled.
   # Remove these rules if you are not running Porch/Nephio on this cluster.
+
+  # Repository objects — created and watched per RemoteCluster.
   - apiGroups: [config.porch.kpt.dev]
     resources: [repositories]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [porch.kpt.dev]
+
+  # PackageVariant — created and updated to render platform packages.
+  # NOTE: PackageVariant lives under config.porch.kpt.dev, NOT porch.kpt.dev.
+  - apiGroups: [config.porch.kpt.dev]
     resources: [packagevariants]
     verbs: [get, list, watch, create, update, patch, delete]
+
+  # PackageRevision — read to verify Porch has accepted the rendered package.
+  - apiGroups: [porch.kpt.dev]
+    resources: [packagerevisions]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  # Nephio Repository — created alongside the Porch Repository per cluster;
+  # deleted on RemoteCluster removal.
+  - apiGroups: [infra.nephio.org]
+    resources: [repositories]
+    verbs: [get, list, watch, create, update, patch, delete]
+
+  # Token — Nephio token controller issues Git credentials per Repository.
   - apiGroups: [token.nephio.org]
     resources: [tokens]
     verbs: [get, list, watch, create, update, patch, delete]
