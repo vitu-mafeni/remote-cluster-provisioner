@@ -230,6 +230,7 @@ fi`,
 			// overwriting it, since the step above already wrote the /srv/nfs/k8s
 			// line to that file.
 			fmt.Sprintf(`sudo mkdir -p %[1]s /srv/nfs/k8s
+sudo chown 1000:1000 %[1]s
 sudo chmod 755 %[1]s /srv/nfs/k8s
 grep -qxF '%[1]s *(rw,sync,no_subtree_check,no_root_squash)' /etc/exports || \
   echo '%[1]s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports

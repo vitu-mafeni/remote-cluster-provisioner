@@ -16,12 +16,12 @@ limitations under the License.
 */
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
-	"os/exec"
 	"strconv"
 	"strings"
 
@@ -30,6 +30,7 @@ import (
 	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 	corev1 "k8s.io/api/core/v1"
+	"golang.org/x/crypto/curve25519"
 )
 
 // NewInClusterProvisioner provisions an on-premises node by:
@@ -592,32 +593,24 @@ func verifyVPNConnectivity(vpnServerClient *sshhelper.Client, vpnNodeIP string) 
 func GenerateWireGuardKeyPair() (string, string, error) { return generateWireGuardKeyPair() }
 
 func generateWireGuardKeyPair() (string, string, error) {
-
-	privateCmd := exec.Command("wg", "genkey")
-
-	var privateOut bytes.Buffer
-	privateCmd.Stdout = &privateOut
-
-	if err := privateCmd.Run(); err != nil {
+	// WireGuard keys are Curve25519 keys. Generate entirely in Go so the
+	// controller pod does not need the `wg` binary installed.
+	var privRaw [32]byte
+	if _, err := rand.Read(privRaw[:]); err != nil {
 		return "", "", fmt.Errorf("failed generating private key: %w", err)
 	}
+	// Curve25519 clamping (RFC 7748 §5)
+	privRaw[0] &= 248
+	privRaw[31] &= 127
+	privRaw[31] |= 64
 
-	privateKey := strings.TrimSpace(privateOut.String())
-
-	publicCmd := exec.Command(
-		"bash",
-		"-c",
-		fmt.Sprintf("echo '%s' | wg pubkey", privateKey),
-	)
-
-	var publicOut bytes.Buffer
-	publicCmd.Stdout = &publicOut
-
-	if err := publicCmd.Run(); err != nil {
-		return "", "", fmt.Errorf("failed generating public key: %w", err)
+	pubRaw, err := curve25519.X25519(privRaw[:], curve25519.Basepoint)
+	if err != nil {
+		return "", "", fmt.Errorf("failed deriving public key: %w", err)
 	}
 
-	publicKey := strings.TrimSpace(publicOut.String())
+	privateKey := base64.StdEncoding.EncodeToString(privRaw[:])
+	publicKey := base64.StdEncoding.EncodeToString(pubRaw)
 
 	return privateKey, publicKey, nil
 }

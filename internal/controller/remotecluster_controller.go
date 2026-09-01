@@ -2537,6 +2537,14 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 					"CREDENTIAL_KEY":          "",
 					"GHCR_DOCKERCONFIGJSON":   "",
 
+					// Harbor credentials — supply EITHER the admin pair (auto-creates a
+					// scoped robot account once at startup) OR a pre-created robot account.
+					// Leave all four empty to skip Harbor integration at startup.
+					"HARBOR_ADMIN_USERNAME": "",
+					"HARBOR_ADMIN_PASSWORD": "",
+					"HARBOR_USERNAME":       "",
+					"HARBOR_SECRET":         "",
+
 					// Image tags — must match what was built and pushed.
 					"QUOTA_API_IMAGE": "",
 					"FRONTEND_IMAGE":  "",
@@ -2601,7 +2609,9 @@ func (r *RemoteClusterReconciler) upsertPackageVariants(ctx context.Context, clu
 		if len(v.setters) > 0 {
 			configMap := make(map[string]interface{}, len(v.setters))
 			for k, val := range v.setters {
-				configMap[k] = val
+				if val != "" {
+					configMap[k] = val
+				}
 			}
 			spec["pipeline"] = map[string]interface{}{
 				"mutators": []interface{}{

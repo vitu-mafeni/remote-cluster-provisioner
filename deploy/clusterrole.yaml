@@ -16,11 +16,12 @@ rules:
     resources: [secrets]
     verbs: [get, list, watch, create, update, patch, delete]
 
-  # Core: configmaps — read cluster-info from kube-public to build kubeadm
-  # join commands (CA cert hash + API server URL).
+  # Core: configmaps — controller-runtime caches ConfigMaps cluster-wide;
+  # get/list/watch are required at the cluster scope. The controller reads
+  # kube-public/cluster-info to build kubeadm join commands.
   - apiGroups: [""]
     resources: [configmaps]
-    verbs: [get]
+    verbs: [get, list, watch]
 
   # Core: events — CRs may live in any namespace; controller-runtime records
   # events in the object's namespace, so this must be cluster-scoped.
