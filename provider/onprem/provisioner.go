@@ -29,8 +29,8 @@ import (
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
-	corev1 "k8s.io/api/core/v1"
 	"golang.org/x/crypto/curve25519"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // NewInClusterProvisioner provisions an on-premises node by:

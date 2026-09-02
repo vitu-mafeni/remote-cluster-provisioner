@@ -958,7 +958,9 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 		// Still running — surface the current step in status so the user can see progress.
 		step := "bootstrapping node (packages and cluster join in progress)"
 		if v, ok := r.onPremProgress.Load(key); ok {
-			step = v.(string)
+			if s, ok := v.(string); ok {
+				step = s
+			}
 		}
 		msg := fmt.Sprintf("Bootstrapping: %s", step)
 		if np.Status.Message != msg {
@@ -1526,7 +1528,9 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 					// the next reconcile forces a fresh credential resolution, then
 					// retry once now with static-only credentials (session token stripped)
 					// in case the IAM key itself is still valid.
-					r.CredMgr.Evict(secret.Namespace, secret.Name)
+					if r.CredMgr != nil {
+						r.CredMgr.Evict(secret.Namespace, secret.Name)
+					}
 					staticCreds := awsprovision.StaticCredsNoSession(awsprovision.ResolveAWSCredentials(secret))
 					if retryErr := awsprovision.TerminateInstance(ctx, np, staticCreds, np.Status.InstanceID); retryErr != nil {
 						log.Error(retryErr, "EC2 termination failed after static-credential retry — requeuing with delay",
@@ -1944,6 +1948,9 @@ func (r *NodeProvisionReconciler) resolveAWSCreds(
 	region string,
 	secret *corev1.Secret,
 ) (awsprovision.AWSCredentials, error) {
+	if r.CredMgr == nil {
+		return awsprovision.AWSCredentials{}, fmt.Errorf("AWS credential manager not initialized")
+	}
 	return r.CredMgr.Get(ctx, secret.Namespace, secret.Name, region)
 }
 

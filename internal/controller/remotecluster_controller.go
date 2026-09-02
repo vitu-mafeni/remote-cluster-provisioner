@@ -3030,11 +3030,128 @@ func (r *RemoteClusterReconciler) recordCnlabSyncFailure(ctx context.Context, cl
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *RemoteClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.Add(r); err != nil {
+		return fmt.Errorf("registering RemoteClusterReconciler as Runnable: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1.RemoteCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("remotecluster").
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(r)
+}
+
+// Start implements manager.Runnable. On controller startup it performs a
+// best-effort credential + VPN config sync to every Ready control-plane
+// RemoteCluster. Unreachable clusters are logged and skipped — no retry
+// counter is incremented.
+func (r *RemoteClusterReconciler) Start(ctx context.Context) error {
+	log := logf.FromContext(ctx).WithName("startup-sync")
+	log.Info("Running startup sync for all Ready RemoteClusters")
+
+	clusterList := &infrav1.RemoteClusterList{}
+	if err := r.List(ctx, clusterList); err != nil {
+		log.Error(err, "startup sync: failed to list RemoteClusters")
+		return nil
+	}
+
+	for i := range clusterList.Items {
+		cluster := &clusterList.Items[i]
+		if cluster.Status.Phase != phaseReady || cluster.Spec.NodeInfo.NodeType != "control-plane" {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		if err := r.startupSyncCluster(ctx, cluster); err != nil {
+			log.Info("startup sync: cluster not reachable — skipping",
+				"cluster", cluster.Name, "reason", err.Error())
+		} else {
+			log.Info("startup sync: completed", "cluster", cluster.Name)
+		}
+	}
+	return nil
+}
+
+// startupSyncCluster pushes credentials and VPN config to a single remote
+// cluster via SSH. Returns an error if the cluster is unreachable; the caller
+// logs and skips — no status fields or retry counters are touched.
+func (r *RemoteClusterReconciler) startupSyncCluster(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	log := logf.FromContext(ctx).WithName("startup-sync").WithValues("cluster", cluster.Name)
+
+	sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+	defer cancel()
+	sshClient, err := r.getSSHClient(sshCtx, cluster)
+	if err != nil {
+		return fmt.Errorf("SSH: %w", err)
+	}
+	defer func() { _ = sshClient.Conn.Close() }()
+
+	// --- credentials ---
+	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
+	if err == nil && runtimeCfg.Token != "" {
+		cr := cluster.Spec.NodeInfo.SoftwareConfig.CnlabRuntime
+		ns := cluster.Namespace
+		if cr != nil && cr.CredentialsRef.NameSpace != "" {
+			ns = cr.CredentialsRef.NameSpace
+		}
+		secretName := "cnlab-runtime-registry"
+		if cr != nil && cr.CredentialsRef.Name != "" {
+			secretName = cr.CredentialsRef.Name
+		}
+		secretData := fmt.Sprintf("  username: %s\n  token: %s\n",
+			base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Username)),
+			base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Token)),
+		)
+		secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: Opaque
+data:
+%s`, secretName, ns, secretData)
+		secretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", secretYAML)
+		if out, sshErr := sshhelper.Run(sshClient, secretCmd); sshErr != nil {
+			return fmt.Errorf("applying credentials secret: %w\nOutput: %s", sshErr, out)
+		}
+		log.Info("Pushed credentials secret", "secret", secretName)
+
+		// Stamp hash so the normal reconcile path knows credentials are current.
+		h := sha256.Sum256([]byte(runtimeCfg.Username + ":" + runtimeCfg.Token))
+		if patchErr := r.patchAnnotation(ctx, cluster, annotationCnlabCredentialsHash, fmt.Sprintf("%x", h)); patchErr != nil {
+			log.Error(patchErr, "stamping credentials hash annotation (non-fatal)")
+		}
+	}
+
+	// --- VPN config ---
+	vpn := cluster.Spec.VPNConfig
+	if vpn.VPNServerPublicIP == "" {
+		return nil
+	}
+	vpnPort := vpn.VPNServerSSHPort
+	if vpnPort == "" {
+		vpnPort = "22"
+	}
+	vpnPatchCmd := fmt.Sprintf(
+		`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge -p `+
+			`'{"spec":{"vpnServerPublicConfig":{"publicIP":%q,"sshPort":%q,"sshUsername":%q,`+
+			`"vpnSshCredentialsRef":{"name":%q,"namespace":%q,"key":%q}}}}'`,
+		cluster.Spec.ClusterName,
+		cluster.Namespace,
+		vpn.VPNServerPublicIP,
+		vpnPort,
+		vpn.VPNServerSSHUsername,
+		vpn.VPNSSHCredentialsRef.Name,
+		vpn.VPNSSHCredentialsRef.NameSpace,
+		vpn.VPNSSHCredentialsRef.Key,
+	)
+	if out, sshErr := sshhelper.Run(sshClient, vpnPatchCmd); sshErr != nil {
+		return fmt.Errorf("patching NodeProvisionNetConfig VPN config: %w\nOutput: %s", sshErr, out)
+	}
+	log.Info("Pushed VPN config to NodeProvisionNetConfig")
+	return nil
 }
 
 // parsePort converts a string port value to int, returning defaultPort when
