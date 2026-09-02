@@ -170,6 +170,19 @@ type RemoteClusterStatus struct {
 	Phase       string             `json:"phase,omitempty"`
 	Message     string             `json:"message,omitempty"`
 	JoinCommand string             `json:"joinCommand,omitempty"`
+
+	// CnlabSyncRetryCount is the number of consecutive failures pushing
+	// cnlab-runtime credentials to the remote cluster.  When it reaches
+	// maxCnlabSyncRetries the controller stops retrying and surfaces an error
+	// condition; the VPN link to the remote cluster may be down.
+	// +optional
+	CnlabSyncRetryCount int `json:"cnlabSyncRetryCount,omitempty"`
+
+	// ProvisionRetryCount is the number of consecutive provisioning failures.
+	// When it reaches maxProvisionRetries the controller stops retrying and
+	// leaves the resource in Failed phase; manual intervention is required.
+	// +optional
+	ProvisionRetryCount int `json:"provisionRetryCount,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -157,8 +157,21 @@ spec:
               progress:
                 description: Progress is a 0–100 percentage of provisioning completion.
                 type: integer
+              provisionRetryCount:
+                description: |-
+                  ProvisionRetryCount is the number of consecutive provisioning failures.
+                  When it reaches maxProvisionRetries the controller stops retrying and
+                  leaves the resource in Failed phase; manual intervention is required.
+                type: integer
               publicIp:
                 description: PublicIP is the cloud-provider public IP of the instance.
+                type: string
+              runtimeCredentialsHash:
+                description: |-
+                  RuntimeCredentialsHash is the SHA-256 hex digest of the registry
+                  username+token most recently synced to this node via oras login.
+                  The controller re-runs the login whenever this hash differs from the
+                  current secret, ensuring the node stays authorised to pull runtime updates.
                 type: string
               startTime:
                 description: Timestamp when provisioning started.

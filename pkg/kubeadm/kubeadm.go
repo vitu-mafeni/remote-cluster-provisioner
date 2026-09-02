@@ -486,7 +486,7 @@ done`, nfsDir, nfsDir, nfsServerIP),
 }
 
 func getJoinCommand(client *sshhelper.Client) (string, error) {
-	output, err := sshhelper.Run(client, "sudo kubeadm token create --print-join-command --ttl 0")
+	output, err := sshhelper.Run(client, "sudo kubeadm token create --print-join-command --ttl 24h")
 	if err != nil {
 		return "", fmt.Errorf("kubeadm token create failed: %w\nOutput: %s", err, output)
 	}

@@ -64,6 +64,9 @@ func NewInClusterProvisioner(
 	// drift between the two sources never causes an IP collision.
 	// ============================================================
 
+	if netNodeConfig.Spec.VPNRange == nil || *netNodeConfig.Spec.VPNRange == "" {
+		return "", "", fmt.Errorf("NodeProvisionNetConfig has no vpnRange configured")
+	}
 	vpnNodeIP, err = allocateVPNIP(vpnServerClient,
 		*netNodeConfig.Spec.VPNRange,
 		netNodeConfig.Status.UsedIPAddresses,
@@ -672,38 +675,32 @@ func GetNextAvailableIP(vpnRange string, usedIPs []string) (string, error) {
 	return getNextAvailableIP(vpnRange, usedIPs)
 }
 
-// getNextAvailableIP returns the next IP in vpnRange that is not in usedIPs.
+// getNextAvailableIP returns the lowest IP in vpnRange that is not in usedIPs.
+// It always scans from the start of the range so that released IPs are reused
+// rather than the range being exhausted prematurely.
 func getNextAvailableIP(vpnRange string, usedIPs []string) (string, error) {
-	lastUsedIP := ""
-	if len(usedIPs) > 0 {
-		lastUsedIP = usedIPs[len(usedIPs)-1]
-	}
-
 	ip, ipNet, err := net.ParseCIDR(vpnRange)
 	if err != nil {
 		return "", fmt.Errorf("invalid VPN range: %w", err)
 	}
 
-	var nextIP net.IP
-	if lastUsedIP != "" {
-		nextIP = net.ParseIP(lastUsedIP)
-		if nextIP == nil {
-			return "", fmt.Errorf("invalid last used IP: %s", lastUsedIP)
-		}
-	} else {
-		nextIP = ip
+	// Build a lookup set for O(1) membership test.
+	used := make(map[string]struct{}, len(usedIPs))
+	for _, u := range usedIPs {
+		used[u] = struct{}{}
 	}
 
-	for {
-		nextIP = incrementIP(nextIP)
-		if !ipNet.Contains(nextIP) {
-			return "", fmt.Errorf("no available IPs in VPN range")
+	// Scan from the network address upward; skip the network (.0) and broadcast
+	// addresses automatically because they won't be in usedIPs but ipNet.Contains
+	// returns true for them — the Contains check below lets us skip them safely.
+	next := incrementIP(ip.To4())
+	for ipNet.Contains(next) {
+		if _, taken := used[next.String()]; !taken {
+			return next.String(), nil
 		}
-		nextIPStr := nextIP.String()
-		if !contains(usedIPs, nextIPStr) {
-			return nextIPStr, nil
-		}
+		next = incrementIP(next)
 	}
+	return "", fmt.Errorf("no available IPs in VPN range %s", vpnRange)
 }
 
 func contains(usedIPs []string, nextIPStr string) bool {

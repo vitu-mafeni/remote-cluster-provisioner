@@ -36,7 +36,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
@@ -46,6 +48,7 @@ import (
 	remotenodeprovision "dcn.ssu.ac.kr/infra/provider/onprem"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 )
 
 // onPremJobResult carries the outcome of a background on-prem provisioning run.
@@ -67,6 +70,20 @@ type NodeProvisionReconciler struct {
 	// onPremProgress tracks the current provisioning step for each in-flight goroutine.
 	// Key: "<namespace>/<name>", Value: string
 	onPremProgress sync.Map
+	// mgrCtx is the manager's root context; used as the base for background
+	// goroutines so that they are cancelled on graceful shutdown.
+	// Populated by Start(), which the manager calls before reconciles begin.
+	mgrCtx    context.Context
+	mgrCancel context.CancelFunc
+}
+
+// Start implements manager.Runnable so the reconciler receives the manager's
+// root context and can propagate it to background goroutines.
+func (r *NodeProvisionReconciler) Start(ctx context.Context) error {
+	r.mgrCtx, r.mgrCancel = context.WithCancel(ctx)
+	<-ctx.Done()
+	r.mgrCancel()
+	return nil
 }
 
 const (
@@ -108,6 +125,10 @@ const (
 	requeueFailed = time.Minute
 	// npPrepullPollInterval is the requeue interval while images are pre-pulling.
 	npPrepullPollInterval = 30 * time.Second
+	// maxProvisionRetries is the number of consecutive provisioning failures
+	// allowed before the controller stops retrying and leaves the resource in
+	// a terminal Failed state requiring manual intervention.
+	maxProvisionRetries = 5
 )
 
 // npNodeResetScript is the comprehensive node cleanup script run via SSH during
@@ -302,10 +323,18 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.reconcileNPImagePrepull(ctx, np)
 
 	case mlv1alpha1.NodeProvisionPhaseReady:
-		log.V(1).Info("NodeProvision is ready, no action needed")
-		return ctrl.Result{}, nil
+		return r.syncRuntimeCredentials(ctx, np)
 
 	case mlv1alpha1.NodeProvisionPhaseFailed:
+		// Terminal: retry limit already reached — do not auto-retry.
+		if np.Status.ProvisionRetryCount >= maxProvisionRetries {
+			log.Info("NodeProvision in terminal Failed state — retry limit reached, manual intervention required",
+				"attempts", np.Status.ProvisionRetryCount,
+				"maxRetries", maxProvisionRetries,
+				"message", np.Status.Message)
+			return ctrl.Result{}, nil
+		}
+
 		if err := r.cleanupVPNPeer(ctx, np); err != nil {
 			log.Error(err, "releasing stale VPN peer before retry (continuing)")
 		}
@@ -318,13 +347,20 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if fresh.Status.Phase != mlv1alpha1.NodeProvisionPhaseFailed {
 			return ctrl.Result{}, nil
 		}
+		if fresh.Status.ProvisionRetryCount >= maxProvisionRetries {
+			log.Info("NodeProvision reached terminal state on re-fetch — not resetting",
+				"attempts", fresh.Status.ProvisionRetryCount)
+			return ctrl.Result{}, nil
+		}
 		now := metav1.Now()
 		fresh.Status.Phase = ""
 		fresh.Status.VpnIP = ""
 		fresh.Status.IPAddress = ""
-		fresh.Status.Message = "Retrying after failure"
+		fresh.Status.Message = fmt.Sprintf("Retrying after failure (attempt %d/%d)", fresh.Status.ProvisionRetryCount, maxProvisionRetries)
 		fresh.Status.LastUpdated = &now
-		log.Info("Retrying NodeProvision after failure — releasing stale VPN IP and resetting phase")
+		log.Info("Retrying NodeProvision after failure — releasing stale VPN IP and resetting phase",
+			"attempt", fresh.Status.ProvisionRetryCount,
+			"maxRetries", maxProvisionRetries)
 		if err := r.Status().Update(ctx, fresh); err != nil {
 			// Another reconcile won the race — its reset will trigger re-provisioning.
 			log.Info("Phase reset race lost, other reconcile already reset", "err", err)
@@ -834,8 +870,12 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 		// but the result hasn't been consumed yet: the next poll would see
 		// no map entry, no VpnIP in status, and falsely restart provisioning.
 
+		goroutineCtx := r.mgrCtx
+		if goroutineCtx == nil {
+			goroutineCtx = context.Background()
+		}
 		vpnNodeIP, publicKey, err := remotenodeprovision.NewInClusterProvisioner(
-			context.Background(),
+			goroutineCtx,
 			npCopy,
 			secretCopy,
 			sshClient,
@@ -1090,6 +1130,7 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	np.Status.Message = "Node successfully joined cluster"
 	np.Status.Progress = 100
 	np.Status.CompletionTime = &now
+	np.Status.ProvisionRetryCount = 0
 	if err := r.Status().Update(ctx, np); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating NodeProvision status to Ready: %w", err)
 	}
@@ -1137,6 +1178,7 @@ func (r *NodeProvisionReconciler) markNodeProvisionReady(ctx context.Context, np
 	np.Status.Progress = 100
 	np.Status.CompletionTime = &now
 	np.Status.LastUpdated = &now
+	np.Status.ProvisionRetryCount = 0
 	return ctrl.Result{}, r.Status().Update(ctx, np)
 }
 
@@ -1551,7 +1593,7 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 	log := logf.FromContext(ctx)
 
 	netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
-	if err := r.List(ctx, netConfigList); err != nil {
+	if err := r.List(ctx, netConfigList, client.InNamespace(np.Namespace)); err != nil {
 		return fmt.Errorf("listing NodeProvisionNetConfigs for VPN cleanup: %w", err)
 	}
 	if len(netConfigList.Items) == 0 {
@@ -1718,10 +1760,10 @@ const joinTokenMaxAge = 20 * time.Hour
 // If the bootstrap token is absent or older than joinTokenMaxAge, the controller
 // creates a new one directly via the Kubernetes API — no SSH or external
 // dependency required.
-func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, _ *mlv1alpha1.NodeProvision) (*mlv1alpha1.NodeProvisionNetConfig, error) {
+func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1alpha1.NodeProvision) (*mlv1alpha1.NodeProvisionNetConfig, error) {
 	log := logf.FromContext(ctx)
 	netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
-	if err := r.List(ctx, netConfigList); err != nil {
+	if err := r.List(ctx, netConfigList, client.InNamespace(np.Namespace)); err != nil {
 		return nil, fmt.Errorf("listing NodeProvisionNetConfigs: %w", err)
 	}
 	if len(netConfigList.Items) == 0 {
@@ -1735,7 +1777,14 @@ func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, _ *mlv1a
 		time.Since(nc.Status.JoinTokenRefreshedAt.Time) > joinTokenMaxAge
 
 	if needsRefresh {
-		log.Info("Bootstrap token missing or too old — refreshing via local Kubernetes API")
+		tokenAge := "never"
+		if nc.Status.JoinTokenRefreshedAt != nil {
+			tokenAge = time.Since(nc.Status.JoinTokenRefreshedAt.Time).Round(time.Minute).String()
+		}
+		log.Info("Bootstrap token missing or expired — refreshing via local Kubernetes API",
+			"tokenAge", tokenAge,
+			"maxAge", joinTokenMaxAge.String(),
+			"joinCommandPresent", nc.Status.ClusterJoinCommand != "")
 		if err := r.refreshLocalJoinToken(ctx, nc); err != nil {
 			log.Error(err, "Failed to refresh bootstrap token")
 			return nil, fmt.Errorf("refreshing bootstrap token: %w", err)
@@ -1744,6 +1793,12 @@ func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, _ *mlv1a
 		if err := r.Get(ctx, client.ObjectKeyFromObject(nc), nc); err != nil {
 			return nil, fmt.Errorf("re-fetching NodeProvisionNetConfig after token refresh: %w", err)
 		}
+	} else if nc.Status.JoinTokenRefreshedAt != nil {
+		age := time.Since(nc.Status.JoinTokenRefreshedAt.Time).Round(time.Minute)
+		remaining := (joinTokenMaxAge - age).Round(time.Minute)
+		log.Info("Bootstrap token still valid",
+			"age", age.String(),
+			"expiresIn", remaining.String())
 	}
 	return nc, nil
 }
@@ -2120,15 +2175,50 @@ func (r *NodeProvisionReconciler) setPhaseStatus(np *mlv1alpha1.NodeProvision, p
 	np.Status.LastUpdated = &now
 }
 
-// failNodeProvision transitions to Failed and persists the status.
+// failNodeProvision re-fetches the NodeProvision, increments ProvisionRetryCount,
+// transitions to Failed, and persists the status via RetryOnConflict.
+// Once the retry limit is reached the resource is left in a terminal Failed
+// state with no RequeueAfter — manual intervention (patch .status.provisionRetryCount
+// to 0) is required.
 func (r *NodeProvisionReconciler) failNodeProvision(ctx context.Context, np *mlv1alpha1.NodeProvision, msg string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	log.Error(fmt.Errorf("%s", msg), "provisioning failed")
-	now := metav1.Now()
-	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseFailed
-	np.Status.Message = msg
-	np.Status.LastUpdated = &now
-	_ = r.Status().Update(ctx, np)
+	var terminal bool
+	var attempts int
+
+	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &mlv1alpha1.NodeProvision{}
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
+			return err
+		}
+		fresh.Status.ProvisionRetryCount++
+		attempts = fresh.Status.ProvisionRetryCount
+		now := metav1.Now()
+		fresh.Status.Phase = mlv1alpha1.NodeProvisionPhaseFailed
+		fresh.Status.LastUpdated = &now
+		if fresh.Status.ProvisionRetryCount >= maxProvisionRetries {
+			terminal = true
+			fresh.Status.Message = fmt.Sprintf(
+				"provisioning failed after %d attempts (last error: %s) — manual intervention required",
+				fresh.Status.ProvisionRetryCount, msg)
+		} else {
+			fresh.Status.Message = fmt.Sprintf("provisioning failed (attempt %d/%d): %s",
+				fresh.Status.ProvisionRetryCount, maxProvisionRetries, msg)
+		}
+		return r.Status().Update(ctx, fresh)
+	})
+	if updateErr != nil {
+		log.Error(updateErr, "failed to persist provisioning failure status")
+	}
+
+	if terminal {
+		log.Error(fmt.Errorf("%s", msg), "provisioning failed — retry limit reached, no further retries",
+			"attempts", attempts,
+			"maxRetries", maxProvisionRetries)
+		return ctrl.Result{}, nil
+	}
+	log.Error(fmt.Errorf("%s", msg), "provisioning failed — will retry",
+		"attempt", attempts,
+		"maxRetries", maxProvisionRetries)
 	return ctrl.Result{RequeueAfter: requeueFailed}, nil
 }
 
@@ -2201,11 +2291,105 @@ func (r *NodeProvisionReconciler) resolveCnlabRuntimeConfig(
 	return cfg, nil
 }
 
+// syncRuntimeCredentials runs oras login on a Ready node whenever the
+// registry credentials stored in NodeProvisionNetConfig have changed.
+// It is a no-op when no credentials are configured, when the node's stored
+// hash already matches, or when SSH access is unavailable (errors are logged
+// and the reconcile is requeued so the sync is retried automatically).
+func (r *NodeProvisionReconciler) syncRuntimeCredentials(ctx context.Context, np *mlv1alpha1.NodeProvision) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	netConfig, err := r.requireNetConfig(ctx, np)
+	if err != nil {
+		// NetConfig absent — nothing to sync yet.
+		return ctrl.Result{}, nil
+	}
+
+	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, netConfig.Spec.SoftwareConfig, netConfig.Namespace)
+	if err != nil {
+		log.Error(err, "resolving cnlab-runtime credentials for sync (skipping)")
+		return ctrl.Result{}, nil
+	}
+
+	if runtimeCfg.Token == "" {
+		// Public registry or credentials not configured.
+		return ctrl.Result{}, nil
+	}
+
+	// Hash username+token — rerun login only when credentials actually change.
+	h := sha256.Sum256([]byte(runtimeCfg.Username + ":" + runtimeCfg.Token))
+	newHash := fmt.Sprintf("%x", h)
+	if np.Status.RuntimeCredentialsHash == newHash {
+		log.Info("Runtime registry credentials already in sync on node",
+			"registry", runtimeCfg.Registry, "hash", newHash[:12]+"…")
+		return ctrl.Result{}, nil
+	}
+	log.Info("Runtime registry credentials changed — syncing to node via oras login",
+		"registry", runtimeCfg.Registry)
+
+	sshClient, err := r.getSSHClientByProvider(ctx, np)
+	if err != nil {
+		log.Error(err, "opening SSH connection for credential sync (will retry)")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	defer sshClient.Conn.Close() //nolint:errcheck
+
+	// Write the token to a temp file so it is never visible in the process list.
+	syncCmd := fmt.Sprintf(`set -euo pipefail
+export HOME="${HOME:-/root}"
+install -m 0600 /dev/null /tmp/.reg-sync
+printf '%%s' '%s' > /tmp/.reg-sync
+cat /tmp/.reg-sync | oras login '%s' --username '%s' --password-stdin
+rm -f /tmp/.reg-sync`,
+		runtimeCfg.Token, runtimeCfg.Registry, runtimeCfg.Username)
+
+	if out, sshErr := ssh.Run(sshClient, syncCmd); sshErr != nil {
+		log.Error(sshErr, "oras login sync failed (will retry)", "output", string(out))
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	np.Status.RuntimeCredentialsHash = newHash
+	now := metav1.Now()
+	np.Status.LastUpdated = &now
+	if err := r.Status().Update(ctx, np); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating RuntimeCredentialsHash: %w", err)
+	}
+
+	log.Info("Runtime registry credentials synced to node", "registry", runtimeCfg.Registry)
+	return ctrl.Result{}, nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeProvisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Register as a Runnable so Start() receives the manager's root context,
+	// which background provisioning goroutines use to stop on graceful shutdown.
+	if err := mgr.Add(r); err != nil {
+		return fmt.Errorf("registering NodeProvisionReconciler as Runnable: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mlv1alpha1.NodeProvision{}).
 		Named("ml-nodeprovision").
+		Watches(
+			&mlv1alpha1.NodeProvisionNetConfig{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				// Re-reconcile all NodeProvision objects in the same namespace so
+				// syncRuntimeCredentials picks up the new credentials.
+				npList := &mlv1alpha1.NodeProvisionList{}
+				if err := mgr.GetClient().List(ctx, npList, client.InNamespace(obj.GetNamespace())); err != nil {
+					return nil
+				}
+				reqs := make([]reconcile.Request, 0, len(npList.Items))
+				for i := range npList.Items {
+					reqs = append(reqs, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Name:      npList.Items[i].Name,
+							Namespace: npList.Items[i].Namespace,
+						},
+					})
+				}
+				return reqs
+			}),
+		).
 		Complete(r)
 }
 

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -118,6 +119,16 @@ const (
 	// annotationJoinTokenRefreshedAt records the RFC3339 timestamp of the last
 	// successful kubeadm token refresh so the controller knows when to renew again.
 	annotationJoinTokenRefreshedAt = "infra.dcn.ssu.ac.kr/join-token-refreshed-at"
+	// annotationCnlabCredentialsHash is the SHA-256 hex digest of the cnlab-runtime
+	// registry username+token last synced to the remote cluster.  When this differs
+	// from the current secret, the controller re-pushes the secret and patches
+	// NodeProvisionNetConfig — including on clusters provisioned before credentials
+	// were added — so every cluster stays able to pull runtime updates autonomously.
+	annotationCnlabCredentialsHash = "infra.dcn.ssu.ac.kr/cnlab-credentials-hash"
+	// annotationCoreVariantsCreated marks that core PackageVariants have been
+	// applied so the overlay step can proceed without blocking the reconcile
+	// worker thread with a sleep.
+	annotationCoreVariantsCreated = "infra.dcn.ssu.ac.kr/core-variants-created"
 
 	// tokenRefreshInterval is how often to rotate the kubeadm bootstrap token.
 	// kubeadm tokens expire after 24 h by default; refresh 1 h before expiry.
@@ -149,6 +160,21 @@ const (
 	// control-plane init goroutine.  kubeadm init + CNI setup typically takes
 	// 5-15 minutes, so 30 s gives reasonable responsiveness without hammering.
 	controlPlanePollInterval = 30 * time.Second
+
+	// maxProvisionRetries is the number of consecutive provisioning failures
+	// allowed before the controller stops retrying and leaves the RemoteCluster
+	// in a terminal Failed state requiring manual intervention.
+	maxProvisionRetries = 5
+
+	// maxCnlabSyncRetries is the number of consecutive SSH failures allowed when
+	// pushing cnlab-runtime credentials to the remote cluster before the controller
+	// stops retrying and surfaces an error condition on the RemoteCluster resource.
+	// The VPN link to the remote cluster may be down.
+	maxCnlabSyncRetries = 5
+
+	// cnlabSyncConditionType is the Condition type recorded on the RemoteCluster
+	// when the credential sync has reached the retry limit.
+	cnlabSyncConditionType = "CnlabCredentialSyncFailed"
 )
 
 // packageVariantGVK is the GVK for Porch PackageVariant resources.
@@ -247,13 +273,28 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// freshly-Ready cluster reaches reconcilePackageVariants on the same
 			// reconcile that the token is first refreshed.
 			if needsTokenRefresh(cluster) {
+				log.Info("Kubeadm bootstrap token due for refresh")
 				if _, err := r.refreshJoinToken(ctx, cluster); err != nil {
 					log.Error(err, "refreshing join token (non-fatal)")
 				}
+			} else if ts, ok := cluster.Annotations[annotationJoinTokenRefreshedAt]; ok {
+				if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					log.Info("Kubeadm bootstrap token still valid",
+						"refreshedAt", t.Format(time.RFC3339),
+						"nextRefreshIn", time.Until(t.Add(tokenRefreshInterval)).Round(time.Minute).String())
+				}
+			} else {
+				log.Info("Kubeadm bootstrap token has never been explicitly refreshed; will refresh now")
+			}
+
+			// Sync cnlab-runtime registry credentials to the remote cluster whenever
+			// they are added or rotated — including clusters provisioned before this
+			// feature existed (annotationCnlabCredentialsHash will be absent on them).
+			if err := r.syncCnlabCredentialsToRemote(ctx, cluster); err != nil {
+				log.Error(err, "syncing cnlab-runtime credentials to remote cluster (non-fatal)")
 			}
 
 			if cluster.Annotations[annotationPkgVariantsCreated] == "true" {
-				log.Info("Cluster fully ready — no action required")
 				// Schedule next wakeup for token renewal.
 				requeueAfter := tokenRefreshInterval
 				if ts, ok := cluster.Annotations[annotationJoinTokenRefreshedAt]; ok {
@@ -263,12 +304,21 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 						}
 					}
 				}
+				log.Info("Cluster fully ready",
+					"nextTokenRefreshIn", requeueAfter.Round(time.Minute).String())
 				return ctrl.Result{RequeueAfter: requeueAfter}, nil
 			}
 			return r.reconcilePackageVariants(ctx, cluster)
 		}
 		return ctrl.Result{}, nil
 	case phaseFailed:
+		if cluster.Status.ProvisionRetryCount >= maxProvisionRetries {
+			log.Info("RemoteCluster in terminal Failed state — retry limit reached, manual intervention required",
+				"attempts", cluster.Status.ProvisionRetryCount,
+				"maxRetries", maxProvisionRetries,
+				"message", cluster.Status.Message)
+			return ctrl.Result{}, nil
+		}
 		return r.reconcileProvisioning(ctx, cluster)
 	default:
 		return ctrl.Result{}, nil
@@ -471,16 +521,20 @@ func (r *RemoteClusterReconciler) reconcilePackageVariants(ctx context.Context, 
 	log := logf.FromContext(ctx).WithValues("cluster", cluster.Name, "clusterName", cluster.Spec.ClusterName)
 	log.Info("Creating PackageVariants")
 
-	if err := r.createCorePackageVariants(ctx, cluster); err != nil {
-		return r.fail(ctx, cluster, "CorePackageVariantsFailed", fmt.Errorf("creating core PackageVariants: %w", err))
+	if cluster.Annotations[annotationCoreVariantsCreated] != "true" {
+		if err := r.createCorePackageVariants(ctx, cluster); err != nil {
+			return r.fail(ctx, cluster, "CorePackageVariantsFailed", fmt.Errorf("creating core PackageVariants: %w", err))
+		}
+		if patchErr := r.patchAnnotation(ctx, cluster, annotationCoreVariantsCreated, "true"); patchErr != nil {
+			log.Error(patchErr, "Failed to stamp core-variants-created annotation (non-fatal)")
+		}
+		// Give Porch time to sync the new cluster repo before overlay PackageVariants
+		// are created. Instead of sleeping (which blocks a worker thread), requeue
+		// immediately; the annotation gate above ensures core creation runs only once.
+		log.Info("Core PackageVariants created — requeueing to allow Porch sync before overlay step",
+			"delay", repoReadyWait.String())
+		return ctrl.Result{RequeueAfter: repoReadyWait}, nil
 	}
-
-	// delay to allow Porch to sync the new cluster repo before creating overlay PackageVariants
-	// (otherwise Porch will fail to find the overlay packages in the new repo)
-	// sleep will block the reconcile loop, but this is a one-time delay and the cluster is already in Ready phase
-	log.Info("Waiting for Porch to sync the new cluster repo before creating overlay PackageVariants",
-		"duration", 30*time.Second)
-	time.Sleep(30 * time.Second)
 
 	if err := r.createOverlaysPlusPostInstallPackageVariants(ctx, cluster); err != nil {
 		return r.fail(ctx, cluster, "OverlayPackageVariantsFailed", fmt.Errorf("creating overlay PackageVariants: %w", err))
@@ -543,7 +597,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
 		}
 
-		sshClientCP, err := r.getSSHClient(ctx, clusterParent)
+		sshClientCP, err := r.getSSHClient(ctx, clusterParent) // ctx is already sshCtx from reconcileProvisioning
 		if err != nil {
 			return r.fail(ctx, cluster, "SSHConnectionFailed", fmt.Errorf("connecting to control-plane via SSH: %w", err))
 		}
@@ -636,7 +690,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	// Label the node so the prepull DaemonSets can target it by hardware type.
 	// DaemonSets are already deployed on the CP; labels make the pods schedule.
 	if clusterParent != nil {
-		if sshClientCP, cpSSHErr := r.getSSHClient(ctx, clusterParent); cpSSHErr == nil {
+		if sshClientCP, cpSSHErr := r.getSSHClient(ctx, clusterParent); cpSSHErr == nil { // ctx is sshCtx
 			defer sshClientCP.Conn.Close() //nolint:errcheck
 			hwLabel := "cpu"
 			if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
@@ -937,6 +991,53 @@ data:
 			log.Info("Ensured image pull secret on remote cluster", "secret", pullSecret.Name)
 		}
 
+		// Copy the cnlab-runtime registry credentials secret to the remote cluster
+		// so its NodeProvisionReconciler can pull the runtime artifact autonomously —
+		// even when the management cluster is unreachable.
+		if cr := clusterParent.Spec.NodeInfo.SoftwareConfig.CnlabRuntime; cr != nil && cr.CredentialsRef.Name != "" {
+			runtimeCredsSecret := &corev1.Secret{}
+			ns := cr.CredentialsRef.NameSpace
+			if ns == "" {
+				ns = cluster.Namespace
+			}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      cr.CredentialsRef.Name,
+				Namespace: ns,
+			}, runtimeCredsSecret); err != nil {
+				return ctrl.Result{}, fmt.Errorf(
+					"fetching cnlab-runtime credentials secret %q: %w",
+					cr.CredentialsRef.Name, err,
+				)
+			}
+
+			secretData := ""
+			for k, v := range runtimeCredsSecret.Data {
+				secretData += fmt.Sprintf("  %s: %s\n", k, base64.StdEncoding.EncodeToString(v))
+			}
+			runtimeSecretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: %s
+data:
+%s`,
+				runtimeCredsSecret.Name,
+				ns,
+				string(runtimeCredsSecret.Type),
+				secretData,
+			)
+
+			runtimeSecretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", runtimeSecretYAML)
+			if runtimeSecretOutput, runtimeSecretErr := sshhelper.Run(sshClient, runtimeSecretCmd); runtimeSecretErr != nil {
+				return ctrl.Result{}, fmt.Errorf(
+					"creating cnlab-runtime credentials secret on remote cluster: %w\nOutput:\n%s",
+					runtimeSecretErr, runtimeSecretOutput,
+				)
+			}
+			log.Info("Ensured cnlab-runtime credentials secret on remote cluster", "secret", runtimeCredsSecret.Name)
+		}
+
 		// Build optional softwareConfig fields (indented to match sibling keys).
 		var imagePrepullsYAML string
 		if len(clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePrepulls) > 0 {
@@ -947,6 +1048,30 @@ data:
 		}
 		if ref := clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePullSecretRef; ref != nil {
 			imagePrepullsYAML += fmt.Sprintf("    imagePullSecretRef:\n      name: \"%s\"\n", ref.Name)
+		}
+		// Propagate cnlabRuntime config so the remote cluster's NodeProvisionReconciler
+		// can pull the runtime artifact without connecting back to the management cluster.
+		var cnlabRuntimeYAML string
+		if cr := clusterParent.Spec.NodeInfo.SoftwareConfig.CnlabRuntime; cr != nil {
+			cnlabRuntimeYAML = "    cnlabRuntime:\n"
+			if cr.Registry != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      registry: %q\n", cr.Registry)
+			}
+			if cr.Repository != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      repository: %q\n", cr.Repository)
+			}
+			if cr.Version != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      version: %q\n", cr.Version)
+			}
+			if cr.OrasVersion != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      orasVersion: %q\n", cr.OrasVersion)
+			}
+			if cr.CredentialsRef.Name != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      credentialsRef:\n        name: %q\n        namespace: %q\n",
+					cr.CredentialsRef.Name,
+					cr.CredentialsRef.NameSpace,
+				)
+			}
 		}
 
 		vpnServerSSHPort := cluster.Spec.VPNConfig.VPNServerSSHPort
@@ -968,7 +1093,7 @@ spec:
   clusterName: %s
   softwareConfig:
     kubernetesVersion: "%s"
-%s  vpnRange: %s
+%s%s  vpnRange: %s
   vpnServerPublicConfig:
     publicIP: %s
     sshPort: "%s"
@@ -982,6 +1107,7 @@ spec:
 			cluster.Spec.ClusterName,
 			clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion,
 			imagePrepullsYAML,
+			cnlabRuntimeYAML,
 			vpnCIDR,
 			cluster.Spec.VPNConfig.VPNServerPublicIP,
 			vpnServerSSHPort,
@@ -1154,7 +1280,7 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 		return ctrl.Result{}, fmt.Errorf("kubeadm token create returned empty output")
 	}
 
-	log.Info("Refreshed kubeadm bootstrap token")
+	log.Info("Refreshed kubeadm bootstrap token", "nextRefreshIn", tokenRefreshInterval.String())
 
 	// Persist the new join command on the RemoteCluster status.
 	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
@@ -1334,6 +1460,13 @@ func (r *RemoteClusterReconciler) setStatus(
 	cluster.Status.Phase = phase
 	cluster.Status.Message = message
 
+	// Reset the retry counter whenever provisioning reaches a success phase.
+	if phase == phaseReady && cluster.Status.ProvisionRetryCount > 0 {
+		logf.FromContext(ctx).Info("RemoteCluster provisioning succeeded — resetting retry counter",
+			"previousAttempts", cluster.Status.ProvisionRetryCount)
+		cluster.Status.ProvisionRetryCount = 0
+	}
+
 	condStatus := metav1.ConditionTrue
 	if isError {
 		condStatus = metav1.ConditionFalse
@@ -1352,14 +1485,54 @@ func (r *RemoteClusterReconciler) setStatus(
 	return r.Status().Update(ctx, cluster)
 }
 
+// fail re-fetches the RemoteCluster, increments ProvisionRetryCount, and
+// persists a Failed status via RetryOnConflict so the counter is never silently lost.
 func (r *RemoteClusterReconciler) fail(
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
 	reason string,
-	err error,
+	cause error,
 ) (ctrl.Result, error) {
-	logf.FromContext(ctx).Error(err, "RemoteCluster failed", "cluster", cluster.Name, "reason", reason)
-	_ = r.setStatus(ctx, cluster, phaseFailed, reason, err.Error(), true)
+	log := logf.FromContext(ctx)
+	var terminal bool
+	var attempts int
+
+	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav1.RemoteCluster{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), fresh); err != nil {
+			return err
+		}
+		fresh.Status.ProvisionRetryCount++
+		attempts = fresh.Status.ProvisionRetryCount
+		var msg string
+		if fresh.Status.ProvisionRetryCount >= maxProvisionRetries {
+			terminal = true
+			msg = fmt.Sprintf("provisioning failed after %d attempts (last error: %v) — manual intervention required",
+				fresh.Status.ProvisionRetryCount, cause)
+		} else {
+			msg = fmt.Sprintf("provisioning failed (attempt %d/%d): %v",
+				fresh.Status.ProvisionRetryCount, maxProvisionRetries, cause)
+		}
+		return r.setStatus(ctx, fresh, phaseFailed, reason, msg, true)
+	})
+	if updateErr != nil {
+		log.Error(updateErr, "failed to persist provisioning failure status",
+			"cluster", cluster.Name, "reason", reason)
+	}
+
+	if terminal {
+		log.Error(cause, "RemoteCluster provisioning reached retry limit — no further retries",
+			"cluster", cluster.Name,
+			"reason", reason,
+			"attempts", attempts,
+			"maxRetries", maxProvisionRetries)
+		return ctrl.Result{}, nil
+	}
+	log.Error(cause, "RemoteCluster provisioning failed — will retry",
+		"cluster", cluster.Name,
+		"reason", reason,
+		"attempt", attempts,
+		"maxRetries", maxProvisionRetries)
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
 }
 
@@ -2684,6 +2857,175 @@ func (r *RemoteClusterReconciler) resolveCnlabRuntimeConfig(
 	}
 	cfg.ApplyDefaults()
 	return cfg, nil
+}
+
+// syncCnlabCredentialsToRemote pushes the cnlab-runtime registry secret and
+// the cnlabRuntime block of NodeProvisionNetConfig to the remote cluster via SSH
+// whenever the credentials change.  It is a no-op when credentials are absent or
+// when the annotation hash already matches the current secret.
+//
+// Calling this from the phaseReady control-plane path means clusters provisioned
+// before credentialsRef was added will be backfilled on their next reconcile.
+func (r *RemoteClusterReconciler) syncCnlabCredentialsToRemote(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	log := logf.FromContext(ctx)
+
+	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
+	if err != nil || runtimeCfg.Token == "" {
+		// No credentials configured — nothing to push.
+		return nil
+	}
+
+	h := sha256.Sum256([]byte(runtimeCfg.Username + ":" + runtimeCfg.Token))
+	newHash := fmt.Sprintf("%x", h)
+	if cluster.Annotations[annotationCnlabCredentialsHash] == newHash {
+		log.Info("cnlab-runtime credentials already in sync on remote cluster",
+			"registry", runtimeCfg.Registry, "hash", newHash[:12]+"…")
+		return nil
+	}
+	log.Info("cnlab-runtime credentials changed — syncing to remote cluster",
+		"registry", runtimeCfg.Registry)
+
+	// Terminal: retry limit already reached — do not re-attempt until manually reset.
+	if cluster.Status.CnlabSyncRetryCount >= maxCnlabSyncRetries {
+		log.Info("cnlab-runtime credential sync in terminal error state — retry limit reached",
+			"attempts", cluster.Status.CnlabSyncRetryCount,
+			"maxRetries", maxCnlabSyncRetries,
+			"hint", "patch .status.cnlabSyncRetryCount to 0 to re-enable sync")
+		return nil
+	}
+
+	sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+	defer cancel()
+	sshClient, err := r.getSSHClient(sshCtx, cluster)
+	if err != nil {
+		return r.recordCnlabSyncFailure(ctx, cluster, fmt.Errorf("SSH connection for credential sync: %w", err))
+	}
+	defer func() { _ = sshClient.Conn.Close() }()
+
+	cr := cluster.Spec.NodeInfo.SoftwareConfig.CnlabRuntime
+	ns := cluster.Namespace
+	if cr != nil && cr.CredentialsRef.NameSpace != "" {
+		ns = cr.CredentialsRef.NameSpace
+	}
+
+	// Push the secret.
+	secretData := fmt.Sprintf("  username: %s\n  token: %s\n",
+		base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Username)),
+		base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Token)),
+	)
+	secretName := "cnlab-runtime-registry"
+	if cr != nil && cr.CredentialsRef.Name != "" {
+		secretName = cr.CredentialsRef.Name
+	}
+	secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: Opaque
+data:
+%s`, secretName, ns, secretData)
+
+	secretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", secretYAML)
+	if out, sshErr := sshhelper.Run(sshClient, secretCmd); sshErr != nil {
+		return r.recordCnlabSyncFailure(ctx, cluster,
+			fmt.Errorf("applying cnlab-runtime secret on remote cluster: %w\nOutput: %s", sshErr, out))
+	}
+	log.Info("Synced cnlab-runtime credentials secret to remote cluster", "secret", secretName)
+
+	// Patch the NodeProvisionNetConfig cnlabRuntime block.
+	cnlabRuntimeYAML := fmt.Sprintf(`    cnlabRuntime:
+      registry: %q
+      repository: %q
+      version: %q
+      orasVersion: %q
+      credentialsRef:
+        name: %q
+        namespace: %q
+`, runtimeCfg.Registry, runtimeCfg.Repository, runtimeCfg.Version, runtimeCfg.OrasVersion,
+		secretName, ns)
+
+	netConfigName := cluster.Spec.ClusterName + "-netconfig"
+	patchCmd := fmt.Sprintf(`
+cat <<'NCEOF' | kubectl apply -f -
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvisionNetConfig
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  softwareConfig:
+%sNCEOF`, netConfigName, cluster.Namespace, cnlabRuntimeYAML)
+
+	if out, sshErr := sshhelper.Run(sshClient, patchCmd); sshErr != nil {
+		return r.recordCnlabSyncFailure(ctx, cluster,
+			fmt.Errorf("patching NodeProvisionNetConfig cnlabRuntime on remote cluster: %w\nOutput: %s", sshErr, out))
+	}
+	log.Info("Synced cnlabRuntime config to remote NodeProvisionNetConfig", "netconfig", netConfigName)
+
+	// Reset failure counter and clear the error condition on success.
+	if cluster.Status.CnlabSyncRetryCount > 0 {
+		log.Info("cnlab-runtime credential sync recovered after previous failures",
+			"previousAttempts", cluster.Status.CnlabSyncRetryCount)
+		cluster.Status.CnlabSyncRetryCount = 0
+		// Replace any existing CnlabCredentialSyncFailed condition with a success entry.
+		cluster.Status.Conditions = append(cluster.Status.Conditions, metav1.Condition{
+			Type:               cnlabSyncConditionType,
+			Status:             metav1.ConditionTrue,
+			Reason:             "SyncSucceeded",
+			Message:            "cnlab-runtime credentials successfully synced to remote cluster",
+			ObservedGeneration: cluster.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			log.Error(err, "updating cnlab sync recovery status (non-fatal)")
+		}
+	}
+
+	if patchErr := r.patchAnnotation(ctx, cluster, annotationCnlabCredentialsHash, newHash); patchErr != nil {
+		log.Error(patchErr, "failed to stamp cnlab credentials hash annotation (non-fatal)")
+	}
+	return nil
+}
+
+// recordCnlabSyncFailure re-fetches the RemoteCluster, increments
+// CnlabSyncRetryCount, and persists the status via RetryOnConflict so the
+// counter is never silently lost on a ResourceVersion conflict.
+func (r *RemoteClusterReconciler) recordCnlabSyncFailure(ctx context.Context, cluster *infrav1.RemoteCluster, cause error) error {
+	log := logf.FromContext(ctx)
+
+	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav1.RemoteCluster{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), fresh); err != nil {
+			return err
+		}
+		fresh.Status.CnlabSyncRetryCount++
+		if fresh.Status.CnlabSyncRetryCount >= maxCnlabSyncRetries {
+			msg := fmt.Sprintf("cnlab-runtime credential sync failed after %d attempts (last error: %v) — VPN to remote cluster may be down; patch .status.cnlabSyncRetryCount to 0 to re-enable",
+				fresh.Status.CnlabSyncRetryCount, cause)
+			fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
+				Type:               cnlabSyncConditionType,
+				Status:             metav1.ConditionFalse,
+				Reason:             "SyncRetryLimitReached",
+				Message:            msg,
+				ObservedGeneration: fresh.Generation,
+				LastTransitionTime: metav1.Now(),
+			})
+			fresh.Status.Message = msg
+			log.Error(cause, "cnlab-runtime credential sync reached retry limit — no further retries",
+				"attempts", fresh.Status.CnlabSyncRetryCount,
+				"maxRetries", maxCnlabSyncRetries)
+		} else {
+			log.Error(cause, "cnlab-runtime credential sync failed — will retry",
+				"attempt", fresh.Status.CnlabSyncRetryCount,
+				"maxRetries", maxCnlabSyncRetries)
+		}
+		return r.Status().Update(ctx, fresh)
+	})
+	if updateErr != nil {
+		log.Error(updateErr, "failed to persist cnlab sync failure status (non-fatal)")
+	}
+	return cause
 }
 
 // SetupWithManager sets up the controller with the Manager.
