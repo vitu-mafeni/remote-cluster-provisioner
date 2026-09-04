@@ -129,6 +129,47 @@ const (
 	// allowed before the controller stops retrying and leaves the resource in
 	// a terminal Failed state requiring manual intervention.
 	maxProvisionRetries = 5
+	// creatingInstanceStallTimeout bounds how long a NodeProvision may sit in
+	// CreatingInstance/ConfiguringVPN without an InstanceID being persisted.
+	// Those phases are progress markers only — nothing re-enters provisioning
+	// from them — so a failure between persisting the phase and persisting the
+	// InstanceID (e.g. the VPN SSH connection failing) must not be allowed to
+	// requeue forever. Past this deadline the NodeProvision is failed so it can
+	// go through the normal retry/backoff path instead of looping silently.
+	creatingInstanceStallTimeout = 10 * time.Minute
+	// waitingForInstanceStallTimeout bounds how long a NodeProvision may sit in
+	// WaitingForInstance. An EC2 instance normally reaches Running within a
+	// couple of minutes; if it hasn't by this deadline (e.g. it silently stuck
+	// in Pending, or a transient AWS API error is looping instead of reaching
+	// failNodeProvision) fail it so it goes through the retry/backoff path.
+	waitingForInstanceStallTimeout = 10 * time.Minute
+	// maxPrepullRetries bounds how many times the image pre-pull Job may be
+	// recreated after failing before the NodeProvision itself is failed. Without
+	// a cap, a permanently bad image reference or expired registry credential
+	// would recreate the Job forever with the CR never reaching Ready or Failed.
+	maxPrepullRetries = 3
+	// prepullJobActiveDeadlineSeconds bounds how long the pre-pull Job's pod may
+	// run before Kubernetes marks it Failed. Without a deadline, a hung `crictl
+	// pull` against an unreachable registry leaves the Job neither Complete nor
+	// Failed, and reconcileImagePrepullJob polls it forever with no way to tell
+	// "still pulling" from "will never finish".
+	prepullJobActiveDeadlineSeconds = int64(20 * 60)
+	// prepullRetryAnnotation tracks pre-pull Job retry attempts across Job
+	// recreations. It lives on the NodeProvision's annotations rather than a
+	// dedicated status field so it needs no CRD schema change; it is reset
+	// whenever a NodeProvision restarts a full provisioning attempt from Failed.
+	prepullRetryAnnotation = "ml.dcn.ssu.ac.kr/prepull-retry-count"
+	// onPremBootstrapStallTimeout bounds how long the on-prem SSH bootstrap
+	// goroutine may run. It has no other deadline (only manager shutdown
+	// cancels its context), so a hung remote command (e.g. an apt-get lock
+	// wait, a stalled kubeadm join) would otherwise leave the NodeProvision in
+	// Bootstrapping, and r.onPremJobs populated, forever.
+	onPremBootstrapStallTimeout = 20 * time.Minute
+	// registeringNodeStallTimeout bounds how long a NodeProvision may wait for
+	// its node to appear in Kubernetes (Joining/RegisteringNode/VerifyingHealth).
+	// If cloud-init/kubelet never brings the node up, this fails the CR instead
+	// of requeueing forever.
+	registeringNodeStallTimeout = 15 * time.Minute
 )
 
 // npNodeResetScript is the comprehensive node cleanup script run via SSH during
@@ -287,10 +328,28 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			_ = r.Status().Update(ctx, np)
 			return ctrl.Result{RequeueAfter: requeueShort}, nil
 		}
+		// Safety net: if this phase has been sitting without an InstanceID for
+		// longer than creatingInstanceStallTimeout, the in-flight reconcile that
+		// was supposed to complete it must have exited early (e.g. via a bare
+		// error return) without ever calling failNodeProvision. Fail it here so
+		// it goes through the normal retry/backoff path instead of requeueing
+		// forever.
+		if np.Status.LastUpdated != nil && time.Since(np.Status.LastUpdated.Time) > creatingInstanceStallTimeout {
+			log.Info("NodeProvision stalled without an InstanceID, failing for retry",
+				"phase", np.Status.Phase, "stalledFor", time.Since(np.Status.LastUpdated.Time))
+			return r.failNodeProvision(ctx, np, fmt.Sprintf(
+				"stalled in phase %s for over %s without an EC2 instance being created", np.Status.Phase, creatingInstanceStallTimeout))
+		}
 		log.Info("Instance creation in progress, requeueing")
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 
 	case mlv1alpha1.NodeProvisionPhaseWaitingForInstance:
+		if np.Status.LastUpdated != nil && time.Since(np.Status.LastUpdated.Time) > waitingForInstanceStallTimeout {
+			log.Info("NodeProvision stalled waiting for instance to become running, failing for retry",
+				"instanceId", np.Status.InstanceID, "stalledFor", time.Since(np.Status.LastUpdated.Time))
+			return r.failNodeProvision(ctx, np, fmt.Sprintf(
+				"instance %s did not become running within %s", np.Status.InstanceID, waitingForInstanceStallTimeout))
+		}
 		secret, err := r.getSecret(ctx, np)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("getting credentials secret: %w", err)
@@ -365,6 +424,9 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// Another reconcile won the race — its reset will trigger re-provisioning.
 			log.Info("Phase reset race lost, other reconcile already reset", "err", err)
 			return ctrl.Result{}, nil
+		}
+		if err := r.clearPrepullRetryCount(ctx, fresh); err != nil {
+			log.Error(err, "failed to reset pre-pull retry count (continuing)")
 		}
 		return ctrl.Result{RequeueAfter: requeueFailed}, nil
 
@@ -481,7 +543,7 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 
 	vpnServerClient, err := r.getVPNServerSSHClient(ctx, netConfig)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("connecting to VPN server: %w", err)
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("connecting to VPN server: %v", err))
 	}
 	defer vpnServerClient.Conn.Close() //nolint:errcheck
 
@@ -520,27 +582,36 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	}
 	log.Info("EC2 instance created", "instanceId", result.InstanceID)
 
-	// Re-fetch to ensure we have the latest ResourceVersion before writing
-	// the critical InstanceID field.  This is necessary because the
-	// setPhaseStatus+Update calls above may have been skipped (conflict) and
-	// we fell back to r.Get, which updated np in place.
-	if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
-		return ctrl.Result{}, fmt.Errorf("re-fetching NodeProvision before status update: %w", err)
-	}
-
-	now := metav1.Now()
-	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseWaitingForInstance
-	np.Status.Message = "Waiting for instance to become running"
-	np.Status.InstanceID = result.InstanceID
-	np.Status.VpnIP = result.VpnIP
-	np.Status.IPAddress = result.VpnIP
-	np.Status.Progress = 30
-	np.Status.LastUpdated = &now
-	if np.Status.StartTime == nil {
-		np.Status.StartTime = &now
-	}
-	if err := r.Status().Update(ctx, np); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating NodeProvision status with InstanceID: %w", err)
+	// Persist the InstanceID with a bounded retry against conflicts/transient
+	// API errors. The EC2 instance already exists at this point, so we must
+	// not fall back to failNodeProvision here: that would leave the phase
+	// stuck without an InstanceID, and a subsequent retry (which does not
+	// reset InstanceID) would launch a second, orphaned instance alongside
+	// this one. If every retry attempt fails, the creatingInstanceStallTimeout
+	// safety net in the CreatingInstance/ConfiguringVPN branch will eventually
+	// fail the NodeProvision for manual investigation instead of looping forever.
+	persistErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &mlv1alpha1.NodeProvision{}
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
+			return err
+		}
+		now := metav1.Now()
+		fresh.Status.Phase = mlv1alpha1.NodeProvisionPhaseWaitingForInstance
+		fresh.Status.Message = "Waiting for instance to become running"
+		fresh.Status.InstanceID = result.InstanceID
+		fresh.Status.VpnIP = result.VpnIP
+		fresh.Status.IPAddress = result.VpnIP
+		fresh.Status.Progress = 30
+		fresh.Status.LastUpdated = &now
+		if fresh.Status.StartTime == nil {
+			fresh.Status.StartTime = &now
+		}
+		return r.Status().Update(ctx, fresh)
+	})
+	if persistErr != nil {
+		log.Error(persistErr, "failed to persist InstanceID after retries — will retry on next reconcile",
+			"instanceId", result.InstanceID)
+		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
 	log.Info("EC2 instance created, waiting for it to become running", "instanceId", result.InstanceID)
 	return ctrl.Result{RequeueAfter: requeueShort}, nil
@@ -735,12 +806,12 @@ func (r *NodeProvisionReconciler) reconcileWaitingForInstance(
 
 	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("resolving AWS credentials: %w", err)
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving AWS credentials: %v", err))
 	}
 
 	privateIP, publicIP, err := awsprovision.WaitForInstanceRunning(ctx, np, creds, np.Status.InstanceID)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("polling instance state: %w", err)
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("polling instance state: %v", err))
 	}
 	if privateIP == "" {
 		log.Info("Instance not yet running, requeueing", "instanceId", np.Status.InstanceID)
@@ -787,7 +858,7 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseValidating, "Validating SSH connectivity", 5)
 	if err := r.Status().Update(ctx, np); err != nil {
 		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
-			return ctrl.Result{}, ferr
+			return r.failNodeProvision(ctx, np, fmt.Sprintf("re-fetching NodeProvision after status conflict: %v", ferr))
 		}
 	}
 
@@ -821,7 +892,7 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	if err := r.Status().Update(ctx, np); err != nil {
 		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
 			sshClient.Conn.Close()
-			return ctrl.Result{}, ferr
+			return r.failNodeProvision(ctx, np, fmt.Sprintf("re-fetching NodeProvision after status conflict: %v", ferr))
 		}
 	}
 
@@ -837,7 +908,15 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
 			sshClient.Conn.Close()       //nolint:errcheck
 			vpnServerClient.Conn.Close() //nolint:errcheck
-			return ctrl.Result{}, ferr
+			// Unlike the Validating/ConfiguringVPN cases above, ConfiguringVPN was
+			// already successfully persisted at this point (the Status().Update
+			// call a few lines up succeeded). A bare error return here would leave
+			// the CR sitting in the already-persisted ConfiguringVPN phase with no
+			// background goroutine ever started — relying solely on the
+			// creatingInstanceStallTimeout safety net to notice. Fail explicitly
+			// instead so the retry starts immediately rather than after up to 10
+			// minutes of silent "in progress" polling.
+			return r.failNodeProvision(ctx, np, fmt.Sprintf("re-fetching NodeProvision after status conflict: %v", ferr))
 		}
 	}
 
@@ -870,10 +949,18 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 		// but the result hasn't been consumed yet: the next poll would see
 		// no map entry, no VpnIP in status, and falsely restart provisioning.
 
-		goroutineCtx := r.mgrCtx
-		if goroutineCtx == nil {
-			goroutineCtx = context.Background()
+		baseCtx := r.mgrCtx
+		if baseCtx == nil {
+			baseCtx = context.Background()
 		}
+		// Bound the goroutine's total runtime. NewInClusterProvisioner runs a
+		// series of blocking SSH commands with no deadline of its own; without
+		// this, a hung remote command (e.g. an apt-get lock wait, a stalled
+		// kubeadm join) would run forever. pollOnPremBootstrap's own no-progress
+		// stall check is the backstop in case a blocking step doesn't actually
+		// observe context cancellation.
+		goroutineCtx, cancel := context.WithTimeout(baseCtx, onPremBootstrapStallTimeout)
+		defer cancel()
 		vpnNodeIP, publicKey, err := remotenodeprovision.NewInClusterProvisioner(
 			goroutineCtx,
 			npCopy,
@@ -968,6 +1055,17 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 			np.Status.Message = msg
 			np.Status.LastUpdated = &now
 			_ = r.Status().Update(ctx, np)
+		} else if np.Status.LastUpdated != nil && time.Since(np.Status.LastUpdated.Time) > onPremBootstrapStallTimeout {
+			// No progress has been reported for over onPremBootstrapStallTimeout.
+			// The background goroutine's context has its own deadline (set when
+			// it was started), but if a blocking SSH call doesn't observe context
+			// cancellation the goroutine (and its SSH connection) may still leak —
+			// the NodeProvision itself must not be left stuck forever regardless.
+			log.Info("On-prem bootstrap stalled with no progress, failing for retry",
+				"step", step, "stalledFor", time.Since(np.Status.LastUpdated.Time))
+			r.onPremJobs.Delete(key)
+			return r.failNodeProvision(ctx, np, fmt.Sprintf(
+				"on-prem bootstrap made no progress past step %q for over %s", step, onPremBootstrapStallTimeout))
 		}
 		log.Info("On-prem bootstrap in progress", "step", step)
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
@@ -1007,12 +1105,27 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 		}
 		log.Info("Node not yet visible in cluster — waiting for kubelet to register",
 			"lookingForIP", targetIP, "elapsed", elapsed)
-		now := metav1.Now()
-		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseRegisteringNode
-		np.Status.Message = fmt.Sprintf("Waiting for node to register with control plane (VPN IP: %s)", targetIP)
-		np.Status.Progress = 70
-		np.Status.LastUpdated = &now
-		_ = r.Status().Update(ctx, np)
+		msg := fmt.Sprintf("Waiting for node to register with control plane (VPN IP: %s)", targetIP)
+		// Only bump LastUpdated when something actually changed (phase just
+		// became RegisteringNode, or the target IP changed). Otherwise
+		// LastUpdated would be refreshed on every ~15s poll regardless of
+		// progress, making it useless as a staleness signal below.
+		if np.Status.Phase != mlv1alpha1.NodeProvisionPhaseRegisteringNode || np.Status.Message != msg {
+			now := metav1.Now()
+			np.Status.Phase = mlv1alpha1.NodeProvisionPhaseRegisteringNode
+			np.Status.Message = msg
+			np.Status.Progress = 70
+			np.Status.LastUpdated = &now
+			_ = r.Status().Update(ctx, np)
+		} else if np.Status.LastUpdated != nil && time.Since(np.Status.LastUpdated.Time) > registeringNodeStallTimeout {
+			// The node has never appeared in Kubernetes with this VPN IP for
+			// over registeringNodeStallTimeout — cloud-init/kubelet likely
+			// failed to come up. Fail instead of polling forever.
+			log.Info("Node registration stalled, failing for retry",
+				"lookingForIP", targetIP, "stalledFor", time.Since(np.Status.LastUpdated.Time))
+			return r.failNodeProvision(ctx, np, fmt.Sprintf(
+				"node with VPN IP %s did not register with the control plane within %s", targetIP, registeringNodeStallTimeout))
+		}
 		return ctrl.Result{RequeueAfter: requeueJoining}, nil
 	}
 
@@ -1216,14 +1329,75 @@ func (r *NodeProvisionReconciler) reconcileImagePrepullJob(
 			return r.markNodeProvisionReady(ctx, np)
 		}
 		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
-			log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed — deleting for retry", "job", jobName)
+			attempts := prepullRetryCount(np) + 1
 			_ = r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))
+			if attempts >= maxPrepullRetries {
+				log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed after max retries, failing NodeProvision",
+					"job", jobName, "attempts", attempts, "maxRetries", maxPrepullRetries)
+				return r.failNodeProvision(ctx, np, fmt.Sprintf(
+					"image pre-pull job failed after %d attempts", attempts))
+			}
+			log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed — deleting for retry",
+				"job", jobName, "attempt", attempts, "maxRetries", maxPrepullRetries)
+			if uErr := r.setPrepullRetryCount(ctx, np, attempts); uErr != nil {
+				log.Error(uErr, "failed to persist pre-pull retry count (continuing)")
+			}
 			return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 		}
 	}
 
 	log.V(1).Info("Image pre-pull job running", "job", jobName)
 	return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+}
+
+// prepullRetryCount reads the image pre-pull retry count persisted on the
+// NodeProvision's annotations. Missing or unparsable values are treated as 0.
+func prepullRetryCount(np *mlv1alpha1.NodeProvision) int {
+	v, ok := np.Annotations[prepullRetryAnnotation]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// setPrepullRetryCount persists the pre-pull retry count onto a freshly
+// fetched copy of the NodeProvision, retrying on update conflicts.
+func (r *NodeProvisionReconciler) setPrepullRetryCount(ctx context.Context, np *mlv1alpha1.NodeProvision, count int) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &mlv1alpha1.NodeProvision{}
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		fresh.Annotations[prepullRetryAnnotation] = strconv.Itoa(count)
+		return r.Update(ctx, fresh)
+	})
+}
+
+// clearPrepullRetryCount removes the pre-pull retry annotation, if present, so
+// that a fresh provisioning attempt (after a full Failed/retry cycle) starts
+// with a clean pre-pull retry budget instead of inheriting the prior one.
+func (r *NodeProvisionReconciler) clearPrepullRetryCount(ctx context.Context, np *mlv1alpha1.NodeProvision) error {
+	if _, ok := np.Annotations[prepullRetryAnnotation]; !ok {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &mlv1alpha1.NodeProvision{}
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
+			return err
+		}
+		if _, ok := fresh.Annotations[prepullRetryAnnotation]; !ok {
+			return nil
+		}
+		delete(fresh.Annotations, prepullRetryAnnotation)
+		return r.Update(ctx, fresh)
+	})
 }
 
 // createImagePrepullJob creates a Job that runs crictl pull for each image on
@@ -1254,6 +1428,7 @@ func (r *NodeProvisionReconciler) createImagePrepullJob(
 	hostPathSocket := corev1.HostPathSocket
 	ttl := int32(600)   // auto-delete 10 min after completion
 	backoff := int32(5) // retry pod up to 5 times
+	activeDeadline := prepullJobActiveDeadlineSeconds
 
 	env := []corev1.EnvVar{}
 	if registrySecretName != "" {
@@ -1294,6 +1469,7 @@ func (r *NodeProvisionReconciler) createImagePrepullJob(
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoff,
 			TTLSecondsAfterFinished: &ttl,
+			ActiveDeadlineSeconds:   &activeDeadline,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					NodeName:      np.Status.NodeName,

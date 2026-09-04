@@ -303,8 +303,22 @@ func WaitForInstanceRunning(
 	}
 
 	inst := out.Reservations[0].Instances[0]
-	if inst.State == nil || inst.State.Name != types.InstanceStateNameRunning {
-		return "", "", nil // caller should requeue
+	if inst.State == nil {
+		return "", "", nil // state not yet reported, caller should requeue
+	}
+	switch inst.State.Name {
+	case types.InstanceStateNameRunning:
+		// fall through to read IP addresses below
+	case types.InstanceStateNameTerminated, types.InstanceStateNameStopped,
+		types.InstanceStateNameStopping, types.InstanceStateNameShuttingDown:
+		// These states are never followed by Running again (barring an explicit
+		// StartInstances call this controller never makes) — surface an error so
+		// the caller fails the NodeProvision instead of polling forever.
+		return "", "", fmt.Errorf("instance %s entered terminal state %q and will never become running",
+			instanceID, inst.State.Name)
+	default:
+		// e.g. Pending — still launching, caller should requeue
+		return "", "", nil
 	}
 
 	private := awssdk.ToString(inst.PrivateIpAddress)

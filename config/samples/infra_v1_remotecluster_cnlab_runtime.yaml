@@ -16,7 +16,7 @@ metadata:
 type: Opaque
 stringData:
   username: "vitu-mafeni"
-  token: "ghp_tzldwREXAMPLETESTING6SFgEBT3H22Bf"  # packages:read scope minimum
+  token: "ghp_tzldwREXAMPLEhuzkIS6SFgEBT3H22Bf"  # packages:read scope minimum
 
 ---
 # ============================================================
@@ -114,15 +114,15 @@ spec:
         - key: KEYCLOAK_ADMIN_PASSWORD
           value: "changeme123"
         - key: JUPYTERHUB_API_TOKEN        # must match hub.services.quota-api.apiToken in jhub-values.yaml
-          value: "79044be905ddf54TESTESTING479eeec9d8dfad4ea7"
+          value: "79044be905ddf5EXAMPLE972fcb6f479eeec9d8dfad4ea7"
         - key: QUOTA_API_TOKEN             # must match hub.extraEnv.QUOTA_API_TOKEN — different from above
           value: "testtoken123"
         - key: DB_PASSWORD
           value: "quota-api"
         - key: CREDENTIAL_KEY              # Fernet key — generate once, never rotate without migrating data
-          value: "zz_dakGbNuEXAMPLETESTINGb7bMgGcUo1i6E7zoepU="
+          value: "zz_dakGbNuJyvJIX8zvA_ZcYb7bMgGcUo1i6E7zoepU="
         - key: GHCR_DOCKERCONFIGJSON       # raw JSON (not base64) — see generation command above
-          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldwRXWTYEXampLETESTINGBf","auth":"dml0dS1tYWZlbmk6Z2EXAMPLETESTING0lTNlNGZ0VCVDNIMjJCZg=="}}}'
+          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldEXAMPLEzkIS6SFgEBT3H22Bf","auth":"dml0dS1tYWZlbmk6Z2hwXEXAMPLE6a0lTNlNGZ0VCVDNIMjJCZg=="}}}'
 
         # ── Image tags (required — whatever you built and pushed to GHCR) ──────
         - key: QUOTA_API_IMAGE
@@ -242,12 +242,12 @@ stringData:
     6naU2QNVfQ2r2gGEeLhidktFmJE3oA+YJ2lGpQIDAQABAoIBAA8byNrGbkdBXjIJ
     izXUrnyP2zG1AqpxMWo6n0ncmXOEGc/wvDEOCtAO/6K+xd1yM9CWcJfSpKP7eV+i
     V3xzpGodSV2kvOEok72+hcfj+YClmtNAZgk8Y9tMvG9hGkMh+PL5Hs2Tbs29DSJb
-    cRZHaIs3w26CxIM8n5jxIwmQCgwKY+ISP9t6l/0axOOPwECpgOCQ3yWFeikmVKNe
-    xA/N894RuEXAMPLE TESTING
-    E1ORifJxuCAIHw2K7A9yoIGoXKHb9KHXCIGwL0HIg+3qD9+WeI0NTKy6DpbZ6rd4
-    twMcdbvQPKKwGkQlqW6B/k1QMrub2hEjQuHgy7kCgYBOkLSvzP9hJKNSBX/PhNUF
+    cRZHaIsEXAMPLE
     tA2kHQN9OarIrbFI8Ib/GG5ifPszcqeTHx2zUzciTbG+2maytPBn9ux5mKtrvtQT
-    6TpcDPIREuyrm1V6TESTINGWCF+dG7hzTviTctvr9tZV9
+    6TpcDPIREuyrm1V69Ifj25zDDOYyNluLo4KuDBSjtlR+ep9p7veSadeeHClWzn65
+    4whYT5uz0XPQQ7RfmvcyTQKBgAa+MlZsnb/81LZgzERE5mUULC73Ve6tzomZMceb
+    kY6GjrZKbWw9/Hjb2gv4d/9vo4QZE8FFeXB4NJMnWfK8JyB3QgWX+cM0xndsOhzD
+    us9nMBn3gK2W2pZdonx86unTbx0uqRG75YSojaXUCcWCF+dG7hzTviTctvr9tZV9
     yBEJAoGAFjw2ZLLaeE2QgOweFpqncEC5/qinpFc51dX8qTMfgNzDxb8EUOTfklBV
     hTpDPqU5c3ttLkACemOfp9eGUsIXPgCTYrDPzpKk6IIY+QLF8T7ANr1/zyju8SRK
     jtiM9JLrHsl6kUYB/3G4lUPo6hTcsavKTr1t4FeS1rcOfzswc1I=
@@ -263,7 +263,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: dckr_pat_gBTESTINGjCbAaQ8TWo
+  password: dckr_patEXAMPLEjCbAaQ8TWo
 ---
 # ============================================================
 # RemoteCluster — GPU worker node

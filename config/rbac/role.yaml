@@ -37,6 +37,15 @@ rules:
   - list
   - watch
 - apiGroups:
+  - infra.nephio.org
+  resources:
+  - tokens
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+- apiGroups:
   - infra.dcn.ssu.ac.kr
   resources:
   - remoteclusters
