@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,6 +47,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
@@ -125,6 +127,14 @@ const (
 	// NodeProvisionNetConfig — including on clusters provisioned before credentials
 	// were added — so every cluster stays able to pull runtime updates autonomously.
 	annotationCnlabCredentialsHash = "infra.dcn.ssu.ac.kr/cnlab-credentials-hash"
+	// annotationVPNConfigHash is the SHA-256 hex digest of the VPN server config
+	// (public IP, SSH port/username, vpnSshCredentialsRef) last pushed to the
+	// remote cluster's NodeProvisionNetConfig. When this differs from the
+	// current spec, the controller re-patches it on the remote cluster — this
+	// is what heals a remote push missed at controller-restart time (e.g. the
+	// remote cluster was unreachable then) on the next successful reconcile,
+	// without waiting for another restart or a worker-join event.
+	annotationVPNConfigHash = "infra.dcn.ssu.ac.kr/vpn-config-hash"
 	// annotationCoreVariantsCreated marks that core PackageVariants have been
 	// applied so the overlay step can proceed without blocking the reconcile
 	// worker thread with a sleep.
@@ -187,6 +197,7 @@ var packageVariantGVK = schema.GroupVersionKind{
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisionnetconfigs,verbs=get;list;watch;create;update;patch
 
 func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -268,6 +279,18 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				}
 			}
 
+			// Keep a local (management-cluster) NodeProvisionNetConfig in sync with
+			// this cluster's VPN config on every Ready-phase reconcile — independent
+			// of annotationNodeProvisionCreated above, which only gates the one-time
+			// SSH-based apply to the *remote* cluster. Without this, the local copy
+			// that ml-nodeprovision reads from (e.g. to VPN-connect newly-created AWS
+			// EC2 workers) has no source of truth at all and must be hand-authored,
+			// which is exactly how it can silently end up with an empty
+			// vpnSshCredentialsRef even though RemoteCluster.Spec.VPNConfig is correct.
+			if err := r.ensureLocalNodeProvisionNetConfig(ctx, cluster, cluster); err != nil {
+				log.Error(err, "syncing local NodeProvisionNetConfig (non-fatal)")
+			}
+
 			// Refresh the kubeadm bootstrap token when due — best-effort, never
 			// blocks PackageVariant creation.  Always fall through so that a
 			// freshly-Ready cluster reaches reconcilePackageVariants on the same
@@ -292,6 +315,17 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// feature existed (annotationCnlabCredentialsHash will be absent on them).
 			if err := r.syncCnlabCredentialsToRemote(ctx, cluster); err != nil {
 				log.Error(err, "syncing cnlab-runtime credentials to remote cluster (non-fatal)")
+			}
+
+			// Sync VPN config to the remote cluster whenever it drifts from the last
+			// successfully-pushed value — including catching up a push that was
+			// missed at controller-restart time because the remote cluster was
+			// unreachable then. Unreachability here is expected/normal (the
+			// provisioned cluster is decoupled from this controller), so failures
+			// are logged and retried next reconcile, never escalated.
+			if err := r.syncVPNConfigToRemote(ctx, cluster); err != nil {
+				log.Info("syncing VPN config to remote cluster — will retry next reconcile",
+					"reason", err.Error())
 			}
 
 			if cluster.Annotations[annotationPkgVariantsCreated] == "true" {
@@ -682,6 +716,9 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, clusterParent, sshClientCP, nodeIP, "update"); err != nil {
 			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed", fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
 		}
+		if err := r.ensureLocalNodeProvisionNetConfig(ctx, clusterParent, clusterParent); err != nil {
+			log.Error(err, "syncing local NodeProvisionNetConfig (non-fatal)")
+		}
 
 	} else {
 		log.Info("Worker already joined; skipping join step")
@@ -849,6 +886,108 @@ func rcBuildDaemonSetPrepullScript(images []string) string {
 	b.WriteString("echo \"[prepull] Done.\"\n")
 	b.WriteString("exec sleep infinity\n")
 	return b.String()
+}
+
+// ensureLocalNodeProvisionNetConfig creates or updates a NodeProvisionNetConfig
+// object on THIS (management) cluster — the one the ml-nodeprovision controller
+// reads from via requireNetConfig when provisioning new AWS/on-prem nodes that
+// need to VPN-join this logical cluster.
+//
+// This is distinct from handleCreateUpdateNodeProvisionConfig, which applies an
+// equivalent object to the REMOTE managed cluster over SSH (for that cluster's
+// own on-prem worker onboarding). Before this function existed, nothing ever
+// synced RemoteCluster.Spec.VPNConfig into a local NodeProvisionNetConfig: the
+// local object had to be hand-authored and kept in sync manually, which is
+// exactly how it ended up with an empty vpnSshCredentialsRef even though the
+// RemoteCluster itself had the correct value all along. Built from typed Go
+// structs (not string-templated YAML) so a field can't be silently dropped.
+//
+// clusterParent must be the control-plane RemoteCluster whose Spec.VPNConfig
+// and Spec.NodeInfo.SoftwareConfig are authoritative for the shared VPN server
+// and cluster software config; cluster is only used for its Spec.ClusterName
+// and Namespace, which are identical between a control-plane and its workers.
+func (r *RemoteClusterReconciler) ensureLocalNodeProvisionNetConfig(
+	ctx context.Context,
+	cluster *infrav1.RemoteCluster,
+	clusterParent *infrav1.RemoteCluster,
+) error {
+	log := logf.FromContext(ctx)
+	name := cluster.Spec.ClusterName + "-netconfig"
+
+	nc := &mlv1alpha1.NodeProvisionNetConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: cluster.Namespace,
+		},
+	}
+	res, err := controllerutil.CreateOrUpdate(ctx, r.Client, nc, func() error {
+		nc.Spec.ClusterName = clusterParent.Spec.ClusterName
+
+		if vpnCIDR := VPNRangeToCIDR(clusterParent.Spec.VPNConfig.IP); vpnCIDR != "" {
+			nc.Spec.VPNRange = &vpnCIDR
+		}
+
+		vpn := clusterParent.Spec.VPNConfig
+		nc.Spec.VPNServerPublicConfig = mlv1alpha1.VPNServerConfig{
+			PublicIP:    vpn.VPNServerPublicIP,
+			SSHPort:     defaultString(vpn.VPNServerSSHPort, "22"),
+			SSHUsername: defaultString(vpn.VPNServerSSHUsername, "ubuntu"),
+			VPNSSHCredentialsRef: mlv1alpha1.VPNSSHCredentialsRef{
+				Name:      vpn.VPNSSHCredentialsRef.Name,
+				NameSpace: vpn.VPNSSHCredentialsRef.NameSpace,
+				Key:       vpn.VPNSSHCredentialsRef.Key,
+			},
+		}
+
+		sw := clusterParent.Spec.NodeInfo.SoftwareConfig
+		nc.Spec.SoftwareConfig.KubernetesVersion = sw.KubernetesVersion
+
+		nc.Spec.SoftwareConfig.ImagePrepulls = nil
+		if len(sw.ImagePrepulls) > 0 {
+			prepulls := make([]mlv1alpha1.ImagePrepull, len(sw.ImagePrepulls))
+			for i, ip := range sw.ImagePrepulls {
+				prepulls[i] = mlv1alpha1.ImagePrepull{Image: ip.Image, NodeTarget: ip.NodeTarget}
+			}
+			nc.Spec.SoftwareConfig.ImagePrepulls = prepulls
+		}
+
+		nc.Spec.SoftwareConfig.ImagePullSecretRef = nil
+		if ref := sw.ImagePullSecretRef; ref != nil {
+			nc.Spec.SoftwareConfig.ImagePullSecretRef = &mlv1alpha1.SecretKeyReference{Name: ref.Name, Key: ref.Key}
+		}
+
+		nc.Spec.SoftwareConfig.CnlabRuntime = nil
+		if cr := sw.CnlabRuntime; cr != nil {
+			nc.Spec.SoftwareConfig.CnlabRuntime = &mlv1alpha1.CnlabRuntimeConfig{
+				Registry:    cr.Registry,
+				Repository:  cr.Repository,
+				Version:     cr.Version,
+				OrasVersion: cr.OrasVersion,
+				CredentialsRef: mlv1alpha1.VPNSSHCredentialsRef{
+					Name:      cr.CredentialsRef.Name,
+					NameSpace: cr.CredentialsRef.NameSpace,
+					Key:       cr.CredentialsRef.Key,
+				},
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("syncing local NodeProvisionNetConfig %q: %w", name, err)
+	}
+	if res != controllerutil.OperationResultNone {
+		log.Info("Synced local NodeProvisionNetConfig from RemoteCluster VPN config",
+			"netconfig", name, "operation", res)
+	}
+	return nil
+}
+
+// defaultString returns s if non-empty, otherwise fallback.
+func defaultString(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig( //nolint:unparam
@@ -1567,6 +1706,9 @@ func (r *RemoteClusterReconciler) completeControlPlane(
 	}
 	if patchErr := r.patchAnnotation(ctx, cluster, annotationNodeProvisionCreated, "true"); patchErr != nil {
 		log.Error(patchErr, "Failed to stamp node-provision-created annotation")
+	}
+	if err := r.ensureLocalNodeProvisionNetConfig(ctx, cluster, cluster); err != nil {
+		log.Error(err, "syncing local NodeProvisionNetConfig (non-fatal)")
 	}
 
 	// All side-effects done — now flip to Ready and persist the join command.
@@ -3040,10 +3182,16 @@ func (r *RemoteClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// Start implements manager.Runnable. On controller startup it performs a
-// best-effort credential + VPN config sync to every Ready control-plane
-// RemoteCluster. Unreachable clusters are logged and skipped — no retry
-// counter is incremented.
+// Start implements manager.Runnable. On controller startup it resyncs, for
+// every Ready control-plane RemoteCluster:
+//  1. The local (management-cluster) NodeProvisionNetConfig — credentials refs
+//     and VPN config, via a plain in-cluster API write. Always attempted,
+//     regardless of whether the remote cluster is reachable.
+//  2. The remote cluster's own credential + VPN config secrets, over SSH.
+//     A provisioned cluster is meant to be decoupled from this controller —
+//     it keeps running on its own once joined — so an unreachable remote
+//     cluster here is only logged and skipped, never retried with a counter
+//     or surfaced as a status/condition change.
 func (r *RemoteClusterReconciler) Start(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithName("startup-sync")
 	log.Info("Running startup sync for all Ready RemoteClusters")
@@ -3064,11 +3212,34 @@ func (r *RemoteClusterReconciler) Start(ctx context.Context) error {
 			return nil
 		default:
 		}
+
+		// Local NodeProvisionNetConfig resync — a plain in-cluster API write,
+		// no SSH involved. Do this unconditionally, before attempting SSH: a
+		// provisioned cluster is meant to keep working via its VPN mesh even
+		// when it (or the network path to it) is unreachable from this
+		// management cluster, so ml-nodeprovision's local copy of its VPN/
+		// credentials config must never depend on remote reachability to stay
+		// current. This is also what heals a stale/empty vpnSshCredentialsRef
+		// on the local NodeProvisionNetConfig across a controller restart,
+		// without needing the remote cluster to be reachable at all.
+		if err := r.ensureLocalNodeProvisionNetConfig(ctx, cluster, cluster); err != nil {
+			log.Error(err, "startup sync: failed to resync local NodeProvisionNetConfig (non-fatal)",
+				"cluster", cluster.Name)
+		} else {
+			log.Info("startup sync: local NodeProvisionNetConfig resynced", "cluster", cluster.Name)
+		}
+
+		// Remote (SSH-based) credential + VPN config push. The remote cluster
+		// is intentionally decoupled from this controller once provisioned —
+		// it must keep running even if this management cluster is down or the
+		// remote cluster is temporarily unreachable — so a failure here is
+		// logged and skipped, never retried with a counter or surfaced as a
+		// RemoteCluster status/condition change.
 		if err := r.startupSyncCluster(ctx, cluster); err != nil {
-			log.Info("startup sync: cluster not reachable — skipping",
+			log.Info("startup sync: cluster not reachable via SSH — skipping remote resync",
 				"cluster", cluster.Name, "reason", err.Error())
 		} else {
-			log.Info("startup sync: completed", "cluster", cluster.Name)
+			log.Info("startup sync: remote resync completed", "cluster", cluster.Name)
 		}
 	}
 	return nil
@@ -3126,6 +3297,34 @@ data:
 	}
 
 	// --- VPN config ---
+	if err := pushVPNConfigViaSSH(sshClient, cluster); err != nil {
+		return err
+	}
+	log.Info("Pushed VPN config to NodeProvisionNetConfig")
+	return nil
+}
+
+// vpnConfigHash returns a stable hash of the VPN server config fields pushed
+// to a remote cluster's NodeProvisionNetConfig. Used to detect drift so the
+// config is only re-pushed (over SSH) when it actually changed, instead of on
+// every reconcile.
+func vpnConfigHash(vpn infrav1.VPNConfig) string {
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%s|%s|%s",
+		vpn.VPNServerPublicIP,
+		vpn.VPNServerSSHPort,
+		vpn.VPNServerSSHUsername,
+		vpn.VPNSSHCredentialsRef.Name,
+		vpn.VPNSSHCredentialsRef.NameSpace,
+		vpn.VPNSSHCredentialsRef.Key,
+	)))
+	return fmt.Sprintf("%x", h)
+}
+
+// pushVPNConfigViaSSH patches the vpnServerPublicConfig block of the remote
+// cluster's own NodeProvisionNetConfig over an already-connected SSH client.
+// A no-op (returns nil without doing anything) when no VPN server is
+// configured yet.
+func pushVPNConfigViaSSH(sshClient *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
 	vpn := cluster.Spec.VPNConfig
 	if vpn.VPNServerPublicIP == "" {
 		return nil
@@ -3150,7 +3349,52 @@ data:
 	if out, sshErr := sshhelper.Run(sshClient, vpnPatchCmd); sshErr != nil {
 		return fmt.Errorf("patching NodeProvisionNetConfig VPN config: %w\nOutput: %s", sshErr, out)
 	}
-	log.Info("Pushed VPN config to NodeProvisionNetConfig")
+	return nil
+}
+
+// syncVPNConfigToRemote re-pushes the VPN server config to the remote
+// cluster's NodeProvisionNetConfig whenever it has drifted from the last
+// successfully-pushed value (tracked via annotationVPNConfigHash). This is
+// what heals a remote push missed at controller-restart time (the remote
+// cluster was unreachable then) on the next successful periodic reconcile,
+// instead of requiring another restart or a worker-join event.
+//
+// Deliberately has no retry counter or terminal/blocking condition, unlike
+// syncCnlabCredentialsToRemote: a provisioned cluster is meant to be
+// decoupled from this controller, so a persistently unreachable remote
+// cluster here is just logged and retried again next reconcile — forever —
+// never escalated into a state requiring manual intervention.
+func (r *RemoteClusterReconciler) syncVPNConfigToRemote(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	log := logf.FromContext(ctx)
+
+	vpn := cluster.Spec.VPNConfig
+	if vpn.VPNServerPublicIP == "" {
+		// No VPN server configured yet — nothing to push.
+		return nil
+	}
+
+	newHash := vpnConfigHash(vpn)
+	if cluster.Annotations[annotationVPNConfigHash] == newHash {
+		return nil
+	}
+	log.Info("VPN config changed — syncing to remote cluster's NodeProvisionNetConfig")
+
+	sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+	defer cancel()
+	sshClient, err := r.getSSHClient(sshCtx, cluster)
+	if err != nil {
+		return fmt.Errorf("SSH connection for VPN config sync: %w", err)
+	}
+	defer func() { _ = sshClient.Conn.Close() }()
+
+	if err := pushVPNConfigViaSSH(sshClient, cluster); err != nil {
+		return err
+	}
+	log.Info("Synced VPN config to remote NodeProvisionNetConfig")
+
+	if patchErr := r.patchAnnotation(ctx, cluster, annotationVPNConfigHash, newHash); patchErr != nil {
+		log.Error(patchErr, "failed to stamp VPN config hash annotation (non-fatal)")
+	}
 	return nil
 }
 
