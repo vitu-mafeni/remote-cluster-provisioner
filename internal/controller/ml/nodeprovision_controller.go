@@ -24,6 +24,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,10 +35,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
 
@@ -2543,6 +2547,66 @@ rm -f /tmp/.reg-sync`,
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// nodeProvisionReconcilePredicate filters the primary NodeProvision watch so
+// that this reconciler's OWN status-subresource writes — phase transitions,
+// message/progress updates, LastUpdated bumps, which make up the vast
+// majority of the writes throughout this file — do not immediately
+// re-trigger another reconcile.
+//
+// Without this, every Status().Update call fires a new watch event and a new
+// reconcile is enqueued right away, racing far ahead of the RequeueAfter
+// values used everywhere in this file for pacing (e.g. requeueFailed,
+// requeueShort). In practice this turned every failure/retry loop into a
+// tight burst of several attempts within a few seconds instead of the
+// intended ~1-2 minutes apart — hammering the VPN SSH server and the AWS API
+// on every single failure instead of backing off.
+//
+// It still lets through anything that is NOT a pure status-only change:
+//   - Generation changes: any .spec edit, including our own
+//     resolveAWSDefaults patch.
+//   - Finalizer changes: critical — the finalizer-add step early in
+//     Reconcile returns ctrl.Result{}, nil with no RequeueAfter and relies
+//     entirely on the watch firing again from that same Update event to
+//     proceed. A bare predicate.GenerationChangedPredicate{} would leave
+//     every new NodeProvision stuck forever right after its finalizer is
+//     added, since finalizer changes don't bump generation.
+//   - DeletionTimestamp changes: so an external delete request is picked up
+//     promptly instead of waiting for the next unrelated status write.
+//   - Annotation/label changes: for parity with finalizers. Nothing
+//     currently depends on this (annotation writes here always pair with an
+//     explicit RequeueAfter), but it costs nothing to let through.
+func nodeProvisionReconcilePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return true },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectOld == nil || e.ObjectNew == nil {
+				return true
+			}
+			if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() {
+				return true
+			}
+			if !reflect.DeepEqual(e.ObjectOld.GetFinalizers(), e.ObjectNew.GetFinalizers()) {
+				return true
+			}
+			if !reflect.DeepEqual(e.ObjectOld.GetAnnotations(), e.ObjectNew.GetAnnotations()) {
+				return true
+			}
+			if !reflect.DeepEqual(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels()) {
+				return true
+			}
+			oldDel := e.ObjectOld.GetDeletionTimestamp()
+			newDel := e.ObjectNew.GetDeletionTimestamp()
+			if (oldDel == nil) != (newDel == nil) {
+				return true
+			}
+			// Pure status-only (or no-op) change — skip; RequeueAfter drives pacing instead.
+			return false
+		},
+	}
+}
+
 func (r *NodeProvisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Register as a Runnable so Start() receives the manager's root context,
 	// which background provisioning goroutines use to stop on graceful shutdown.
@@ -2550,7 +2614,7 @@ func (r *NodeProvisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("registering NodeProvisionReconciler as Runnable: %w", err)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&mlv1alpha1.NodeProvision{}).
+		For(&mlv1alpha1.NodeProvision{}, builder.WithPredicates(nodeProvisionReconcilePredicate())).
 		Named("ml-nodeprovision").
 		Watches(
 			&mlv1alpha1.NodeProvisionNetConfig{},

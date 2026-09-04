@@ -3309,7 +3309,8 @@ data:
 // config is only re-pushed (over SSH) when it actually changed, instead of on
 // every reconcile.
 func vpnConfigHash(vpn infrav1.VPNConfig) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%s|%s|%s",
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s",
+		vpn.IP,
 		vpn.VPNServerPublicIP,
 		vpn.VPNServerSSHPort,
 		vpn.VPNServerSSHUsername,
@@ -3320,10 +3321,16 @@ func vpnConfigHash(vpn infrav1.VPNConfig) string {
 	return fmt.Sprintf("%x", h)
 }
 
-// pushVPNConfigViaSSH patches the vpnServerPublicConfig block of the remote
-// cluster's own NodeProvisionNetConfig over an already-connected SSH client.
-// A no-op (returns nil without doing anything) when no VPN server is
-// configured yet.
+// pushVPNConfigViaSSH patches the vpnRange and vpnServerPublicConfig fields of
+// the remote cluster's own NodeProvisionNetConfig over an already-connected
+// SSH client. A no-op (returns nil without doing anything) when no VPN server
+// is configured yet.
+//
+// vpnRange must be kept in sync here too, not just vpnServerPublicConfig:
+// on-prem node provisioning reads this remote NodeProvisionNetConfig (the
+// same way AWS provisioning reads the local one), so a missing/stale vpnRange
+// here causes the identical "NodeProvisionNetConfig has no vpnRange
+// configured" failure for on-prem nodes joining this cluster.
 func pushVPNConfigViaSSH(sshClient *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
 	vpn := cluster.Spec.VPNConfig
 	if vpn.VPNServerPublicIP == "" {
@@ -3333,12 +3340,14 @@ func pushVPNConfigViaSSH(sshClient *sshhelper.Client, cluster *infrav1.RemoteClu
 	if vpnPort == "" {
 		vpnPort = "22"
 	}
+	vpnCIDR := VPNRangeToCIDR(vpn.IP)
 	vpnPatchCmd := fmt.Sprintf(
 		`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge -p `+
-			`'{"spec":{"vpnServerPublicConfig":{"publicIP":%q,"sshPort":%q,"sshUsername":%q,`+
+			`'{"spec":{"vpnRange":%q,"vpnServerPublicConfig":{"publicIP":%q,"sshPort":%q,"sshUsername":%q,`+
 			`"vpnSshCredentialsRef":{"name":%q,"namespace":%q,"key":%q}}}}'`,
 		cluster.Spec.ClusterName,
 		cluster.Namespace,
+		vpnCIDR,
 		vpn.VPNServerPublicIP,
 		vpnPort,
 		vpn.VPNServerSSHUsername,
