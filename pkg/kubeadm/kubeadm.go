@@ -313,7 +313,7 @@ fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 
 		// ── Phase 6: Kubernetes components ───────────────────────────────────────────
 		{Name: "K8s Install", Steps: []string{
-			fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages", clean, clean, clean),
+			fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages --allow-downgrades", clean, clean, clean),
 			"sudo apt-mark hold kubelet kubeadm kubectl",
 			"sudo systemctl enable kubelet",
 			"sudo systemctl stop kubelet 2>/dev/null || true",
