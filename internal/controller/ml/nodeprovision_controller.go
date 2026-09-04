@@ -66,6 +66,13 @@ type onPremJobResult struct {
 type NodeProvisionReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// APIReader is a direct (non-cached) client used for reads where an
+	// informer-cache lag could cause a false failure — e.g. reading the
+	// NodeProvisionNetConfig that node provisioning depends on immediately
+	// after this controller (re)starts, before its watch cache is guaranteed
+	// to reflect the very latest write. Falls back to the cached Client when
+	// nil (e.g. in tests that don't set it).
+	APIReader client.Reader
 	// CredMgr handles background refresh of AWS STS / MFA-backed sessions.
 	CredMgr *awsprovision.CredentialManager
 	// onPremJobs holds in-flight on-prem provisioning goroutines.
@@ -1947,7 +1954,20 @@ const joinTokenMaxAge = 20 * time.Hour
 func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1alpha1.NodeProvision) (*mlv1alpha1.NodeProvisionNetConfig, error) {
 	log := logf.FromContext(ctx)
 	netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
-	if err := r.List(ctx, netConfigList, client.InNamespace(np.Namespace)); err != nil {
+	// Read directly from the API server (bypassing the informer cache) rather
+	// than via r.List/r.Client. Every field of this object — VPN config,
+	// credentials refs, Kubernetes version — is load-bearing for provisioning,
+	// checked only once per attempt with no re-validation, so even a brief
+	// cache lag (e.g. immediately after this controller restarts, or right
+	// after RemoteCluster's sync writes a fresh copy) can surface as a
+	// confusing "field X is empty" failure despite the object being fully
+	// correct in etcd. This read is infrequent enough that the extra API
+	// server round-trip is a non-issue.
+	lister := r.APIReader
+	if lister == nil {
+		lister = r.Client
+	}
+	if err := lister.List(ctx, netConfigList, client.InNamespace(np.Namespace)); err != nil {
 		return nil, fmt.Errorf("listing NodeProvisionNetConfigs: %w", err)
 	}
 	if len(netConfigList.Items) == 0 {
@@ -1973,8 +1993,9 @@ func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1
 			log.Error(err, "Failed to refresh bootstrap token")
 			return nil, fmt.Errorf("refreshing bootstrap token: %w", err)
 		}
-		// Re-fetch so callers see the updated join command.
-		if err := r.Get(ctx, client.ObjectKeyFromObject(nc), nc); err != nil {
+		// Re-fetch (uncached, for the same read-after-write reason as above) so
+		// callers see the updated join command.
+		if err := lister.Get(ctx, client.ObjectKeyFromObject(nc), nc); err != nil {
 			return nil, fmt.Errorf("re-fetching NodeProvisionNetConfig after token refresh: %w", err)
 		}
 	} else if nc.Status.JoinTokenRefreshedAt != nil {

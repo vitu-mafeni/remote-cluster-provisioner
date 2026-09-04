@@ -195,9 +195,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&mlcontroller.NodeProvisionReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		CredMgr: credMgr,
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		CredMgr:   credMgr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "NodeProvision")
 		os.Exit(1)
