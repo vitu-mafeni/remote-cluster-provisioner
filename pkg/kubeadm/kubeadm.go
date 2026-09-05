@@ -212,28 +212,35 @@ mode: ipvs
 
 		// ── Phase 1: NFS server ──────────────────────────────────────────────────────
 		{Name: "NFS Server", Steps: []string{
-			// Idempotent: skip install and chown if nfs-kernel-server is already active.
+			// Package install/enable is gated on nfs-kernel-server not already
+			// being active — fine to skip since that only concerns the service
+			// itself. The /srv/nfs/k8s export below must NOT be nested inside
+			// this guard: on a node where nfs-kernel-server is already active
+			// for an unrelated, pre-existing export (e.g. a KubeVirt NFS setup
+			// that predates this provisioner running), the guard would be false
+			// and our own /srv/nfs/k8s directory/export would silently never be
+			// created, leaving kubelet's later NFS mounts to fail with "access
+			// denied by server" since the path was never in /etc/exports at all.
 			`if ! systemctl is-active --quiet nfs-kernel-server; then
   sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
   sudo flock /var/lib/dpkg/lock-frontend -w 60 true 2>/dev/null || true
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server nfs-common
-  sudo mkdir -p /srv/nfs/k8s
-  sudo chown nobody:nogroup /srv/nfs/k8s
-  sudo chmod 755 /srv/nfs/k8s
-  echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports
-  sudo exportfs -ra
   sudo systemctl enable --now nfs-kernel-server
 else
-  echo "nfs-kernel-server already active, skipping"
-fi`,
+  echo "nfs-kernel-server already active, skipping install/enable"
+fi
+sudo mkdir -p /srv/nfs/k8s
+sudo chown nobody:nogroup /srv/nfs/k8s
+sudo chmod 755 /srv/nfs/k8s
+grep -qxF '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' /etc/exports || \
+  echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
+sudo exportfs -ra`,
 
 			// Second, separate export for Enterprise Gateway's kernelspecs (see
 			// EGKernelspecsExportPath). Kept as its own always-run, self-idempotent
-			// step — NOT nested inside the "if ! systemctl is-active" guard above —
-			// so a resumed/retried run (nfs-kernel-server already active from a
-			// prior attempt) still adds this export rather than being skipped along
-			// with the whole block. Appends to /etc/exports (tee -a) rather than
+			// step so a resumed/retried run still adds this export rather than
+			// being skipped. Appends to /etc/exports (tee -a) rather than
 			// overwriting it, since the step above already wrote the /srv/nfs/k8s
 			// line to that file.
 			fmt.Sprintf(`sudo mkdir -p %[1]s /srv/nfs/k8s
