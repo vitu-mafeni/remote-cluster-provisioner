@@ -373,18 +373,53 @@ exit $RC )`,
 		}},
 
 		// ── Phase 9: CNI ─────────────────────────────────────────────────────────────
+		// This phase re-runs in full on every retry until "kubectl wait" below
+		// succeeds (it is not itself split into sub-steps that can be marked
+		// done independently). Every mutation here MUST therefore be a no-op
+		// when already applied, and the DaemonSet must only be bounced when a
+		// change actually happened this run — otherwise a slow-to-converge
+		// cluster gets its CNI pod killed and recreated on every ~30-60s
+		// retry, which prevents the node from ever holding a stable Ready
+		// state long enough to satisfy the wait.
 		{Name: "CNI", Steps: []string{
+			// Flannel's cni-conf.json chains the "flannel" plugin (installed by
+			// flannel's own init container) with the standard "portmap" plugin,
+			// which flannel does NOT ship. Without it CRI-O rejects the whole
+			// conflist as invalid ("failed to find plugin portmap in path
+			// [/opt/cni/bin/]") and reports NetworkPluginNotReady forever, even
+			// though the conflist file is present on disk. Install the standard
+			// CNI plugins bundle so portmap (and friends) exist before flannel
+			// comes up. Idempotent: skipped once portmap is already present.
+			`if [ ! -x /opt/cni/bin/portmap ]; then
+  ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+  CNI_PLUGINS_VERSION=v1.5.1
+  curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${ARCH}-${CNI_PLUGINS_VERSION}.tgz" -o /tmp/cni-plugins.tgz
+  sudo mkdir -p /opt/cni/bin
+  sudo tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin
+  rm -f /tmp/cni-plugins.tgz
+fi`,
 			"kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml",
-			`kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface=wg0"}]'`,
-			// Flannel's VXLAN backend defaults to UDP port 8472, which collides
-			// with other VXLAN users already on the host network namespace (e.g.
-			// Cilium-managed LXD/Incus containers on bare-metal nodes bind
-			// 0.0.0.0:8472 for cilium_vxlan), causing "failed to set interface
-			// flannel.1 to UP state: address already in use". Pin flannel to a
-			// distinct port so its VXLAN socket bind never contends with a
-			// pre-existing one. Network below matches the podSubnet configured
-			// in kubeadmConfig above.
-			`cat <<'EOF' > /tmp/net-conf.json
+			// `kubectl apply` above resets the DaemonSet's args to the upstream
+			// manifest (which has no --iface=wg0) on every run, so this check
+			// will legitimately re-fire once per retry until the CNI phase
+			// finally completes — but only bounces the daemonset when the flag
+			// is genuinely missing, not unconditionally.
+			`CHANGED=0
+kubectl -n kube-flannel get daemonset kube-flannel-ds -o jsonpath='{.spec.template.spec.containers[0].args}' | grep -q -- '--iface=wg0' || {
+  kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface=wg0"}]'
+  CHANGED=1
+}
+# Flannel's VXLAN backend defaults to UDP port 8472, which collides with
+# other VXLAN users already on the host network namespace (e.g.
+# Cilium-managed LXD/Incus containers on bare-metal nodes bind
+# 0.0.0.0:8472 for cilium_vxlan), causing "failed to set interface
+# flannel.1 to UP state: address already in use". Pin flannel to a
+# distinct port so its VXLAN socket bind never contends with a
+# pre-existing one. Network below matches the podSubnet configured in
+# kubeadmConfig above. Only rewritten (and the daemonset only bounced) if
+# not already configured, so a healthy flannel pod is left alone on retry.
+kubectl -n kube-flannel get configmap kube-flannel-cfg -o jsonpath='{.data.net-conf\.json}' | grep -q '"Port": 8473' || {
+  cat <<'EOF' > /tmp/net-conf.json
 {
   "Network": "10.244.0.0/16",
   "Backend": {
@@ -393,10 +428,14 @@ exit $RC )`,
   }
 }
 EOF
-kubectl -n kube-flannel create configmap kube-flannel-cfg \
-  --from-file=net-conf.json=/tmp/net-conf.json \
-  --dry-run=client -o json | kubectl -n kube-flannel patch configmap kube-flannel-cfg --type merge --patch-file=/dev/stdin`,
-			"kubectl -n kube-flannel rollout restart daemonset kube-flannel-ds",
+  kubectl -n kube-flannel create configmap kube-flannel-cfg \
+    --from-file=net-conf.json=/tmp/net-conf.json \
+    --dry-run=client -o json | kubectl -n kube-flannel patch configmap kube-flannel-cfg --type merge --patch-file=/dev/stdin
+  CHANGED=1
+}
+if [ "$CHANGED" = "1" ]; then
+  kubectl -n kube-flannel rollout restart daemonset kube-flannel-ds
+fi`,
 			"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
 			"kubectl wait --for=condition=Ready nodes --all --timeout=180s",
 		}},
@@ -667,6 +706,22 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 
 		// ── Phase 8: kubeadm join ─────────────────────────────────────────────────────
 		{Name: "kubeadm Join", Steps: []string{
+			// The cluster-wide flannel DaemonSet will schedule a pod onto this
+			// node once it joins. Its cni-conf.json chains the "flannel" plugin
+			// (installed by flannel's own init container) with the standard
+			// "portmap" plugin, which flannel does NOT ship — without it CRI-O
+			// rejects the whole conflist as invalid and this node's kubelet
+			// reports NetworkPluginNotReady forever. Install the standard CNI
+			// plugins bundle here so portmap is already present before the
+			// flannel pod lands. Idempotent: skipped once portmap is present.
+			`if [ ! -x /opt/cni/bin/portmap ]; then
+  ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+  CNI_PLUGINS_VERSION=v1.5.1
+  curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${ARCH}-${CNI_PLUGINS_VERSION}.tgz" -o /tmp/cni-plugins.tgz
+  sudo mkdir -p /opt/cni/bin
+  sudo tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin
+  rm -f /tmp/cni-plugins.tgz
+fi`,
 			fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
 		}},
 	}
