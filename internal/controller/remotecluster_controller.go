@@ -1436,7 +1436,11 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 	}
 	defer func() { _ = sshClient.Conn.Close() }()
 
-	out, err := sshhelper.Run(sshClient, "kubeadm token create --print-join-command 2>/dev/null")
+	// --kubeconfig is explicit rather than relying on kubeadm's default
+	// resolution — see the identical comment in pkg/kubeadm/kubeadm.go's
+	// getJoinCommand for why: a stray KUBECONFIG env var on the target host
+	// can silently redirect kubeadm at an unrelated API server.
+	out, err := sshhelper.Run(sshClient, "kubeadm token create --print-join-command --kubeconfig=/etc/kubernetes/admin.conf 2>/dev/null")
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("kubeadm token create: %w\nOutput: %s", err, out)
 	}

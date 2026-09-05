@@ -486,7 +486,13 @@ done`, nfsDir, nfsDir, nfsServerIP),
 }
 
 func getJoinCommand(client *sshhelper.Client) (string, error) {
-	output, err := sshhelper.Run(client, "sudo kubeadm token create --print-join-command --ttl 24h")
+	// --kubeconfig is explicit rather than relying on kubeadm's default
+	// resolution: a stray KUBECONFIG env var on the target host (e.g. left
+	// over from an unrelated kubeadm/k8s setup that predates this cluster)
+	// silently redirects kubeadm at a different API server entirely, which
+	// surfaces as a confusing TLS SAN mismatch against the *correct*
+	// cluster's certificate rather than a connection failure.
+	output, err := sshhelper.Run(client, "sudo kubeadm token create --print-join-command --ttl 24h --kubeconfig=/etc/kubernetes/admin.conf")
 	if err != nil {
 		return "", fmt.Errorf("kubeadm token create failed: %w\nOutput: %s", err, output)
 	}
