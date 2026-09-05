@@ -197,6 +197,13 @@ mode: ipvs
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
 			"sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
+			// kubeadm reset does NOT remove CNI-created virtual interfaces. A stale
+			// flannel.1 (VXLAN) or cni0 (bridge) left over from a previous
+			// init/reset cycle causes the next flanneld to fail with
+			// "failed to set interface flannel.1 to UP state: address already in use".
+			"sudo ip link delete flannel.1 2>/dev/null || true",
+			"sudo ip link delete cni0 2>/dev/null || true",
+			"sudo ip link delete kube-ipvs0 2>/dev/null || true",
 			// Remove cnlab-runtime so the CRI-O Install phase always performs a
 			// fresh install. dpkg --remove keeps config files in /etc/ but removes
 			// all binaries, ensuring crio/criu are reinstalled from the OCI artifact.
@@ -362,6 +369,27 @@ exit $RC )`,
 		{Name: "CNI", Steps: []string{
 			"kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml",
 			`kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface=wg0"}]'`,
+			// Flannel's VXLAN backend defaults to UDP port 8472, which collides
+			// with other VXLAN users already on the host network namespace (e.g.
+			// Cilium-managed LXD/Incus containers on bare-metal nodes bind
+			// 0.0.0.0:8472 for cilium_vxlan), causing "failed to set interface
+			// flannel.1 to UP state: address already in use". Pin flannel to a
+			// distinct port so its VXLAN socket bind never contends with a
+			// pre-existing one. Network below matches the podSubnet configured
+			// in kubeadmConfig above.
+			`cat <<'EOF' > /tmp/net-conf.json
+{
+  "Network": "10.244.0.0/16",
+  "Backend": {
+    "Type": "vxlan",
+    "Port": 8473
+  }
+}
+EOF
+kubectl -n kube-flannel create configmap kube-flannel-cfg \
+  --from-file=net-conf.json=/tmp/net-conf.json \
+  --dry-run=client -o json | kubectl -n kube-flannel patch configmap kube-flannel-cfg --type merge --patch-file=/dev/stdin`,
+			"kubectl -n kube-flannel rollout restart daemonset kube-flannel-ds",
 			"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
 			"kubectl wait --for=condition=Ready nodes --all --timeout=180s",
 		}},
@@ -552,6 +580,13 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
 			"sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
+			// kubeadm reset does NOT remove CNI-created virtual interfaces. A stale
+			// flannel.1 (VXLAN) or cni0 (bridge) left over from a previous
+			// init/join/reset cycle causes the next flanneld to fail with
+			// "failed to set interface flannel.1 to UP state: address already in use".
+			"sudo ip link delete flannel.1 2>/dev/null || true",
+			"sudo ip link delete cni0 2>/dev/null || true",
+			"sudo ip link delete kube-ipvs0 2>/dev/null || true",
 			"sudo dpkg --remove cnlab-runtime 2>/dev/null || true",
 		}},
 
