@@ -110,6 +110,85 @@ const (
 	WorkerPhaseJoin        = 8
 )
 
+// insecureRegistriesConfStep returns a shell step that marks the registry
+// host:port of every private image reference in imagePrepulls as insecure
+// (plain HTTP) via a CRI-O registries.conf.d drop-in. This platform's
+// self-hosted registries (e.g. Harbor exposed through a NodePort on the
+// node's own LAN IP) are reached over plain HTTP, not TLS — without this,
+// CRI-O defaults to HTTPS and every pull fails with "server gave HTTP
+// response to HTTPS client". Returns "" (add nothing) when no image
+// reference has a qualified registry host to configure.
+func insecureRegistriesConfStep(imagePrepulls []infrav1.ImagePrepull) string {
+	seen := map[string]bool{}
+	var hosts []string
+	for _, ip := range imagePrepulls {
+		host, _, found := strings.Cut(ip.Image, "/")
+		if !found {
+			continue
+		}
+		// A bare Docker Hub org/user (e.g. "library", "vitu1") has no dot or
+		// colon and isn't a registry host — skip it so unqualified images
+		// don't misfire this check.
+		if !strings.ContainsAny(host, ".:") || seen[host] {
+			continue
+		}
+		seen[host] = true
+		hosts = append(hosts, host)
+	}
+	if len(hosts) == 0 {
+		return ""
+	}
+	fileName := strings.NewReplacer(".", "-", ":", "-").Replace
+	var b strings.Builder
+	b.WriteString("sudo mkdir -p /etc/containers/registries.conf.d\n")
+	for _, h := range hosts {
+		fmt.Fprintf(&b, "cat <<'EOF' | sudo tee /etc/containers/registries.conf.d/50-insecure-%s.conf > /dev/null\n"+
+			"[[registry]]\nlocation = \"%s\"\ninsecure = true\nEOF\n", fileName(h), h)
+	}
+	return b.String()
+}
+
+// joinWorkerSteps returns the shell steps that wait for the control-plane API
+// server to become reachable over the VPN tunnel, then run kubeadm join with
+// its own retry loop. kubeadm's own preflight check for the cluster-info
+// ConfigMap uses a short (~10s) internal timeout, which is too tight for a
+// worker whose WireGuard tunnel may not have finished its handshake/routing
+// yet — that transient race is what produces "couldn't validate the identity
+// of the API Server ... context deadline exceeded". Explicitly waiting for
+// the endpoint to answer first, then retrying the join itself a few times,
+// converges far faster than relying on an outer reconcile retry.
+func joinWorkerSteps(joinCmd string) []string {
+	apiEndpoint := ""
+	fields := strings.Fields(joinCmd)
+	for i, f := range fields {
+		if f == "join" && i+1 < len(fields) {
+			apiEndpoint = fields[i+1]
+			break
+		}
+	}
+
+	var steps []string
+	if apiEndpoint != "" {
+		steps = append(steps, fmt.Sprintf(`echo "Waiting for control-plane API server %[1]s to become reachable over the VPN tunnel..."
+for i in $(seq 1 60); do
+  curl -sk --connect-timeout 3 --max-time 5 "https://%[1]s/healthz" -o /dev/null && { echo "Control-plane API server reachable"; break; }
+  sleep 5
+done`, apiEndpoint))
+	}
+	steps = append(steps, fmt.Sprintf(`for attempt in 1 2 3 4 5; do
+  if sudo %s --cri-socket=unix:///var/run/crio/crio.sock; then
+    echo "kubeadm join succeeded"
+    break
+  fi
+  if [ "$attempt" = "5" ]; then
+    echo "ERROR: kubeadm join failed after 5 attempts" >&2
+    exit 1
+  fi
+  sleep $((attempt * 15))
+done`, joinCmd))
+	return steps
+}
+
 func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster, startPhase int, onPhaseComplete func(int), runtimeCfg pkgruntime.Config) (string, error) {
 	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
 
@@ -180,6 +259,28 @@ apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
 mode: ipvs
 `, tunIP, clean, cluster.Spec.ClusterName)
+
+	// Mirrors the worker-join labeling logic below (see labelAndTaintCmd) so a
+	// single-node ("one box") cluster — where the control-plane node is also
+	// the only compute node — gets the same gpu=on label and PreferNoSchedule
+	// taint a GPU worker would, instead of only the bare hardware-type label.
+	var postInitLabelCmd string
+	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+		postInitLabelCmd = fmt.Sprintf(
+			"kubectl label nodes --all hardware-type=%s gpu=on ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite && kubectl taint nodes --all hardware-type=gpu:PreferNoSchedule --overwrite",
+			cluster.Spec.NodeInfo.HardwareType,
+		)
+	} else {
+		postInitLabelCmd = fmt.Sprintf(
+			"kubectl label nodes --all hardware-type=%s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite",
+			cluster.Spec.NodeInfo.HardwareType,
+		)
+	}
+
+	crioInstallSteps := pkgruntime.InstallSteps(runtimeCfg)
+	if s := insecureRegistriesConfStep(cluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls); s != "" {
+		crioInstallSteps = append(crioInstallSteps, s)
+	}
 
 	phases := []ProvisionPhase{
 		// ── Phase 0: Cleanup ─────────────────────────────────────────────────────────
@@ -299,7 +400,7 @@ fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 		}},
 
 		// ── Phase 4: CRI-O Install ──────────────────────────────────────────────────
-		{Name: "CRI-O Install", Steps: pkgruntime.InstallSteps(runtimeCfg)},
+		{Name: "CRI-O Install", Steps: crioInstallSteps},
 
 		// ── Phase 5: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
@@ -369,7 +470,7 @@ exit $RC )`,
 		// ── Phase 8: Post-init ───────────────────────────────────────────────────────
 		{Name: "Post-Init", Steps: []string{
 			"kubectl taint nodes --all node-role.kubernetes.io/control-plane- || kubectl taint nodes --all node-role.kubernetes.io/master- || true",
-			fmt.Sprintf("kubectl label nodes --all hardware-type=%s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite", cluster.Spec.NodeInfo.HardwareType),
+			postInitLabelCmd,
 		}},
 
 		// ── Phase 9: CNI ─────────────────────────────────────────────────────────────
@@ -612,6 +713,11 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 		}
 	}
 
+	crioInstallSteps := pkgruntime.InstallSteps(runtimeCfg)
+	if s := insecureRegistriesConfStep(clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePrepulls); s != "" {
+		crioInstallSteps = append(crioInstallSteps, s)
+	}
+
 	phases := []ProvisionPhase{
 		// ── Phase 0: Cleanup ─────────────────────────────────────────────────────────
 		// Only runs on a fresh start; skipped on retries so kubeadm reset does not
@@ -663,7 +769,7 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 		}},
 
 		// ── Phase 3: CRI-O Install ──────────────────────────────────────────────────
-		{Name: "CRI-O Install", Steps: pkgruntime.InstallSteps(runtimeCfg)},
+		{Name: "CRI-O Install", Steps: crioInstallSteps},
 
 		// ── Phase 4: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
@@ -705,7 +811,7 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 		}},
 
 		// ── Phase 8: kubeadm join ─────────────────────────────────────────────────────
-		{Name: "kubeadm Join", Steps: []string{
+		{Name: "kubeadm Join", Steps: append([]string{
 			// The cluster-wide flannel DaemonSet will schedule a pod onto this
 			// node once it joins. Its cni-conf.json chains the "flannel" plugin
 			// (installed by flannel's own init container) with the standard
@@ -722,8 +828,7 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
   sudo tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin
   rm -f /tmp/cni-plugins.tgz
 fi`,
-			fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
-		}},
+		}, joinWorkerSteps(joinCmd)...)},
 	}
 
 	if err := runPhases(client, phases, startPhase, onPhaseComplete); err != nil {
