@@ -70,7 +70,7 @@
     background:var(--bg); border:1px solid var(--border); border-radius:8px;
     padding:18px; margin:20px 0 8px; overflow-x:auto; text-align:center;
   }
-  figure.diagram-wrap svg{max-width:100%; height:auto; color:var(--fg);}
+  figure.diagram-wrap img{max-width:100%; height:auto; border-radius:6px;}
   figure.diagram-wrap figcaption{
     margin-top:12px; font-size:13px; color:var(--fg-muted); text-align:left;
   }
@@ -220,73 +220,7 @@
 
     <h3>2.1 Overall architecture</h3>
     <figure class="diagram-wrap">
-    <svg viewBox="0 0 1000 650" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Overall architecture: the management cluster's bootstrap controller installs control-plane and worker nodes over SSH and writes shared config to the remote cluster; the remote cluster's scale-out controller reads that config to add more nodes and refreshes tokens against its own Kubernetes API; both controllers register VPN peers on the WireGuard server.">
-      <defs>
-        <marker id="archArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
-        </marker>
-      </defs>
-      <rect x="20" y="30" width="440" height="220" rx="14" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.5"/>
-      <text x="40" y="56" font-family="sans-serif" font-size="13" font-weight="700" fill="currentColor">MANAGEMENT CLUSTER</text>
-      <rect x="50" y="90" width="170" height="70" rx="8" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="135" y="120" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">Cluster bootstrap</text>
-      <text x="135" y="137" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">controller</text>
-      <rect x="250" y="90" width="170" height="70" rx="8" fill="#3b6fb4" fill-opacity="0.18" stroke="#3b6fb4" stroke-width="1.5"/>
-      <text x="335" y="120" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">GitOps platform</text>
-      <text x="335" y="137" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">(Nephio / Porch)</text>
-      <path d="M220,125 L250,125" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
-      <circle cx="235" cy="125" r="11" fill="#c0392b" stroke="#c0392b"/>
-      <text x="235" y="129" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">4</text>
-      <text x="235" y="182" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">deploy platform stack</text>
-      <rect x="540" y="30" width="440" height="220" rx="14" fill="currentColor" fill-opacity="0.05" stroke="currentColor" stroke-width="1.5"/>
-      <text x="560" y="56" font-family="sans-serif" font-size="13" font-weight="700" fill="currentColor">REMOTE / WORKLOAD CLUSTER</text>
-      <rect x="570" y="90" width="180" height="70" rx="8" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="660" y="120" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">NodeProvisionNetConfig</text>
-      <text x="660" y="137" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">(shared config)</text>
-      <rect x="770" y="90" width="180" height="70" rx="8" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="860" y="120" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">Cluster scale-out</text>
-      <text x="860" y="137" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">controller</text>
-      <path d="M750,125 L770,125" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
-      <circle cx="760" cy="125" r="11" fill="#c0392b" stroke="#c0392b"/>
-      <text x="760" y="129" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">3</text>
-      <text x="760" y="182" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">reads config</text>
-      <path d="M150,160 L150,200 L660,200 L660,160" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
-      <circle cx="405" cy="200" r="11" fill="#c0392b" stroke="#c0392b"/>
-      <text x="405" y="204" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">2</text>
-      <text x="405" y="222" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">write shared config</text>
-      <rect x="630" y="320" width="260" height="50" rx="8" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="760" y="350" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">Cluster's own Kubernetes API</text>
-      <path d="M910,160 L910,270 L850,270 L850,320" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
-      <circle cx="910" cy="195" r="11" fill="#c0392b" stroke="#c0392b"/>
-      <text x="910" y="199" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">6</text>
-      <text x="880" y="292" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">refresh token,</text>
-      <text x="880" y="306" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">label nodes</text>
-      <rect x="60" y="400" width="260" height="70" rx="8" fill="currentColor" fill-opacity="0.06" stroke="currentColor" stroke-width="1.5"/>
-      <text x="190" y="430" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">Control-plane node</text>
-      <text x="190" y="447" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">installed via SSH</text>
-      <rect x="380" y="400" width="260" height="70" rx="8" fill="currentColor" fill-opacity="0.06" stroke="currentColor" stroke-width="1.5"/>
-      <text x="510" y="430" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">Worker node</text>
-      <text x="510" y="447" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">joined to the cluster</text>
-      <path d="M120,160 L120,380" stroke="currentColor" stroke-width="1.5" fill="none"/>
-      <path d="M120,380 Q120,400 160,400" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
-      <path d="M120,380 L460,380 Q470,380 470,390 L470,400" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
-      <circle cx="120" cy="380" r="11" fill="#c0392b" stroke="#c0392b"/>
-      <text x="120" y="384" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">1</text>
-      <text x="120" y="365" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">install / join</text>
-      <path d="M860,160 L860,230 L565,230 L565,400" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
-      <circle cx="860" cy="195" r="11" fill="#c0392b" stroke="#c0392b"/>
-      <text x="860" y="199" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">5</text>
-      <text x="860" y="178" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">SSH / cloud-init</text>
-      <rect x="370" y="560" width="260" height="60" rx="8" fill="currentColor" fill-opacity="0.06" stroke="currentColor" stroke-width="1.5"/>
-      <text x="500" y="595" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="currentColor">WireGuard VPN server</text>
-      <path d="M190,470 L190,540 L430,540 L430,560" stroke="currentColor" stroke-width="1.3" stroke-dasharray="4 4" fill="none" marker-end="url(#archArrow)"/>
-      <path d="M510,470 L510,560" stroke="currentColor" stroke-width="1.3" stroke-dasharray="4 4" fill="none" marker-end="url(#archArrow)"/>
-      <text x="290" y="530" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">VPN tunnel</text>
-      <path d="M70,160 L10,160 L10,595 L370,595" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
-      <path d="M940,160 L990,160 L990,595 L630,595" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
-      <text x="15" y="510" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">register / remove peer</text>
-      <text x="985" y="510" text-anchor="end" font-family="sans-serif" font-size="11" fill="currentColor">register / remove peer</text>
-    </svg>
+    <img src="diagrams/architecture.svg" alt="Overall architecture: the management cluster's bootstrap controller installs control-plane and worker nodes over SSH and writes shared config to the remote cluster; the remote cluster's scale-out controller reads that config to add more nodes and refreshes tokens against its own Kubernetes API; both controllers register VPN peers on the WireGuard server.">
     <figcaption>Both controllers install/join nodes over SSH, keep the remote cluster's shared config in sync, and manage VPN peers; only the bootstrap controller talks to the GitOps platform.</figcaption>
     </figure>
 
@@ -313,96 +247,13 @@
 
     <h3 id="s2-2">2.2 <code>RemoteCluster</code>: what happens, phase by phase</h3>
     <figure class="diagram-wrap">
-    <svg viewBox="0 0 1000 460" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RemoteCluster phase flow: a new resource starts Provisioning, moves to Ready on success or Failed on error; Failed retries up to 5 times before requiring manual attention; a Ready cluster receives routine upkeep and is cleaned up on deletion.">
-      <defs>
-        <marker id="rcArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
-        </marker>
-      </defs>
-      <circle cx="40" cy="195" r="6" fill="currentColor"/>
-      <path d="M46,195 L70,195" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#rcArrow)"/>
-      <rect x="70" y="160" width="200" height="70" rx="10" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="170" y="190" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Provisioning</text>
-      <text x="170" y="207" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">(install running)</text>
-      <rect x="430" y="160" width="200" height="70" rx="10" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="530" y="190" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Ready</text>
-      <text x="530" y="207" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">(cluster usable)</text>
-      <path d="M480,160 C480,105 580,105 580,160" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#rcArrow)"/>
-      <text x="530" y="96" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">routine upkeep (token refresh,</text>
-      <text x="530" y="110" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">config sync, platform deploy)</text>
-      <path d="M270,195 L430,195" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#rcArrow)"/>
-      <text x="350" y="182" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">install succeeds</text>
-      <rect x="740" y="160" width="220" height="70" rx="10" fill="currentColor" fill-opacity="0.06" stroke="currentColor" stroke-width="1.5"/>
-      <text x="850" y="190" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Node cleaned up</text>
-      <text x="850" y="207" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">&amp; removed from VPN</text>
-      <path d="M630,195 L740,195" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#rcArrow)"/>
-      <text x="685" y="182" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">you delete the resource</text>
-      <rect x="70" y="320" width="200" height="70" rx="10" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="170" y="350" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Failed</text>
-      <text x="170" y="367" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">(see status.message)</text>
-      <path d="M130,230 L130,320" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#rcArrow)"/>
-      <text x="20" y="278" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">install</text>
-      <text x="20" y="292" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">fails</text>
-      <path d="M210,320 L210,230" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#rcArrow)"/>
-      <text x="285" y="270" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">retry, up to</text>
-      <text x="285" y="284" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">5 attempts</text>
-      <path d="M130,390 L130,422" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#rcArrow)"/>
-      <circle cx="130" cy="434" r="8" fill="none" stroke="currentColor" stroke-width="1.5"/>
-      <circle cx="130" cy="434" r="3.5" fill="currentColor"/>
-      <text x="160" y="438" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">retry limit reached — needs your attention</text>
-    </svg>
+    <img src="diagrams/remotecluster-phases.svg" alt="RemoteCluster phase flow: a new resource starts Provisioning, moves to Ready on success or Failed on error; Failed retries up to 5 times before requiring manual attention; a Ready cluster receives routine upkeep and is cleaned up on deletion.">
     <figcaption>RemoteCluster moves Provisioning → Ready, retries up to 5 times on failure, and is cleaned up on deletion.</figcaption>
     </figure>
 
     <h3 id="s2-3">2.3 <code>NodeProvision</code>: what happens, phase by phase</h3>
     <figure class="diagram-wrap">
-    <svg viewBox="0 0 1150 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="NodeProvision phase flow: a new resource is validated, then provisioned over SSH (on-prem) or via EC2 and cloud-init (AWS), joins the cluster, optionally pre-pulls images on GPU nodes, then becomes Ready; failures retry up to 5 times before requiring manual attention.">
-      <defs>
-        <marker id="npArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
-        </marker>
-      </defs>
-      <circle cx="40" cy="195" r="6" fill="currentColor"/>
-      <path d="M46,195 L70,195" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <rect x="70" y="160" width="140" height="70" rx="10" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="140" y="200" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Pending</text>
-      <path d="M210,195 L290,195" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <rect x="290" y="160" width="220" height="70" rx="10" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="400" y="190" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Provisioning</text>
-      <text x="400" y="207" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">(SSH, or EC2 + cloud-init)</text>
-      <path d="M510,195 L590,195" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <rect x="590" y="160" width="170" height="70" rx="10" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="675" y="200" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Joining cluster</text>
-      <path d="M760,195 L940,195" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <text x="850" y="182" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">otherwise</text>
-      <path d="M700,160 C700,60 850,60 940,75" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <text x="800" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">GPU node with images configured</text>
-      <rect x="940" y="40" width="180" height="70" rx="10" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="1030" y="70" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Pre-pull images</text>
-      <text x="1030" y="87" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">(GPU nodes)</text>
-      <path d="M1030,110 L1015,160" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <rect x="940" y="160" width="150" height="70" rx="10" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="1015" y="200" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Ready</text>
-      <path d="M1015,230 L1015,300" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <text x="1027" y="268" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">you delete</text>
-      <text x="1027" y="282" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">the resource</text>
-      <rect x="925" y="300" width="180" height="70" rx="10" fill="currentColor" fill-opacity="0.06" stroke="currentColor" stroke-width="1.5"/>
-      <text x="1015" y="330" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Deleting</text>
-      <text x="1015" y="347" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">(node, cloud instance, VPN peer removed)</text>
-      <rect x="400" y="320" width="200" height="70" rx="10" fill="currentColor" fill-opacity="0.09" stroke="currentColor" stroke-width="1.5"/>
-      <text x="500" y="350" text-anchor="middle" font-family="sans-serif" font-size="13" fill="currentColor">Failed</text>
-      <text x="500" y="367" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">(see status.message)</text>
-      <path d="M400,230 L400,280 L470,280 L470,320" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <path d="M675,230 L675,280 L560,280 L560,320" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <text x="500" y="270" text-anchor="middle" font-family="sans-serif" font-size="11" fill="currentColor">provisioning or join fails</text>
-      <path d="M400,355 L40,355 L40,195 L70,195" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <text x="50" y="330" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">retry, up to</text>
-      <text x="50" y="344" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">5 attempts</text>
-      <path d="M500,390 L500,412" stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
-      <circle cx="500" cy="424" r="8" fill="none" stroke="currentColor" stroke-width="1.5"/>
-      <circle cx="500" cy="424" r="3.5" fill="currentColor"/>
-      <text x="520" y="428" text-anchor="start" font-family="sans-serif" font-size="11" fill="currentColor">retry limit reached — needs your attention</text>
-    </svg>
+    <img src="diagrams/nodeprovision-phases.svg" alt="NodeProvision phase flow: a new resource is validated, then provisioned over SSH (on-prem) or via EC2 and cloud-init (AWS), joins the cluster, optionally pre-pulls images on GPU nodes, then becomes Ready; failures retry up to 5 times before requiring manual attention.">
     <figcaption>NodeProvision validates, provisions via SSH or EC2, joins the cluster, optionally pre-pulls GPU images, then becomes Ready.</figcaption>
     </figure>
 
