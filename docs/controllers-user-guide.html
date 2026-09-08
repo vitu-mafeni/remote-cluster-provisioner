@@ -95,6 +95,19 @@
     nav#toc{width:auto; flex:none; position:relative; height:auto; max-height:320px;}
     main{padding:24px 20px 80px;}
   }
+  @media print{
+    body{font-size:12.5px;}
+    nav#toc{display:none;}
+    #backtotop{display:none;}
+    .layout{display:block;}
+    main{max-width:none; padding:0 8px;}
+    a{color:var(--fg); text-decoration:underline;}
+    table, figure{break-inside:avoid;}
+    pre{break-inside:auto; white-space:pre-wrap; word-break:break-word; overflow-x:visible;}
+    h2, h3, h4{break-after:avoid;}
+    h2{margin-top:26px;}
+    figure.diagram-wrap{box-shadow:none;}
+  }
 </style>
 </head>
 <body>

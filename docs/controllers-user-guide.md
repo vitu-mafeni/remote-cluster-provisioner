@@ -1,11 +1,6 @@
 # remote-cluster-provisioner — Controllers User Guide
 
-> **Audience:** this guide is for people who **run** `remote-cluster-provisioner` to create and
-> manage remote GPU/CPU clusters — not for people building the project from source. It assumes
-> the controller container image has already been built and is available in a registry your
-> cluster can pull from (your platform team's job, or a pre-built image you were handed). Nothing
-> here requires compiling Go code, editing source files, or building images — only `kubectl` and
-> the manifests shipped in this repository.
+> **Repository:** [Github](https://github.com/vitu-mafeni/remote-cluster-provisioner/tree/harbor)
 
 ## Table of contents
 
