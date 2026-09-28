@@ -2721,14 +2721,14 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		},
 
 		{
-			name: "stateful-migration-variant",
+			name: "fluidcr-variant",
 			upstream: packageRef{
-				pkg:      "ml-platform/stateful-migration",
+				pkg:      "ml-platform/fluidcr",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
 			downstream: packageRef{
-				pkg:  "stateful-migration",
+				pkg:  "fluidcr",
 				repo: cluster.Spec.ClusterName,
 			},
 			annotations: map[string]interface{}{
@@ -2860,11 +2860,11 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 
 					// In-cluster service defaults — override via PlatformVariables
 					// when monitoring or an external Postgres is used.
-					"GRAFANA_URL":        "http://prometheus-grafana.monitoring.svc.cluster.local:80",
-					"ALERTMANAGER_URL":   "http://alertmanager-operated.monitoring.svc.cluster.local:9093",
-					"PROMETHEUS_URL":     "http://prometheus-operated.monitoring.svc.cluster.local:9090",
-					"HARBOR_BASE_URL":    "http://harbor.harbor.svc.cluster.local:80",
-					"CHECKPOINT_API_URL": "http://checkpoint-apiserver.stateful-migration.svc.cluster.local:8090",
+					"GRAFANA_URL":      "http://prometheus-grafana.monitoring.svc.cluster.local:80",
+					"ALERTMANAGER_URL": "http://alertmanager-operated.monitoring.svc.cluster.local:9093",
+					"PROMETHEUS_URL":   "http://prometheus-operated.monitoring.svc.cluster.local:9090",
+					"HARBOR_BASE_URL":  "http://harbor.harbor.svc.cluster.local:80",
+					"FLUIDCR_API_URL":  "http://fluidcr-api.fluidcr-system.svc.cluster.local:8080",
 
 					// External Postgres — empty means use the bundled StatefulSet.
 					"DB_HOST": "",
