@@ -41,6 +41,23 @@ type RemoteClusterSpec struct {
 
 	Auth      RemoteClusterAuth `json:"auth"`
 	GitConfig GitConfig         `json:"gitConfig,omitempty"`
+
+	// DisableVPN runs the cluster without WireGuard. Use it when spec.host is
+	// an IP that is directly reachable by the controller and by the other
+	// nodes of the cluster. spec.host must be an IP address bound to a local
+	// interface on the node; it is used as the kubelet node IP (and, for a
+	// control-plane, the API server advertise address) in place of the wg0
+	// address.
+	//
+	// The mode belongs to the whole cluster and is decided by the
+	// control-plane: it publishes it in the cluster's NodeProvisionNetConfig,
+	// workers (RemoteCluster and NodeProvision) inherit it, and a node that
+	// disables the VPN under a VPN control-plane is failed. With it set, no VPN
+	// server is contacted, no VPN range/credentials are published or copied, no
+	// peer is removed, flannel is not pinned to wg0, WireGuard is not installed
+	// or torn down, and spec.vpnConfig is ignored.
+	// +optional
+	DisableVPN bool `json:"disableVPN,omitempty"`
 }
 
 type VPNConfig struct {
@@ -88,6 +105,29 @@ type SoftwareConfig struct {
 	// K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
 	KubernetesVersion string         `json:"kubernetesVersion,omitempty"` // e.g., "v1.34.2"
 	ImagePrepulls     []ImagePrepull `json:"imagePrepulls,omitempty"`
+
+	// InsecureRegistries lists container registries (host or host:port, e.g.
+	// "harbor.example.com:30002") that CRI-O must reach over plain HTTP or with
+	// an untrusted/self-signed certificate. Each is written to a
+	// /etc/containers/registries.conf.d drop-in with insecure = true on every
+	// node provisioned by this operator (on-prem, AWS, GCP) BEFORE CRI-O starts.
+	// Use it for registries that are not listed in imagePrepulls but are pulled
+	// from by other workloads.
+	//
+	// Backward compatibility: the registry host of every fully-qualified image
+	// in imagePrepulls is ALSO marked insecure, exactly as before; the effective
+	// list is the de-duplicated, sorted union of both. Entries must be a bare
+	// host or host:port: no scheme, path, spaces, quotes or other special
+	// characters (invalid entries are rejected).
+	//
+	// CRI-O reads registries.conf.d only at start, so nodes that are already
+	// provisioned need a one-time manual CRI-O restart after the drop-in is
+	// written (see docs/controllers-user-guide.md).
+	// +optional
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=259
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`
+	InsecureRegistries []string `json:"insecureRegistries,omitempty"`
 
 	// ImagePullSecretRef optionally references a Secret containing registry
 	// credentials used when pre-pulling private images listed in ImagePrepulls.

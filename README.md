@@ -1,6 +1,6 @@
 # remote-cluster-provisioner
 
-A Kubernetes operator that provisions and manages remote GPU clusters from a central management cluster. It handles the full lifecycle of remote nodes: SSH-based bootstrapping, WireGuard VPN registration, CRI-O runtime installation via a prebuilt OCI artifact (`cnlab-runtime`), kubeadm join, and Nephio/Porch platform deployment.
+A Kubernetes operator that provisions and manages remote GPU clusters from a central management cluster. It handles the full lifecycle of remote nodes: SSH-based bootstrapping, WireGuard VPN registration (optional, see [Running without WireGuard](#running-without-wireguard-disablevpn)), CRI-O runtime installation via a prebuilt OCI artifact (`cnlab-runtime`), kubeadm join, and Nephio/Porch platform deployment.
 
 ---
 
@@ -19,7 +19,8 @@ Remote Cluster (autonomous after initial provisioning)
     ├── Reads NodeProvisionNetConfig (join command, VPN config, credentials)
     ├── Provisions on-prem nodes via SSH
     ├── Provisions AWS EC2 nodes via cloud-init
-    ├── Registers WireGuard peers on VPN server
+    ├── Provisions Google Cloud (GCE) nodes via a startup script
+    ├── Registers WireGuard peers on VPN server (skipped when disableVPN is set)
     └── Syncs cnlab-runtime registry credentials to each node
 ```
 
@@ -32,16 +33,17 @@ The remote cluster's `NodeProvisionReconciler` is **fully autonomous** — it re
 ### Management cluster
 - Kubernetes cluster with CRDs installed (see [Deploy](#deploy))
 - Nephio/Porch installed (for PackageVariant deployment)
-- SSH access to all remote nodes from the management cluster pod network (via WireGuard)
+- SSH access to all remote nodes from the management cluster pod network (via WireGuard, or directly when the cluster runs with `disableVPN: true`)
 
 ### Remote nodes
 - Ubuntu 22.04 (Jammy)
 - Passwordless `sudo` for the SSH user
-- WireGuard VPN connectivity to the management cluster's VPN server
-- GPU nodes: NVIDIA drivers pre-installed (driver version configured in `softwareConfig`)
+- WireGuard VPN connectivity to the management cluster's VPN server (**only when `disableVPN` is `false`**, the default; not needed when the cluster runs without a VPN)
+- Direct network reachability between the controller and the node (and between nodes) when the cluster runs with `disableVPN: true`
+- GPU nodes: the controller does not install or version-manage the NVIDIA driver, container toolkit or device plugin (there are no such fields in `softwareConfig`); provide them on the host or via the GPU Operator
 
 ### WireGuard VPN server
-- Required for node-to-node and management connectivity
+- **Required only when `disableVPN` is `false`** (the default) — it provides node-to-node and management connectivity. Clusters created with `disableVPN: true` never contact a VPN server.
 - See [docs/wireguard-setup-bundle/WIREGUARD_SETUP.md](docs/wireguard-setup-bundle/WIREGUARD_SETUP.md) for setup
 
 ---
@@ -49,9 +51,51 @@ The remote cluster's `NodeProvisionReconciler` is **fully autonomous** — it re
 ## Deploy
 
 ```bash
-# Install CRDs and deploy the controller
-kubectl apply -k config/default
+# Build and push (or pick an already published) controller image, then install
+# the CRDs and deploy the controller with that image:
+make deploy IMG=<registry>/remote-cluster-provisioner:<tag>
 ```
+
+`config/manager/manager.yaml` only carries the placeholder image `controller:latest`;
+`make deploy IMG=...` rewrites it via `kustomize edit set image`, so a bare
+`kubectl apply -k config/default` would deploy an unpullable image.
+
+Alternatively, the static manifests in `deploy/` (CRDs, RBAC, metrics Service, Deployment
+in namespace `remote-cluster-provisioner-system`) can be applied with kustomize after setting
+the image; the placeholder `ghcr.io/<ORG>/remote-cluster-provisioner` with tag
+`REPLACE_WITH_RELEASE_TAG` in `deploy/kustomization.yaml` must be replaced first (it is deliberately
+not a valid image reference, so an unedited apply fails with `InvalidImageName`):
+
+```bash
+cd deploy
+kustomize edit set image \
+  ghcr.io/<ORG>/remote-cluster-provisioner=ghcr.io/<your-org>/remote-cluster-provisioner:<tag>
+kubectl apply -k .
+```
+
+The controller image is **not obfuscated** by default. To build an obfuscated (garble) image,
+opt in explicitly with `docker build --build-arg OBFUSCATE=true .` (or set the `OBFUSCATE`
+repository variable to `true` for the publish workflow); this makes crashes much harder to debug.
+The Go toolchain used for the image comes from `go.mod` (Dockerfile `ARG GO_VERSION`, kept in sync
+by the publish workflow), the same version CI tests with.
+
+### SSH host key verification (optional)
+
+By default the controller does **not** verify SSH host keys (it logs a warning once). To enable
+verification, set `SSH_KNOWN_HOSTS_FILE` on the controller container to the path of an OpenSSH
+`known_hosts` file (mount it from a ConfigMap or Secret; see the commented example in
+`deploy/deployment.yaml`). When set:
+
+- the controller **fails closed**: connections to hosts that are not listed in the file are
+  rejected, so every node (including new ones you are about to provision, on-prem hosts and
+  the VPN server) must be added to the file **before** you create its resource;
+- only the host key types present in the file for a host are negotiated, so include the type
+  the host actually offers (`ssh-keyscan -t ed25519,ecdsa,rsa <host>`);
+- an unreadable or malformed file makes every SSH connection fail rather than silently falling
+  back to no verification.
+
+There is intentionally no trust-on-first-use cache: reinstalled nodes get new host keys and
+must be re-seeded in the file.
 
 After deploy, apply your cluster credentials and config:
 
@@ -62,6 +106,13 @@ kubectl apply -f config/samples/infra_v1_remotecluster_cnlab_runtime.yaml
 # On-prem node provisioning config (on the remote cluster)
 kubectl apply -f config/samples/ml_v1alpha1_nodeprovision.yaml
 ```
+
+Complete, copy-and-edit cluster samples (all secrets are `CHANGE_ME` placeholders):
+
+| Sample | What it shows |
+|---|---|
+| `config/samples/infra_v1_remotecluster_vpn.yaml` | Cluster **with** WireGuard: CPU control-plane + GPU and CPU workers, `insecureRegistries`, `imagePrepulls` |
+| `config/samples/infra_v1_remotecluster_novpn.yaml` | Cluster **without** a VPN (`disableVPN: true`): GPU control-plane (also a compute node) + GPU and CPU workers |
 
 ---
 
@@ -109,6 +160,10 @@ spec:
       key: id_rsa
 ```
 
+Set `disableVPN: true` on the **control-plane** `RemoteCluster` to run the whole cluster without
+WireGuard (see [Running without WireGuard](#running-without-wireguard-disablevpn)); `vpnConfig` is
+then ignored.
+
 **Status fields:**
 
 | Field | Description |
@@ -132,20 +187,21 @@ metadata:
   name: my-cluster-netconfig
 spec:
   clusterName: my-cluster
+  disableVPN: false             # true = the cluster runs without WireGuard; vpnRange/vpnServerPublicConfig are then unused
   vpnRange: "10.9.0.0/24"
   vpnServerPublicConfig:
     publicIP: 13.215.206.108
-    sshPort: 22
+    sshPort: "22"
     sshUsername: ubuntu
+    vpnPort: "51820"
     vpnSshCredentialsRef:
       name: vpn-server-secret
       namespace: default
       key: id_rsa
   softwareConfig:
     kubernetesVersion: v1.34.2
-    nvidiaDriverVersion: "550"
-    nvidiaContainerToolkitVersion: 1.17.3-1
-    k8sDevicePluginVersion: v0.17.1
+    insecureRegistries:         # optional: registries served over plain HTTP / untrusted TLS (host or host:port)
+      - harbor.example.com:30002
     cnlabRuntime:
       registry: ghcr.io
       repository: vitu-mafeni/cnlab-runtime
@@ -156,11 +212,21 @@ spec:
         namespace: default
 ```
 
+A `NodeProvision` picks its config with `spec.clusterName` (matched against the NetConfig's
+`spec.clusterName`). It may be omitted only while the namespace has exactly one
+`NodeProvisionNetConfig`; with several, a `NodeProvision` without it fails with an error asking for it.
+
+`insecureRegistries` are written as CRI-O `registries.conf.d` drop-ins (`insecure = true`) on every
+provisioned node before CRI-O starts; hosts of `imagePrepulls` images are also marked insecure
+(backward compatible). Already-provisioned nodes need a one-time manual drop-in and
+`systemctl restart crio` — see the controllers user guide, section 5.2.
+
 ---
 
 ### `NodeProvision` — provision a node from the remote cluster
 
-Managed by the **remote cluster** controller. Supports on-prem (SSH) and AWS (EC2 cloud-init).
+Managed by the **remote cluster** controller. Supports on-prem (SSH), AWS (EC2 cloud-init) and
+Google Cloud (GCE startup script).
 
 ```yaml
 apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
@@ -168,7 +234,8 @@ kind: NodeProvision
 metadata:
   name: gpu-worker-01
 spec:
-  provider: OnPrem            # or: AWS
+  provider: OnPrem            # or: AWS, GCP
+  clusterName: my-cluster     # selects the NodeProvisionNetConfig; required when a namespace has several clusters
   role: worker
   hardwareType: gpu           # or: cpu — controls which images are pre-pulled
   ipAddress: 192.168.28.150
@@ -200,17 +267,74 @@ spec:
     namespace: default
 ```
 
+For Google Cloud (GCE) provisioning (full guide: [docs §5.4](docs/controllers-user-guide.md);
+sample: `config/samples/ml_v1alpha1_nodeprovision_gcp.yaml`):
+
+```yaml
+spec:
+  provider: GCP
+  nodeLabel: cpu              # cpu -> e2-standard-4 | gpu -> n1-standard-8 + 1x nvidia-tesla-t4
+  region: us-central1         # or gcpConfig.zone: us-central1-a (authoritative when both are set)
+  gcpConfig:                  # optional; project, zone, network and image are auto-resolved
+    projectId: my-project
+    bootDiskSizeGB: 100
+  credentialsRef:
+    name: gcp-node-credentials   # Secret with the service-account key under `credentials.json`
+```
+
+Needs the Compute Engine API, a service account with `roles/compute.instanceAdmin.v1` (and
+`roles/compute.securityAdmin` for the per-node firewall rules) and a JSON key in the Secret. With a
+VPN the node joins over WireGuard (UDP 51820 admitted from the VPN server only); with
+`disableVPN` no VPN server is contacted and the VM's internal IP is the kubelet node IP.
+
+`spec.disableVPN` normally does not need to be set on a `NodeProvision`: it is inherited from the
+cluster (see [Running without WireGuard](#running-without-wireguard-disablevpn)).
+
 **Status fields:**
 
 | Field | Description |
 |---|---|
-| `phase` | `Pending` → `Provisioning` → `Bootstrapping` → `Joining` → `Ready` → `Failed` |
+| `phase` | One of `Pending`, `Validating`, `Provisioning`, `CreatingInstance` (AWS, GCP), `WaitingForInstance` (AWS, GCP), `ConfiguringVPN`, `Bootstrapping`, `Joining`, `RegisteringNode`, `VerifyingHealth`, `PrePullingImages`, `Ready`, `Failed`, `Deleting`. Typical path: `Pending` → `Validating` → (`CreatingInstance` → `WaitingForInstance`, AWS/GCP) → `ConfiguringVPN` → `Bootstrapping` → `Joining` → `RegisteringNode` → (`PrePullingImages`) → `Ready`; the exact sequence differs by provider. `ConfiguringVPN` is skipped when the VPN is disabled. `Failed` is terminal after 5 consecutive failures; `Deleting` is shown during teardown |
 | `message` | Human-readable status including retry count on failure |
 | `provisionRetryCount` | Consecutive provisioning failures (resets to 0 on success) |
 | `runtimeCredentialsHash` | SHA-256 of last synced registry credentials — triggers re-sync on rotation |
 | `vpnIp` | WireGuard IP allocated for this node |
-| `publicIp` / `privateIp` | Cloud provider IPs (AWS only) |
-| `instanceId` | Cloud provider instance ID (AWS only) |
+| `publicIp` / `privateIp` | Cloud provider IPs (AWS, GCP) |
+| `instanceId` | Cloud provider instance ID (AWS) / instance name (GCP) |
+
+---
+
+## Running without WireGuard (`disableVPN`)
+
+WireGuard is only required when `disableVPN` is `false` (the default). Set
+`spec.disableVPN: true` when every node is directly reachable (public or otherwise routable IPs):
+no VPN server is contacted, no VPN range/credentials are published, no peers or WireGuard
+packages/config are created or removed, no AWS security-group / GCP firewall rule for the WireGuard UDP port is added, and
+flannel is pinned per node to the node's own address (`--iface=$(FLANNEL_NODE_IP)` from the pod's
+`status.hostIP`, i.e. the kubelet node IP) instead of `wg0`.
+
+- **Inheritance:** the mode is a property of the whole cluster. Set it on the **control-plane**
+  `RemoteCluster`; it is published in the cluster's `NodeProvisionNetConfig.spec.disableVPN` and
+  inherited by worker `RemoteCluster`s and by every `NodeProvision` (on-prem, AWS and GCP) in that
+  cluster. Flow: control-plane `RemoteCluster` → `NodeProvisionNetConfig` → `NodeProvision`.
+- **Mismatch:** setting `disableVPN: true` on a worker or `NodeProvision` under a cluster that
+  runs a VPN is rejected with a clear message because a mixed cluster cannot work: a
+  `RemoteCluster` worker is failed with condition `VPNModeMismatch` without consuming the retry
+  budget, a `NodeProvision` goes to `Failed` with the reason in `status.message` (also without
+  consuming retries, so it never becomes terminal). Fix the spec.
+- **Fixed once provisioned:** the mode a `RemoteCluster` node was provisioned with is recorded in
+  the annotation `infra.dcn.ssu.ac.kr/provisioned-vpn-mode` (`vpn` or `novpn`). Later flips of
+  `spec.disableVPN` are ignored for that node (condition `VPNModeChangeIgnored`; a provisioned
+  worker that disagrees with its control-plane gets `VPNModeMismatch` and is left untouched);
+  re-provision the node to change its mode. For a `NodeProvision`, changing `disableVPN` on an
+  existing resource is likewise unsupported: deletion cleanup follows what was recorded in
+  `status` (`vpnIp` for a VPN node, only `ipAddress` for a VPN-less one), not the current spec.
+- **Networking is yours to manage:** allow TCP 6443 to the control-plane, kubelet TCP 10250 and
+  flannel VXLAN UDP 8473 between nodes. Pod traffic then crosses the network unencrypted.
+- `spec.host` / `ipAddress` must be an IP bound to an interface on the node (a NATed public IP
+  is rejected early); for AWS and GCP the instance's private / internal IP is used.
+
+See [docs/controllers-user-guide.md](docs/controllers-user-guide.md) (§5.1, §7.3) for details.
 
 ---
 
@@ -232,6 +356,16 @@ stringData:
     -----END OPENSSH PRIVATE KEY-----
   # Or password auth:
   # password: "your-password"
+```
+
+### GCP service-account key
+
+For `provider: GCP`. The key must be of `"type": "service_account"`; the data key is `credentials.json`
+(or `serviceAccountKey`, or the name set in `credentialsRef.key`). The Secret must be in the
+NodeProvision's namespace.
+
+```bash
+kubectl create secret generic gcp-node-credentials --from-file=credentials.json=./sa-key.json
 ```
 
 ### cnlab-runtime registry credentials
@@ -426,3 +560,4 @@ kubectl patch svc dex -n auth --type=json \
 - **WireGuard setup**: [docs/wireguard-setup-bundle/WIREGUARD_SETUP.md](docs/wireguard-setup-bundle/WIREGUARD_SETUP.md)
 - The controller dynamically registers/removes WireGuard peers via SSH on the VPN server as nodes are provisioned and deleted.
 - The VPN range is configured in `NodeProvisionNetConfig.spec.vpnRange`. IPs are allocated from the start of the range and released IPs are reused.
+- All of the above applies only when `disableVPN` is `false`; clusters running with `disableVPN: true` do not use a VPN server at all.

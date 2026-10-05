@@ -93,8 +93,22 @@ spec:
           requests:
             cpu: 10m
             memory: 128Mi
+        # OPTIONAL - SSH host key verification. By default the controller accepts any
+        # SSH host key. To verify, set SSH_KNOWN_HOSTS_FILE to an OpenSSH known_hosts
+        # file mounted from a ConfigMap/Secret; it then FAILS CLOSED for hosts not
+        # listed, so pre-seed every node/VPN server first. Example (uncomment all
+        # three: the env var here, plus the volumeMount and volume below):
+        # env:
+        # - name: SSH_KNOWN_HOSTS_FILE
+        #   value: /etc/ssh-known-hosts/known_hosts
         volumeMounts: []
+        # - name: ssh-known-hosts
+        #   mountPath: /etc/ssh-known-hosts
+        #   readOnly: true
       volumes: []
+      # - name: ssh-known-hosts
+      #   configMap:
+      #     name: ssh-known-hosts
       serviceAccountName: controller-manager
       # Allow background SSH goroutines to receive context cancellation and
       # close connections cleanly before the process is SIGKILLed.

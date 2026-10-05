@@ -52,6 +52,7 @@ import (
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
+	"dcn.ssu.ac.kr/infra/provider/onprem"
 )
 
 //go:embed assets/ml.dcn.ssu.ac.kr_nodeprovisionnetconfigs.yaml
@@ -69,7 +70,9 @@ type RemoteClusterReconciler struct {
 	Scheme *runtime.Scheme
 
 	// controlPlaneJobs holds in-flight control-plane init goroutines.
-	// Key: "namespace/name", Value: <-chan controlPlaneJobResult
+	// Key: "namespace/name", Value: *controlPlaneJob (carries the object UID and
+	// a cancel func so a deleted/recreated RemoteCluster never adopts or leaks a
+	// stale goroutine).
 	controlPlaneJobs sync.Map
 
 	// controlPlaneProgress tracks the last phase index completed by an in-flight
@@ -144,6 +147,10 @@ const (
 	// applied so the overlay step can proceed without blocking the reconcile
 	// worker thread with a sleep.
 	annotationCoreVariantsCreated = "infra.dcn.ssu.ac.kr/core-variants-created"
+	// annotationDeleteNodeCleanupDone marks (on an object being deleted) that the
+	// node drain/reset has been attempted, so a re-entered delete does not repeat
+	// minutes of SSH work.
+	annotationDeleteNodeCleanupDone = "infra.dcn.ssu.ac.kr/delete-node-cleanup-done"
 
 	// tokenRefreshInterval is how often to rotate the kubeadm bootstrap token.
 	// kubeadm tokens expire after 24 h by default; refresh 1 h before expiry.
@@ -192,6 +199,10 @@ const (
 	cnlabSyncConditionType = "CnlabCredentialSyncFailed"
 )
 
+// packageVariantNamespace is the namespace PackageVariants are created in
+// (and therefore listed/deleted in).
+const packageVariantNamespace = "default"
+
 // packageVariantGVK is the GVK for Porch PackageVariant resources.
 var packageVariantGVK = schema.GroupVersionKind{
 	Group:   "config.porch.kpt.dev",
@@ -203,6 +214,8 @@ var packageVariantGVK = schema.GroupVersionKind{
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisionnetconfigs,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=infra.nephio.org,resources=tokens;repositories,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=config.porch.kpt.dev,resources=repositories;packagevariants,verbs=get;list;watch;create;update;patch;delete
 
 func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -235,6 +248,24 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// The VPN mode is a property of the cluster, not of a single node: make
+	// workers follow their control-plane before anything below reads it.
+	if res, done, err := r.reconcileVPNMode(ctx, cluster); done || err != nil {
+		return res, err
+	}
+
+	// An invalid insecureRegistries entry would end up in a drop-in file name
+	// and a shell script on the node: refuse it up front with a clear message
+	// instead of failing midway through provisioning.
+	if err := pkgruntime.ValidateInsecureRegistries(cluster.Spec.NodeInfo.SoftwareConfig.InsecureRegistries); err != nil {
+		cause := fmt.Errorf("spec.nodeInfo.softwareConfig.%w", err)
+		if cluster.Status.Phase == phaseReady {
+			return r.softFail(ctx, cluster, "InvalidInsecureRegistries", cause)
+		}
+		return r.failNoCount(ctx, cluster, "InvalidInsecureRegistries", cause)
+	}
+	r.clearConditions(ctx, cluster, "InvalidInsecureRegistries")
+
 	// Protect the SSH credential secret with a finalizer so it cannot be
 	// deleted while this RemoteCluster exists.  Also keep a controller-owned
 	// copy as a second layer of defence (e.g. in case the finalizer was
@@ -248,8 +279,9 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// Protect the VPN SSH credential secret the same way.
-	if cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
+	// Protect the VPN SSH credential secret the same way (not used at all when
+	// the VPN is disabled).
+	if !effectiveVPNDisabled(cluster) && cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
 		if vpnSecret, err := r.getVPNSecret(ctx, cluster); err == nil {
 			if err := r.ensureVPNSecretFinalizer(ctx, cluster, vpnSecret); err != nil {
 				log.Error(err, "adding finalizer to VPN SSH credential secret (non-fatal)")
@@ -257,11 +289,28 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
+	isControlPlane := cluster.Spec.NodeInfo.NodeType == "control-plane"
+
 	switch cluster.Status.Phase {
 	case "", phaseProvisioning:
+		if isControlPlane && cluster.Status.JoinCommand != "" {
+			return r.recoverControlPlane(ctx, cluster)
+		}
 		return r.reconcileProvisioning(ctx, cluster)
 	case phaseReady:
-		if cluster.Spec.NodeInfo.NodeType == "control-plane" {
+		// Record the VPN mode of nodes provisioned before it was tracked, so a
+		// later change of spec.disableVPN cannot alter how they are cleaned up.
+		if cluster.Annotations[annotationProvisionedVPNMode] == "" {
+			if err := r.patchAnnotation(ctx, cluster, annotationProvisionedVPNMode, vpnModeString(cluster.Spec.DisableVPN)); err != nil {
+				log.Error(err, "recording provisioned VPN mode (non-fatal)")
+			} else {
+				ensureAnnotations(cluster)[annotationProvisionedVPNMode] = vpnModeString(cluster.Spec.DisableVPN)
+			}
+		}
+		if !isControlPlane && cluster.Annotations[annotationWorkerFinalizePending] != "" {
+			return r.retryWorkerFinalize(ctx, cluster)
+		}
+		if isControlPlane {
 			// If NodeProvisionNetConfig was not created (e.g. it failed after setStatus
 			// already flipped to Ready in a previous run), re-run it now via SSH before
 			// proceeding to PackageVariants.
@@ -271,14 +320,15 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				defer cancel()
 				sshClient, err := r.getSSHClient(sshCtx, cluster)
 				if err != nil {
-					return r.fail(ctx, cluster, "SSHConnectionFailed",
+					return r.softFail(ctx, cluster, "SSHConnectionFailed",
 						fmt.Errorf("SSH for NodeProvisionNetConfig: %w", err))
 				}
 				defer func() { _ = sshClient.Conn.Close() }()
 				if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, cluster, sshClient, cluster.Spec.VPNConfig.IP, "create"); err != nil {
-					return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed",
+					return r.softFail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed",
 						fmt.Errorf("creating NodeProvisionNetConfig: %w", err))
 				}
+				r.clearConditions(ctx, cluster, "SSHConnectionFailed", "NodeProvisionNetConfigUpdateFailed")
 				if patchErr := r.patchAnnotation(ctx, cluster, annotationNodeProvisionCreated, "true"); patchErr != nil {
 					log.Error(patchErr, "Failed to stamp node-provision-created annotation")
 				}
@@ -337,14 +387,7 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 			if cluster.Annotations[annotationPkgVariantsCreated] == "true" {
 				// Schedule next wakeup for token renewal.
-				requeueAfter := tokenRefreshInterval
-				if ts, ok := cluster.Annotations[annotationJoinTokenRefreshedAt]; ok {
-					if t, err := time.Parse(time.RFC3339, ts); err == nil {
-						if remaining := tokenRefreshInterval - time.Since(t); remaining > 0 {
-							requeueAfter = remaining
-						}
-					}
-				}
+				requeueAfter := tokenRequeueAfter(cluster)
 				log.Info("Cluster fully ready",
 					"nextTokenRefreshIn", requeueAfter.Round(time.Minute).String())
 				return ctrl.Result{RequeueAfter: requeueAfter}, nil
@@ -353,6 +396,18 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{}, nil
 	case phaseFailed:
+		// A control-plane that already finished kubeadm init (JoinCommand set) is a
+		// working cluster: a later step failed. Never leave it in the Failed ->
+		// Provisioning loop; move it back to Ready so the idempotent Ready steps
+		// (PackageVariants, token refresh, sync) run again.
+		if isControlPlane && cluster.Status.JoinCommand != "" {
+			return r.recoverControlPlane(ctx, cluster)
+		}
+		// Likewise a worker that already joined: only its finalization is left,
+		// which never needs (or consumes the retry budget of) a fresh provisioning.
+		if !isControlPlane && cluster.Annotations[annotationWorkerJoined] == "true" {
+			return r.retryWorkerFinalize(ctx, cluster)
+		}
 		if cluster.Status.ProvisionRetryCount >= maxProvisionRetries {
 			log.Info("RemoteCluster in terminal Failed state — retry limit reached, manual intervention required",
 				"attempts", cluster.Status.ProvisionRetryCount,
@@ -373,6 +428,13 @@ func (r *RemoteClusterReconciler) reconcileProvisioning(ctx context.Context, clu
 		"nodeType", cluster.Spec.NodeInfo.NodeType,
 	)
 	log.Info("Starting provisioning node for cluster")
+
+	// A worker that already joined must never be re-provisioned nor need a
+	// connection to its own host: finish its finalization through the
+	// control-plane only (and without spending the provisioning retry budget).
+	if cluster.Spec.NodeInfo.NodeType == "worker" && cluster.Annotations[annotationWorkerJoined] == "true" {
+		return r.retryWorkerFinalize(ctx, cluster)
+	}
 
 	if err := r.setStatus(ctx, cluster, phaseProvisioning, "Provisioning", "Provisioning in progress", false); err != nil {
 		log.Error(err, "Failed to update status to Provisioning — continuing")
@@ -428,7 +490,7 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 	// Already done — nothing to init, move on.
 	if cluster.Status.JoinCommand != "" {
 		log.Info("Control plane already initialised; skipping kubeadm init")
-		return ctrl.Result{RequeueAfter: repoReadyWait}, nil
+		return r.recoverControlPlane(ctx, cluster)
 	}
 
 	// If InitializeControlPlane already succeeded but the post-init steps (createClusterRepo,
@@ -443,6 +505,15 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 	key := cluster.Namespace + "/" + cluster.Name
 
 	v, running := r.controlPlaneJobs.Load(key)
+	if running {
+		// Discard a job that belongs to a previous incarnation of this name
+		// (deleted and recreated): cancel it and start over.
+		if job, ok := v.(*controlPlaneJob); !ok || job.uid != string(cluster.UID) {
+			log.Info("Discarding stale control-plane init job from a previous object with the same name")
+			r.cancelControlPlaneJob(key)
+			running = false
+		}
+	}
 	if !running {
 		// Determine which phase to start from.  On the first attempt the annotation
 		// is absent so startPhase is 0 (full run).  On a retry after failure the
@@ -463,7 +534,7 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 				fmt.Errorf("connecting via SSH to %s: %w", cluster.Spec.Host, err))
 		}
 
-		clusterCopy := cluster.DeepCopy()
+		clusterCopy := withEffectiveVPNMode(cluster)
 
 		runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
 		if err != nil {
@@ -472,13 +543,30 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 				fmt.Errorf("resolving cnlab-runtime config: %w", err))
 		}
 
+		// The connection works and the host is about to be modified: record the VPN
+		// mode this node is provisioned with, so later cleanup and SSH addressing do
+		// not depend on the (mutable) spec. Not earlier — a host that was never
+		// reached must stay free to have its spec.disableVPN corrected.
+		if err := r.recordProvisionedVPNMode(ctx, cluster); err != nil {
+			sshClient.Conn.Close() //nolint:errcheck
+			return ctrl.Result{}, err
+		}
+
 		ch := make(chan controlPlaneJobResult, 1)
-		r.controlPlaneJobs.Store(key, (<-chan controlPlaneJobResult)(ch))
+		job := &controlPlaneJob{
+			ch:  ch,
+			uid: string(cluster.UID),
+			// Closing the connection the goroutine owns aborts its running command.
+			cancel: func() { _ = sshClient.Conn.Close() },
+		}
+		r.controlPlaneJobs.Store(key, job)
 
 		go func() {
 			defer sshClient.Conn.Close() //nolint:errcheck
 			joinCommand, err := kubeadm.InitializeControlPlane(sshClient, clusterCopy, startPhase, func(phaseIdx int) {
-				r.controlPlaneProgress.Store(key, phaseIdx)
+				if !job.cancelled.Load() {
+					r.controlPlaneProgress.Store(key, phaseIdx)
+				}
 			}, runtimeCfg)
 			ch <- controlPlaneJobResult{joinCommand: joinCommand, err: err}
 		}()
@@ -488,7 +576,7 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 	}
 
 	// Poll the result channel (non-blocking).
-	ch := v.(<-chan controlPlaneJobResult)
+	ch := v.(*controlPlaneJob).ch
 	select {
 	case res := <-ch:
 		r.controlPlaneJobs.Delete(key)
@@ -503,6 +591,9 @@ func (r *RemoteClusterReconciler) reconcileControlPlane(
 		}
 
 		if res.err != nil {
+			// Nothing completed on the host: release the VPN mode record so the
+			// user can still correct spec.disableVPN (no-op once a phase completed).
+			r.releaseVPNModeIfUntouched(ctx, cluster)
 			return r.fail(ctx, cluster, "ControlPlaneInitFailed",
 				fmt.Errorf("initializing control plane: %w", res.err))
 		}
@@ -564,8 +655,9 @@ func (r *RemoteClusterReconciler) reconcilePackageVariants(ctx context.Context, 
 
 	if cluster.Annotations[annotationCoreVariantsCreated] != "true" {
 		if err := r.createCorePackageVariants(ctx, cluster); err != nil {
-			return r.fail(ctx, cluster, "CorePackageVariantsFailed", fmt.Errorf("creating core PackageVariants: %w", err))
+			return r.softFail(ctx, cluster, "CorePackageVariantsFailed", fmt.Errorf("creating core PackageVariants: %w", err))
 		}
+		r.clearConditions(ctx, cluster, "CorePackageVariantsFailed")
 		if patchErr := r.patchAnnotation(ctx, cluster, annotationCoreVariantsCreated, "true"); patchErr != nil {
 			log.Error(patchErr, "Failed to stamp core-variants-created annotation (non-fatal)")
 		}
@@ -578,21 +670,20 @@ func (r *RemoteClusterReconciler) reconcilePackageVariants(ctx context.Context, 
 	}
 
 	if err := r.createOverlaysPlusPostInstallPackageVariants(ctx, cluster); err != nil {
-		return r.fail(ctx, cluster, "OverlayPackageVariantsFailed", fmt.Errorf("creating overlay PackageVariants: %w", err))
+		return r.softFail(ctx, cluster, "OverlayPackageVariantsFailed", fmt.Errorf("creating overlay PackageVariants: %w", err))
 	}
+	r.clearConditions(ctx, cluster, "OverlayPackageVariantsFailed")
 
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-			return err
-		}
-		ensureAnnotations(cluster)[annotationPkgVariantsCreated] = "true"
-		return r.Update(ctx, cluster)
-	}); err != nil {
+	if err := r.patchAnnotation(ctx, cluster, annotationPkgVariantsCreated, "true"); err != nil {
 		return ctrl.Result{}, fmt.Errorf("marking package-variants as created: %w", err)
 	}
+	ensureAnnotations(cluster)[annotationPkgVariantsCreated] = "true"
 
-	log.Info("PackageVariants created; cluster is fully ready")
-	return ctrl.Result{}, nil
+	// Annotation-only writes never wake the controller (GenerationChangedPredicate),
+	// so schedule the next wake-up for the bootstrap-token renewal explicitly.
+	requeueAfter := tokenRequeueAfter(cluster)
+	log.Info("PackageVariants created; cluster is fully ready", "nextTokenRefreshIn", requeueAfter.Round(time.Minute).String())
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 func (r *RemoteClusterReconciler) reconcileWorker(
@@ -609,7 +700,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	// Sync VPN server config from the control-plane onto the worker CR so that
 	// handleDelete can call removeVPNPeer using only cluster.Spec.VPNConfig.
 	// Worker CRs carry the node's own VPN IP but not the server credentials.
-	if clusterParent != nil &&
+	if clusterParent != nil && !effectiveVPNDisabled(cluster) &&
 		cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" &&
 		clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
@@ -625,146 +716,125 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		log.Info("Synced VPN server config from control-plane", "cp", clusterParent.Name)
 	}
 
-	if cluster.Annotations[annotationWorkerJoined] != "true" {
-
-		if clusterParent == nil {
-			log.Info("Control-plane not found yet; requeueing")
-			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
-		}
-
-		if clusterParent.Status.Phase != phaseReady || clusterParent.Status.JoinCommand == "" {
-			log.Info("Control-plane not ready yet; requeueing",
-				"cpPhase", clusterParent.Status.Phase)
-			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
-		}
-
-		sshClientCP, err := r.getSSHClient(ctx, clusterParent) // ctx is already sshCtx from reconcileProvisioning
-		if err != nil {
-			return r.fail(ctx, cluster, "SSHConnectionFailed", fmt.Errorf("connecting to control-plane via SSH: %w", err))
-		}
-		defer func() { _ = sshClientCP.Conn.Close() }()
-
-		// Determine which phase to start from for this worker.
-		// On the first attempt the annotation is absent → startPhase=0 (full run).
-		// On retry after failure the annotation holds the last completed phase index.
-		workerStartPhase := 0
-		if s, ok := cluster.Annotations[annotationLastCompletedPhaseWorker]; ok {
-			if n, parseErr := strconv.Atoi(s); parseErr == nil && n >= 0 {
-				workerStartPhase = n + 1
-				log.Info("Resuming worker join from phase", "startPhase", workerStartPhase)
-			}
-		}
-
-		// Progress callback: persists the last completed phase to the CR annotation
-		// after each phase so a retry can skip already-done work.
-		onWorkerPhaseComplete := func(phaseIdx int) {
-			if patchErr := r.patchAnnotation(ctx, cluster, annotationLastCompletedPhaseWorker, strconv.Itoa(phaseIdx)); patchErr != nil {
-				log.Error(patchErr, "Failed to persist worker phase progress", "phase", phaseIdx)
-			}
-		}
-
-		workerRuntimeCfg, rErr := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
-		if rErr != nil {
-			return r.fail(ctx, cluster, "RuntimeConfigError",
-				fmt.Errorf("resolving cnlab-runtime config: %w", rErr))
-		}
-		// If the worker CR has no registry credentials, inherit them from the
-		// control-plane CR. This avoids repeating credentialsRef on every worker.
-		if workerRuntimeCfg.Token == "" && clusterParent != nil {
-			parentCfg, pErr := r.resolveCnlabRuntimeConfig(ctx, clusterParent.Spec.NodeInfo.SoftwareConfig, clusterParent.Namespace)
-			if pErr != nil {
-				return r.fail(ctx, cluster, "RuntimeConfigError",
-					fmt.Errorf("resolving cnlab-runtime config from control-plane: %w", pErr))
-			}
-			workerRuntimeCfg.Username = parentCfg.Username
-			workerRuntimeCfg.Token = parentCfg.Token
-			// Inherit registry/repo/version from parent only when the worker
-			// has no cnlabRuntime block at all.
-			if cluster.Spec.NodeInfo.SoftwareConfig.CnlabRuntime == nil {
-				workerRuntimeCfg = parentCfg
-			}
-		}
-
-		err, nodeIP := kubeadm.JoinWorkerNode(
-			sshClient,
-			sshClientCP,
-			cluster,
-			clusterParent.Status.JoinCommand,
-			clusterParent,
-			workerStartPhase,
-			onWorkerPhaseComplete,
-			workerRuntimeCfg,
-		)
-		if err != nil {
-			return r.fail(
-				ctx,
-				cluster,
-				"WorkerJoinFailed",
-				fmt.Errorf("joining worker node to cluster: %w", err),
-			)
-		}
-
-		// Refresh, stamp the joined annotation, clear the phase-resume annotation,
-		// then update status — all in one pass.
-		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("refreshing cluster before status update: %w", err)
-		}
-		anns := ensureAnnotations(cluster)
-		anns[annotationWorkerJoined] = "true"
-		anns[annotationLastCompletedPhaseWorker] = "-1" // clear so a future reprovision starts fresh
-		if err := r.Update(ctx, cluster); err != nil {
-			return ctrl.Result{}, fmt.Errorf("marking worker as joined: %w", err)
-		}
-		if err := r.setStatus(ctx, cluster, phaseReady, "WorkerJoined", "Worker node joined to cluster", false); err != nil {
-			return ctrl.Result{}, fmt.Errorf("updating worker status to Ready: %w", err)
-		}
-		log.Info("Worker node joined to cluster")
-
-		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, clusterParent, sshClientCP, nodeIP, "update"); err != nil {
-			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed", fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
-		}
-		if err := r.ensureLocalNodeProvisionNetConfig(ctx, clusterParent, clusterParent); err != nil {
-			log.Error(err, "syncing local NodeProvisionNetConfig (non-fatal)")
-		}
-
-	} else {
+	if cluster.Annotations[annotationWorkerJoined] == "true" {
+		// Already joined (reconcileProvisioning normally diverts these before it
+		// opens the worker connection): only the finalization is left.
 		log.Info("Worker already joined; skipping join step")
+		return r.retryWorkerFinalize(ctx, cluster)
 	}
 
-	// Label the node so the prepull DaemonSets can target it by hardware type.
-	// DaemonSets are already deployed on the CP; labels make the pods schedule.
-	if clusterParent != nil {
-		if sshClientCP, cpSSHErr := r.getSSHClient(ctx, clusterParent); cpSSHErr == nil { // ctx is sshCtx
-			defer sshClientCP.Conn.Close() //nolint:errcheck
-			hwLabel := "cpu"
-			if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
-				hwLabel = "gpu"
-			}
-			// Resolve actual node name (= OS hostname) to use with kubectl label.
-			nodeName := cluster.Spec.ClusterName
-			if workerSSH, sshErr := r.getSSHClient(ctx, cluster); sshErr == nil {
-				if out, hErr := sshhelper.Run(workerSSH, "hostname"); hErr == nil {
-					if h := strings.TrimSpace(out); h != "" {
-						nodeName = h
-					}
-				}
-				workerSSH.Conn.Close() //nolint:errcheck
-			}
-			labelCmd := fmt.Sprintf(
-				"kubectl label node %s infra.dcn.ssu.ac.kr/worker=true infra.dcn.ssu.ac.kr/hardware-type=%s --overwrite",
-				nodeName, hwLabel,
-			)
-			if out, labelErr := sshhelper.Run(sshClientCP, labelCmd); labelErr != nil {
-				log.Error(labelErr, "Failed to label worker node for DaemonSet targeting",
-					"node", nodeName, "output", strings.TrimSpace(out))
-			} else {
-				log.Info("Labeled worker node for DaemonSet targeting", "node", nodeName, "hardwareType", hwLabel)
-			}
-		} else {
-			log.Error(cpSSHErr, "Cannot SSH to CP to label worker node — skipping (DaemonSet will not schedule until labeled)")
+	if clusterParent == nil {
+		log.Info("Control-plane not found yet; requeueing")
+		return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
+	}
+
+	if clusterParent.Status.Phase != phaseReady || clusterParent.Status.JoinCommand == "" {
+		log.Info("Control-plane not ready yet; requeueing",
+			"cpPhase", clusterParent.Status.Phase)
+		return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
+	}
+
+	sshClientCP, err := r.getSSHClient(ctx, clusterParent) // ctx is already sshCtx from reconcileProvisioning
+	if err != nil {
+		return r.fail(ctx, cluster, "SSHConnectionFailed", fmt.Errorf("connecting to control-plane via SSH: %w", err))
+	}
+	defer func() { _ = sshClientCP.Conn.Close() }()
+
+	// Determine which phase to start from for this worker.
+	// On the first attempt the annotation is absent → startPhase=0 (full run).
+	// On retry after failure the annotation holds the last completed phase index.
+	workerStartPhase := 0
+	if s, ok := cluster.Annotations[annotationLastCompletedPhaseWorker]; ok {
+		if n, parseErr := strconv.Atoi(s); parseErr == nil && n >= 0 {
+			workerStartPhase = n + 1
+			log.Info("Resuming worker join from phase", "startPhase", workerStartPhase)
 		}
 	}
 
+	// Progress callback: persists the last completed phase to the CR annotation
+	// after each phase so a retry can skip already-done work.
+	onWorkerPhaseComplete := func(phaseIdx int) {
+		if patchErr := r.patchAnnotation(ctx, cluster, annotationLastCompletedPhaseWorker, strconv.Itoa(phaseIdx)); patchErr != nil {
+			log.Error(patchErr, "Failed to persist worker phase progress", "phase", phaseIdx)
+		}
+	}
+
+	workerRuntimeCfg, rErr := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
+	if rErr != nil {
+		return r.fail(ctx, cluster, "RuntimeConfigError",
+			fmt.Errorf("resolving cnlab-runtime config: %w", rErr))
+	}
+	// If the worker CR has no registry credentials, inherit them from the
+	// control-plane CR. This avoids repeating credentialsRef on every worker.
+	if workerRuntimeCfg.Token == "" {
+		parentCfg, pErr := r.resolveCnlabRuntimeConfig(ctx, clusterParent.Spec.NodeInfo.SoftwareConfig, clusterParent.Namespace)
+		if pErr != nil {
+			return r.fail(ctx, cluster, "RuntimeConfigError",
+				fmt.Errorf("resolving cnlab-runtime config from control-plane: %w", pErr))
+		}
+		workerRuntimeCfg.Username = parentCfg.Username
+		workerRuntimeCfg.Token = parentCfg.Token
+		// Inherit registry/repo/version from parent only when the worker
+		// has no cnlabRuntime block at all.
+		if cluster.Spec.NodeInfo.SoftwareConfig.CnlabRuntime == nil {
+			workerRuntimeCfg = parentCfg
+		}
+	}
+
+	// Both connections are up and the host is about to be modified: record the
+	// VPN mode it is provisioned with (once) so a later spec flip cannot change
+	// how it is cleaned up. Recorded this late on purpose — a worker that was
+	// never reached must stay free to have its spec corrected.
+	if err := r.recordProvisionedVPNMode(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	err, nodeIP := kubeadm.JoinWorkerNode(
+		sshClient,
+		sshClientCP,
+		withEffectiveVPNMode(cluster),
+		clusterParent.Status.JoinCommand,
+		withEffectiveVPNMode(clusterParent),
+		workerStartPhase,
+		onWorkerPhaseComplete,
+		workerRuntimeCfg,
+	)
+	if err != nil {
+		// Failed before any phase completed: the host was not changed as far as we
+		// know, so release the VPN mode record and let the user fix the spec.
+		r.releaseVPNModeIfUntouched(ctx, cluster)
+		return r.fail(
+			ctx,
+			cluster,
+			"WorkerJoinFailed",
+			fmt.Errorf("joining worker node to cluster: %w", err),
+		)
+	}
+
+	// Stamp the joined annotation FIRST (the join itself is not safe to
+	// re-run) together with a "finalize pending" marker that carries the
+	// node IP. Status=Ready, the control-plane's usedIPAddresses entry and the
+	// node labels are recorded afterwards and retried from the marker on any
+	// failure, so a failure below can no longer leave a joined worker stuck in
+	// Provisioning with its IP never recorded or its node unlabelled.
+	pending := nodeIP
+	if pending == "" {
+		pending = "none"
+	}
+	if err := r.patchAnnotations(ctx, cluster, map[string]string{
+		annotationWorkerJoined:             "true",
+		annotationLastCompletedPhaseWorker: "-1", // clear so a future reprovision starts fresh
+		annotationWorkerFinalizePending:    pending,
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("marking worker as joined: %w", err)
+	}
+	ensureAnnotations(cluster)[annotationWorkerJoined] = "true"
+	ensureAnnotations(cluster)[annotationWorkerFinalizePending] = pending
+	log.Info("Worker node joined to cluster")
+
+	if err := r.finalizeWorkerJoin(ctx, cluster, clusterParent, sshClientCP); err != nil {
+		return r.softFail(ctx, cluster, "WorkerFinalizeFailed", err)
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -831,21 +901,21 @@ func rcBuildPrepullDaemonSetManifest(dsName, nodeSelectorKey, nodeSelectorVal st
 	if registrySecretName != "" {
 		envJSON = fmt.Sprintf(`,
           "env": [
-            {"name": "REGISTRY_USER", "valueFrom": {"secretKeyRef": {"name": %q, "key": "username", "optional": true}}},
-            {"name": "REGISTRY_PASS", "valueFrom": {"secretKeyRef": {"name": %q, "key": "password", "optional": true}}}
-          ]`, registrySecretName, registrySecretName)
+            {"name": "REGISTRY_USER", "valueFrom": {"secretKeyRef": {"name": %s, "key": "username", "optional": true}}},
+            {"name": "REGISTRY_PASS", "valueFrom": {"secretKeyRef": {"name": %s, "key": "password", "optional": true}}}
+          ]`, jsonString(registrySecretName), jsonString(registrySecretName))
 	}
 
 	return fmt.Sprintf(`{
   "apiVersion": "apps/v1",
   "kind": "DaemonSet",
-  "metadata": {"name": %q, "namespace": "default", "labels": {"app": %q}},
+  "metadata": {"name": %s, "namespace": %s, "labels": {"app": %s}},
   "spec": {
-    "selector": {"matchLabels": {"app": %q}},
+    "selector": {"matchLabels": {"app": %s}},
     "template": {
-      "metadata": {"labels": {"app": %q}},
+      "metadata": {"labels": {"app": %s}},
       "spec": {
-        "nodeSelector": {%q: %q},
+        "nodeSelector": {%s: %s},
         "tolerations": [{"operator": "Exists"}],
         "containers": [{
           "name": "prepull",
@@ -867,7 +937,8 @@ func rcBuildPrepullDaemonSetManifest(dsName, nodeSelectorKey, nodeSelectorVal st
       }
     }
   }
-}`, dsName, dsName, dsName, dsName, nodeSelectorKey, nodeSelectorVal, scriptB64, envJSON)
+}`, jsonString(dsName), jsonString(prepullNamespace), jsonString(dsName), jsonString(dsName), jsonString(dsName),
+		jsonString(nodeSelectorKey), jsonString(nodeSelectorVal), scriptB64, envJSON)
 }
 
 // rcBuildDaemonSetPrepullScript returns a bash script that pulls images then sleeps.
@@ -887,8 +958,9 @@ func rcBuildDaemonSetPrepullScript(images []string) string {
 		if img == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "echo \"[prepull] Pulling %s...\"\n", img)
-		fmt.Fprintf(&b, "$CRICTL --runtime-endpoint \"$ENDPOINT\" pull $CREDS %q\n", img)
+		// shQuote: an image reference must never be interpreted by the shell.
+		fmt.Fprintf(&b, "printf '[prepull] Pulling %%s...\\n' %s\n", shQuote(img))
+		fmt.Fprintf(&b, "$CRICTL --runtime-endpoint \"$ENDPOINT\" pull $CREDS %s\n", shQuote(img))
 	}
 	b.WriteString("echo \"[prepull] Done.\"\n")
 	b.WriteString("exec sleep infinity\n")
@@ -929,24 +1001,30 @@ func rcBuildDaemonSetPrepullScript(images []string) string {
 // "create" push that was supposed to set them either never fully ran or ran
 // before those fields existed, and nothing ever re-synced them afterward).
 func desiredNodeProvisionNetConfigFields(clusterParent *infrav1.RemoteCluster) mlv1alpha1.NodeProvisionNetConfigSpec {
+	vpnDisabled := effectiveVPNDisabled(clusterParent)
 	spec := mlv1alpha1.NodeProvisionNetConfigSpec{
 		ClusterName: clusterParent.Spec.ClusterName,
+		DisableVPN:  vpnDisabled,
 	}
 
-	if vpnCIDR := VPNRangeToCIDR(clusterParent.Spec.VPNConfig.IP); vpnCIDR != "" {
-		spec.VPNRange = &vpnCIDR
-	}
+	// A control-plane with the VPN disabled has no VPN range or server for
+	// nodes to join; leave those fields empty.
+	if !vpnDisabled {
+		if vpnCIDR := VPNRangeToCIDR(clusterParent.Spec.VPNConfig.IP); vpnCIDR != "" {
+			spec.VPNRange = &vpnCIDR
+		}
 
-	vpn := clusterParent.Spec.VPNConfig
-	spec.VPNServerPublicConfig = mlv1alpha1.VPNServerConfig{
-		PublicIP:    vpn.VPNServerPublicIP,
-		SSHPort:     defaultString(vpn.VPNServerSSHPort, "22"),
-		SSHUsername: defaultString(vpn.VPNServerSSHUsername, "ubuntu"),
-		VPNSSHCredentialsRef: mlv1alpha1.VPNSSHCredentialsRef{
-			Name:      vpn.VPNSSHCredentialsRef.Name,
-			NameSpace: vpn.VPNSSHCredentialsRef.NameSpace,
-			Key:       vpn.VPNSSHCredentialsRef.Key,
-		},
+		vpn := clusterParent.Spec.VPNConfig
+		spec.VPNServerPublicConfig = mlv1alpha1.VPNServerConfig{
+			PublicIP:    vpn.VPNServerPublicIP,
+			SSHPort:     defaultString(vpn.VPNServerSSHPort, "22"),
+			SSHUsername: defaultString(vpn.VPNServerSSHUsername, "ubuntu"),
+			VPNSSHCredentialsRef: mlv1alpha1.VPNSSHCredentialsRef{
+				Name:      vpn.VPNSSHCredentialsRef.Name,
+				NameSpace: vpnCredRefNamespace(clusterParent, vpn.VPNSSHCredentialsRef),
+				Key:       vpn.VPNSSHCredentialsRef.Key,
+			},
+		}
 	}
 
 	sw := clusterParent.Spec.NodeInfo.SoftwareConfig
@@ -962,6 +1040,10 @@ func desiredNodeProvisionNetConfigFields(clusterParent *infrav1.RemoteCluster) m
 
 	if ref := sw.ImagePullSecretRef; ref != nil {
 		spec.SoftwareConfig.ImagePullSecretRef = &mlv1alpha1.SecretKeyReference{Name: ref.Name, Key: ref.Key}
+	}
+
+	if len(sw.InsecureRegistries) > 0 {
+		spec.SoftwareConfig.InsecureRegistries = append([]string(nil), sw.InsecureRegistries...)
 	}
 
 	return spec
@@ -988,11 +1070,13 @@ func (r *RemoteClusterReconciler) ensureLocalNodeProvisionNetConfig(
 	res, err := controllerutil.CreateOrUpdate(ctx, r.Client, nc, func() error {
 		desired := desiredNodeProvisionNetConfigFields(clusterParent)
 		nc.Spec.ClusterName = desired.ClusterName
+		nc.Spec.DisableVPN = desired.DisableVPN
 		nc.Spec.VPNRange = desired.VPNRange
 		nc.Spec.VPNServerPublicConfig = desired.VPNServerPublicConfig
 		nc.Spec.SoftwareConfig.KubernetesVersion = desired.SoftwareConfig.KubernetesVersion
 		nc.Spec.SoftwareConfig.ImagePrepulls = desired.SoftwareConfig.ImagePrepulls
 		nc.Spec.SoftwareConfig.ImagePullSecretRef = desired.SoftwareConfig.ImagePullSecretRef
+		nc.Spec.SoftwareConfig.InsecureRegistries = desired.SoftwareConfig.InsecureRegistries
 		// CnlabRuntime is deliberately left untouched here — synced separately
 		// by syncCnlabCredentialsToRemote, which also handles the credentials
 		// Secret it references.
@@ -1030,6 +1114,12 @@ func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig( //nolin
 		cluster.Name,
 	)
 
+	// Everything below is about what is (or is being) configured on the nodes, so
+	// it must follow the VPN mode they were provisioned with, not the mutable
+	// spec.disableVPN. Work on copies; the originals are never written back.
+	cluster = withEffectiveVPNMode(cluster)
+	clusterParent = withEffectiveVPNMode(clusterParent)
+
 	// ============================================================
 	// Resolve wg0 IP from remote node
 	// ============================================================
@@ -1041,16 +1131,25 @@ func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig( //nolin
 	// would always return the control-plane's IP, not the worker's.
 
 	if action == "create" {
-		output, err := sshhelper.Run(
-			sshClient,
-			"ip -4 addr show wg0 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'",
-		)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("getting wg0 ip: %w", err)
-		}
-		nodeIP = strings.TrimSpace(output)
-		if nodeIP == "" {
-			return ctrl.Result{}, fmt.Errorf("empty wg0 ip")
+		if cluster.Spec.DisableVPN {
+			// No wg0: the control-plane's own address is its node IP.
+			var err error
+			nodeIP, err = kubeadm.ResolveNodeIP(sshClient, cluster)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("resolving control-plane node ip: %w", err)
+			}
+		} else {
+			output, err := sshhelper.RunStdout(
+				sshClient,
+				"ip -4 addr show wg0 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'",
+			)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("getting wg0 ip: %w", err)
+			}
+			nodeIP = strings.TrimSpace(output)
+			if nodeIP == "" {
+				return ctrl.Result{}, fmt.Errorf("empty wg0 ip")
+			}
 		}
 	}
 
@@ -1058,7 +1157,7 @@ func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig( //nolin
 		return ctrl.Result{}, fmt.Errorf("nodeIP is empty")
 	}
 
-	log.Info("Resolved wg0 IP", "nodeIP", nodeIP)
+	log.Info("Resolved node IP", "nodeIP", nodeIP, "vpnDisabled", cluster.Spec.DisableVPN)
 
 	// ============================================================
 	// CREATE
@@ -1070,39 +1169,16 @@ func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig( //nolin
 
 		// Ensure the VPN SSH credentials secret exists on the remote cluster so
 		// the NodeProvisionNetConfig controller there can read it.
-		if cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
+		vpnRef := cluster.Spec.VPNConfig.VPNSSHCredentialsRef
+		vpnNS := vpnCredRefNamespace(cluster, vpnRef)
+		if !cluster.Spec.DisableVPN && vpnRef.Name != "" {
 			vpnSecret := &corev1.Secret{}
-			if err := r.Get(ctx, types.NamespacedName{
-				Name:      cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
-				Namespace: cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
-			}, vpnSecret); err != nil {
-				return ctrl.Result{}, fmt.Errorf(
-					"fetching VPN SSH credentials secret %q: %w",
-					cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
-					err,
-				)
+			if err := r.Get(ctx, types.NamespacedName{Name: vpnRef.Name, Namespace: vpnNS}, vpnSecret); err != nil {
+				return ctrl.Result{}, fmt.Errorf("fetching VPN SSH credentials secret %q: %w", vpnRef.Name, err)
 			}
 
-			secretData := ""
-			for k, v := range vpnSecret.Data {
-				secretData += fmt.Sprintf("  %s: %s\n", k, base64.StdEncoding.EncodeToString(v))
-			}
-			secretYAML := fmt.Sprintf(`apiVersion: v1
-kind: Secret
-metadata:
-  name: %s
-  namespace: %s
-type: %s
-data:
-%s`,
-				vpnSecret.Name,
-				cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
-				string(vpnSecret.Type),
-				secretData,
-			)
-
-			secretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", secretYAML)
-			secretOutput, secretErr := sshhelper.Run(sshClient, secretCmd)
+			secretOutput, secretErr := sshhelper.Run(sshClient,
+				secretApplyCmd(vpnSecret.Name, vpnNS, vpnSecret.Type, vpnSecret.Data))
 			if secretErr != nil {
 				return ctrl.Result{}, fmt.Errorf(
 					"creating VPN SSH credentials secret on remote cluster: %w\nOutput:\n%s",
@@ -1114,7 +1190,8 @@ data:
 		}
 
 		// Ensure the image pull secret exists on the remote cluster so the
-		// NodeProvision controller there can authenticate when pre-pulling images.
+		// NodeProvision controller there can authenticate when pre-pulling images,
+		// and so the prepull DaemonSets (fixed to prepullNamespace) can read it.
 		if ref := clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePullSecretRef; ref != nil {
 			pullSecret := &corev1.Secret{}
 			if err := r.Get(ctx, types.NamespacedName{
@@ -1127,33 +1204,21 @@ data:
 				)
 			}
 
-			secretData := ""
-			for k, v := range pullSecret.Data {
-				secretData += fmt.Sprintf("  %s: %s\n", k, base64.StdEncoding.EncodeToString(v))
+			targetNamespaces := []string{cluster.Namespace}
+			if cluster.Namespace != prepullNamespace {
+				targetNamespaces = append(targetNamespaces, prepullNamespace)
 			}
-			pullSecretYAML := fmt.Sprintf(`apiVersion: v1
-kind: Secret
-metadata:
-  name: %s
-  namespace: %s
-type: %s
-data:
-%s`,
-				pullSecret.Name,
-				cluster.Namespace,
-				string(pullSecret.Type),
-				secretData,
-			)
-
-			pullSecretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", pullSecretYAML)
-			pullSecretOutput, pullSecretErr := sshhelper.Run(sshClient, pullSecretCmd)
-			if pullSecretErr != nil {
-				return ctrl.Result{}, fmt.Errorf(
-					"creating image pull secret on remote cluster: %w\nOutput:\n%s",
-					pullSecretErr, pullSecretOutput,
-				)
+			for _, ns := range targetNamespaces {
+				pullSecretOutput, pullSecretErr := sshhelper.Run(sshClient,
+					secretApplyCmd(pullSecret.Name, ns, pullSecret.Type, pullSecret.Data))
+				if pullSecretErr != nil {
+					return ctrl.Result{}, fmt.Errorf(
+						"creating image pull secret in namespace %q on remote cluster: %w\nOutput:\n%s",
+						ns, pullSecretErr, pullSecretOutput,
+					)
+				}
+				log.Info("Ensured image pull secret on remote cluster", "secret", pullSecret.Name, "namespace", ns)
 			}
-			log.Info("Ensured image pull secret on remote cluster", "secret", pullSecret.Name)
 		}
 
 		// Copy the cnlab-runtime registry credentials secret to the remote cluster
@@ -1175,26 +1240,8 @@ data:
 				)
 			}
 
-			secretData := ""
-			for k, v := range runtimeCredsSecret.Data {
-				secretData += fmt.Sprintf("  %s: %s\n", k, base64.StdEncoding.EncodeToString(v))
-			}
-			runtimeSecretYAML := fmt.Sprintf(`apiVersion: v1
-kind: Secret
-metadata:
-  name: %s
-  namespace: %s
-type: %s
-data:
-%s`,
-				runtimeCredsSecret.Name,
-				ns,
-				string(runtimeCredsSecret.Type),
-				secretData,
-			)
-
-			runtimeSecretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", runtimeSecretYAML)
-			if runtimeSecretOutput, runtimeSecretErr := sshhelper.Run(sshClient, runtimeSecretCmd); runtimeSecretErr != nil {
+			if runtimeSecretOutput, runtimeSecretErr := sshhelper.Run(sshClient,
+				secretApplyCmd(runtimeCredsSecret.Name, ns, runtimeCredsSecret.Type, runtimeCredsSecret.Data)); runtimeSecretErr != nil {
 				return ctrl.Result{}, fmt.Errorf(
 					"creating cnlab-runtime credentials secret on remote cluster: %w\nOutput:\n%s",
 					runtimeSecretErr, runtimeSecretOutput,
@@ -1204,15 +1251,23 @@ data:
 		}
 
 		// Build optional softwareConfig fields (indented to match sibling keys).
+		// Every interpolated value goes through yamlQuote so it cannot break out
+		// of its scalar.
 		var imagePrepullsYAML string
 		if len(clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePrepulls) > 0 {
 			imagePrepullsYAML = "    imagePrepulls:\n"
 			for _, ip := range clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePrepulls {
-				imagePrepullsYAML += fmt.Sprintf("    - image: %q\n      nodeTarget: %q\n", ip.Image, ip.NodeTarget)
+				imagePrepullsYAML += fmt.Sprintf("    - image: %s\n      nodeTarget: %s\n", yamlQuote(ip.Image), yamlQuote(ip.NodeTarget))
 			}
 		}
 		if ref := clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePullSecretRef; ref != nil {
-			imagePrepullsYAML += fmt.Sprintf("    imagePullSecretRef:\n      name: \"%s\"\n", ref.Name)
+			imagePrepullsYAML += fmt.Sprintf("    imagePullSecretRef:\n      name: %s\n", yamlQuote(ref.Name))
+		}
+		if regs := clusterParent.Spec.NodeInfo.SoftwareConfig.InsecureRegistries; len(regs) > 0 {
+			imagePrepullsYAML += "    insecureRegistries:\n"
+			for _, h := range regs {
+				imagePrepullsYAML += fmt.Sprintf("    - %s\n", yamlQuote(h))
+			}
 		}
 		// Propagate cnlabRuntime config so the remote cluster's NodeProvisionReconciler
 		// can pull the runtime artifact without connecting back to the management cluster.
@@ -1220,21 +1275,21 @@ data:
 		if cr := clusterParent.Spec.NodeInfo.SoftwareConfig.CnlabRuntime; cr != nil {
 			cnlabRuntimeYAML = "    cnlabRuntime:\n"
 			if cr.Registry != "" {
-				cnlabRuntimeYAML += fmt.Sprintf("      registry: %q\n", cr.Registry)
+				cnlabRuntimeYAML += fmt.Sprintf("      registry: %s\n", yamlQuote(cr.Registry))
 			}
 			if cr.Repository != "" {
-				cnlabRuntimeYAML += fmt.Sprintf("      repository: %q\n", cr.Repository)
+				cnlabRuntimeYAML += fmt.Sprintf("      repository: %s\n", yamlQuote(cr.Repository))
 			}
 			if cr.Version != "" {
-				cnlabRuntimeYAML += fmt.Sprintf("      version: %q\n", cr.Version)
+				cnlabRuntimeYAML += fmt.Sprintf("      version: %s\n", yamlQuote(cr.Version))
 			}
 			if cr.OrasVersion != "" {
-				cnlabRuntimeYAML += fmt.Sprintf("      orasVersion: %q\n", cr.OrasVersion)
+				cnlabRuntimeYAML += fmt.Sprintf("      orasVersion: %s\n", yamlQuote(cr.OrasVersion))
 			}
 			if cr.CredentialsRef.Name != "" {
-				cnlabRuntimeYAML += fmt.Sprintf("      credentialsRef:\n        name: %q\n        namespace: %q\n",
-					cr.CredentialsRef.Name,
-					cr.CredentialsRef.NameSpace,
+				cnlabRuntimeYAML += fmt.Sprintf("      credentialsRef:\n        name: %s\n        namespace: %s\n",
+					yamlQuote(cr.CredentialsRef.Name),
+					yamlQuote(vpnCredRefNamespace(clusterParent, cr.CredentialsRef)),
 				)
 			}
 		}
@@ -1248,37 +1303,47 @@ data:
 			vpnServerSSHUsername = "ubuntu"
 		}
 
-		netConfigYAML := fmt.Sprintf(`
-apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
-kind: NodeProvisionNetConfig
-metadata:
-  name: %s-netconfig
-  namespace: %s
-spec:
-  clusterName: %s
-  softwareConfig:
-    kubernetesVersion: "%s"
-%s%s  vpnRange: %s
+		// VPN section of the spec — omitted entirely when the VPN is disabled.
+		var vpnSpecYAML string
+		if !cluster.Spec.DisableVPN {
+			vpnSpecYAML = fmt.Sprintf(`  vpnRange: %s
   vpnServerPublicConfig:
     publicIP: %s
-    sshPort: "%s"
+    sshPort: %s
     sshUsername: %s
     vpnSshCredentialsRef:
       name: %s
       namespace: %s
 `,
-			cluster.Spec.ClusterName,
-			cluster.Namespace,
-			cluster.Spec.ClusterName,
-			clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion,
+				yamlQuote(vpnCIDR),
+				yamlQuote(cluster.Spec.VPNConfig.VPNServerPublicIP),
+				yamlQuote(vpnServerSSHPort),
+				yamlQuote(vpnServerSSHUsername),
+				yamlQuote(vpnRef.Name),
+				yamlQuote(vpnNS),
+			)
+		}
+
+		netConfigYAML := fmt.Sprintf(`
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvisionNetConfig
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterName: %s
+  disableVPN: %t
+  softwareConfig:
+    kubernetesVersion: %s
+%s%s%s`,
+			yamlQuote(cluster.Spec.ClusterName+"-netconfig"),
+			yamlQuote(cluster.Namespace),
+			yamlQuote(cluster.Spec.ClusterName),
+			cluster.Spec.DisableVPN,
+			yamlQuote(clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion),
 			imagePrepullsYAML,
 			cnlabRuntimeYAML,
-			vpnCIDR,
-			cluster.Spec.VPNConfig.VPNServerPublicIP,
-			vpnServerSSHPort,
-			vpnServerSSHUsername,
-			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name,
-			cluster.Spec.VPNConfig.VPNSSHCredentialsRef.NameSpace,
+			vpnSpecYAML,
 		)
 
 		// Apply the CRD first so the remote API server knows the full schema
@@ -1315,13 +1380,17 @@ spec:
 		// (join command + initial IP) with a single-quoted JSON body so that no
 		// shell variable expansion can corrupt the value.
 		joinCmdJSON, _ := json.Marshal(cluster.Status.JoinCommand)
+		// usedIPAddresses tracks VPN-range allocations; the node IP of a
+		// VPN-less control-plane is not one.
+		usedIPsJSON := fmt.Sprintf(`,"usedIPAddresses":[%s]`, jsonString(nodeIP))
+		if cluster.Spec.DisableVPN {
+			usedIPsJSON = ""
+		}
 		staticPatchCmd := fmt.Sprintf(
-			`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status `+
-				`-p '{"status":{"clusterJoinCommand":%s,"usedIPAddresses":["%s"]}}'`,
-			cluster.Spec.ClusterName,
-			cluster.Namespace,
-			string(joinCmdJSON),
-			nodeIP,
+			`kubectl patch nodeprovisionnetconfig %s -n %s --type=merge --subresource=status -p %s`,
+			shQuote(cluster.Spec.ClusterName+"-netconfig"),
+			shQuote(cluster.Namespace),
+			shQuote(fmt.Sprintf(`{"status":{"clusterJoinCommand":%s%s}}`, string(joinCmdJSON), usedIPsJSON)),
 		)
 		staticOutput, staticErr := sshhelper.Run(sshClient, staticPatchCmd)
 		if staticErr != nil {
@@ -1340,10 +1409,10 @@ spec:
 			`KUBECONFIG_B64=$(sudo cat /etc/kubernetes/admin.conf | base64 -w0 2>/dev/null || `+
 				`sudo cat /etc/kubernetes/admin.conf | base64 | tr -d '\n') && `+
 				`[ -n "$KUBECONFIG_B64" ] && `+
-				`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status `+
+				`kubectl patch nodeprovisionnetconfig %s -n %s --type=merge --subresource=status `+
 				`-p "{\"status\":{\"kubeconfig\":\"$KUBECONFIG_B64\"}}" || true`,
-			cluster.Spec.ClusterName,
-			cluster.Namespace,
+			shQuote(cluster.Spec.ClusterName+"-netconfig"),
+			shQuote(cluster.Namespace),
 		)
 		kcOutput, kcErr := sshhelper.Run(sshClient, kcPatchCmd)
 		if kcErr != nil {
@@ -1373,12 +1442,14 @@ spec:
 	// UPDATE
 	// ============================================================
 
-	if action == "update" {
+	if action == "update" && cluster.Spec.DisableVPN {
+		log.Info("Worker has no VPN IP — not recording it in usedIPAddresses", "nodeIP", nodeIP)
+	} else if action == "update" {
 		// Append the worker's VPN IP to usedIPAddresses only if not already present.
 		// Using a shell read-then-write to avoid races and duplicates — the JSON patch
 		// "add to array" op has no native dedup.
 		appendCmd := fmt.Sprintf(`
-NAME="%s-netconfig"; NS="%s"; IP="%s"
+NAME=%s; NS=%s; IP=%s
 EXISTING=$(kubectl get nodeprovisionnetconfig "$NAME" -n "$NS" \
   -o jsonpath='{.status.usedIPAddresses[*]}' 2>/dev/null || true)
 for x in $EXISTING; do
@@ -1388,9 +1459,9 @@ kubectl patch nodeprovisionnetconfig "$NAME" -n "$NS" \
   --type='json' --subresource=status \
   -p="[{\"op\":\"add\",\"path\":\"/status/usedIPAddresses/-\",\"value\":\"$IP\"}]"
 `,
-			cluster.Spec.ClusterName,
-			cluster.Namespace,
-			nodeIP,
+			shQuote(cluster.Spec.ClusterName+"-netconfig"),
+			shQuote(cluster.Namespace),
+			shQuote(nodeIP),
 		)
 
 		output, err := sshhelper.Run(sshClient, appendCmd)
@@ -1440,7 +1511,8 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 	// resolution — see the identical comment in pkg/kubeadm/kubeadm.go's
 	// getJoinCommand for why: a stray KUBECONFIG env var on the target host
 	// can silently redirect kubeadm at an unrelated API server.
-	out, err := sshhelper.Run(sshClient, "kubeadm token create --print-join-command --kubeconfig=/etc/kubernetes/admin.conf 2>/dev/null")
+	// Stdout only: the output is stored as the join command.
+	out, err := sshhelper.RunStdoutCtx(sshCtx, sshClient, "kubeadm token create --print-join-command --kubeconfig=/etc/kubernetes/admin.conf 2>/dev/null")
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("kubeadm token create: %w\nOutput: %s", err, out)
 	}
@@ -1469,8 +1541,12 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 		log.Error(err, "patching remote netconfig kubeconfig (non-fatal)")
 	}
 
-	if patchErr := r.patchAnnotation(ctx, cluster, annotationJoinTokenRefreshedAt, time.Now().UTC().Format(time.RFC3339)); patchErr != nil {
+	refreshedAt := time.Now().UTC().Format(time.RFC3339)
+	if patchErr := r.patchAnnotation(ctx, cluster, annotationJoinTokenRefreshedAt, refreshedAt); patchErr != nil {
 		log.Error(patchErr, "Failed to stamp join-token-refreshed-at annotation")
+	} else {
+		// Keep the caller's copy current: it computes the next wake-up from it.
+		ensureAnnotations(cluster)[annotationJoinTokenRefreshedAt] = refreshedAt
 	}
 
 	return ctrl.Result{RequeueAfter: tokenRefreshInterval}, nil
@@ -1498,8 +1574,8 @@ kubeadm certs renew admin.conf
 cp -f /etc/kubernetes/admin.conf "$HOME/.kube/config" 2>/dev/null || true
 
 # Discover the netconfig name and namespace.
-NETCONFIG_NAME="%s-netconfig"
-NAMESPACE="%s"
+NETCONFIG_NAME=%s
+NAMESPACE=%s
 
 # Base64-encode the fresh kubeconfig (GNU and BSD base64 compatible).
 KUBECONFIG_B64=$(base64 -w0 /etc/kubernetes/admin.conf 2>/dev/null || \
@@ -1511,7 +1587,7 @@ kubectl patch nodeprovisionnetconfig "$NETCONFIG_NAME" -n "$NAMESPACE" \
   -p "{\"status\":{\"kubeconfig\":\"$KUBECONFIG_B64\"}}"
 
 echo "kubeconfig-refresh: done"
-`, clusterName, namespace)
+`, shQuote(clusterName+"-netconfig"), shQuote(namespace))
 
 	serviceUnit := `[Unit]
 Description=Renew kubeadm admin kubeconfig and update NodeProvisionNetConfig
@@ -1577,12 +1653,10 @@ func (r *RemoteClusterReconciler) patchRemoteNetConfigJoinCmd(ctx context.Contex
 	joinCmdJSON, _ := json.Marshal(joinCmd)
 	nowJSON, _ := json.Marshal(time.Now().UTC().Format(time.RFC3339))
 	cmd := fmt.Sprintf(
-		`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge --subresource=status `+
-			`-p '{"status":{"clusterJoinCommand":%s,"joinTokenRefreshedAt":%s}}'`,
-		cluster.Spec.ClusterName,
-		cluster.Namespace,
-		string(joinCmdJSON),
-		string(nowJSON),
+		`kubectl patch nodeprovisionnetconfig %s -n %s --type=merge --subresource=status -p %s`,
+		shQuote(cluster.Spec.ClusterName+"-netconfig"),
+		shQuote(cluster.Namespace),
+		shQuote(fmt.Sprintf(`{"status":{"clusterJoinCommand":%s,"joinTokenRefreshedAt":%s}}`, string(joinCmdJSON), string(nowJSON))),
 	)
 	out, err := sshhelper.Run(sshClient, cmd)
 	if err != nil {
@@ -1604,11 +1678,11 @@ func (r *RemoteClusterReconciler) patchRemoteNetConfigKubeconfig(ctx context.Con
 		`KUBECONFIG_B64=$(sudo cat /etc/kubernetes/admin.conf | base64 -w0 2>/dev/null || `+
 			`sudo cat /etc/kubernetes/admin.conf | base64 | tr -d '\n') && `+
 			`[ -n "$KUBECONFIG_B64" ] && `+
-			`kubectl patch nodeprovisionnetconfig %s-netconfig -n %s `+
+			`kubectl patch nodeprovisionnetconfig %s -n %s `+
 			`--type=merge --subresource=status `+
 			`-p "{\"status\":{\"kubeconfig\":\"$KUBECONFIG_B64\"}}"`,
-		cluster.Spec.ClusterName,
-		cluster.Namespace,
+		shQuote(cluster.Spec.ClusterName+"-netconfig"),
+		shQuote(cluster.Namespace),
 	)
 	out, err := sshhelper.Run(sshClient, cmd)
 	if err != nil {
@@ -1618,14 +1692,16 @@ func (r *RemoteClusterReconciler) patchRemoteNetConfigKubeconfig(ctx context.Con
 	return nil
 }
 
-// setStatus appends a new progress condition to the cluster status, preserving
-// the full history of all steps (both successes and failures).
+// setStatus upserts the progress condition for this step (keyed by its Type, so
+// the list stays bounded and a repeated step updates rather than duplicates) and
+// writes the phase/message.
 func (r *RemoteClusterReconciler) setStatus(
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
 	phase, reason, message string,
 	isError bool,
 ) error {
+	message = truncateMessage(message)
 	cluster.Status.Phase = phase
 	cluster.Status.Message = message
 
@@ -1636,19 +1712,32 @@ func (r *RemoteClusterReconciler) setStatus(
 		cluster.Status.ProvisionRetryCount = 0
 	}
 
+	// Reaching Ready supersedes every earlier failure: fail()/softFail() record a
+	// failure as a condition of Status False keyed by its reason, and nothing else
+	// would ever clear those, leaving e.g. ControlPlaneInitFailed=False on a
+	// working cluster. The cnlab credential-sync condition has its own lifecycle
+	// (it also gates retries) and is kept.
+	if phase == phaseReady && !isError {
+		kept := cluster.Status.Conditions[:0:0]
+		for _, c := range cluster.Status.Conditions {
+			if c.Status == metav1.ConditionFalse && c.Type != cnlabSyncConditionType {
+				continue
+			}
+			kept = append(kept, c)
+		}
+		cluster.Status.Conditions = kept
+	}
+
 	condStatus := metav1.ConditionTrue
 	if isError {
 		condStatus = metav1.ConditionFalse
 	}
 
-	// Append rather than upsert so every step is recorded in order.
-	cluster.Status.Conditions = append(cluster.Status.Conditions, metav1.Condition{
-		Type:               reason,
-		Status:             condStatus,
-		Reason:             reason,
-		Message:            message,
-		ObservedGeneration: cluster.Generation,
-		LastTransitionTime: metav1.Now(),
+	upsertCondition(cluster, metav1.Condition{
+		Type:    reason,
+		Status:  condStatus,
+		Reason:  reason,
+		Message: message,
 	})
 
 	return r.Status().Update(ctx, cluster)
@@ -1821,6 +1910,98 @@ func ensureAnnotations(obj client.Object) map[string]string {
 	return obj.GetAnnotations()
 }
 
+// reconcileVPNMode keeps a worker's VPN mode consistent with its
+// control-plane's, which decides for the whole cluster: flannel is pinned to
+// wg0 on VPN clusters and the API server is advertised on the wg0 (or, without
+// a VPN, the host) address, so a mixed cluster cannot work.
+//
+// spec.disableVPN is mutable, but what was actually provisioned is not: once a
+// node has been provisioned its mode is recorded in annotationProvisionedVPNMode
+// and that record (never the spec) drives every decision about the node. A
+// node that is already provisioned is therefore never silently flipped; a
+// conflict is surfaced as a condition and re-checked every minute.
+//
+//   - control-plane without the VPN, unprovisioned worker unset → the worker
+//     inherits it (persisted, so deletion cleanup does not depend on the
+//     control-plane still existing).
+//   - control-plane with the VPN, unprovisioned worker disabled → the worker is
+//     failed without consuming the retry budget (the user must fix the spec).
+//   - provisioned worker whose mode differs from its control-plane → condition +
+//     requeue, nothing is changed.
+//
+// done is true when the caller must return res immediately.
+func (r *RemoteClusterReconciler) reconcileVPNMode(ctx context.Context, cluster *infrav1.RemoteCluster) (res ctrl.Result, done bool, err error) {
+	// A worker whose record was stamped but that never got as far as completing a
+	// phase (older versions stamped it before even connecting) never touched its
+	// host: the record is meaningless and would otherwise wedge it behind a
+	// permanent mismatch. Workers are provisioned synchronously, so no attempt
+	// can be in flight here.
+	if cluster.Spec.NodeInfo.NodeType == "worker" && cluster.Annotations[annotationProvisionedVPNMode] != "" &&
+		r.provisioningUntouched(cluster) {
+		if err := r.patchAnnotations(ctx, cluster, map[string]string{annotationProvisionedVPNMode: ""}); err != nil {
+			return ctrl.Result{}, true, fmt.Errorf("releasing stale VPN mode record of an untouched worker: %w", err)
+		}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+			return ctrl.Result{}, true, err
+		}
+	}
+	recorded := cluster.Annotations[annotationProvisionedVPNMode]
+	if recorded != "" && recorded != vpnModeString(cluster.Spec.DisableVPN) {
+		// Surface that a spec edit is being ignored for an already provisioned node.
+		r.setCondition(ctx, cluster, conditionVPNModeChangeIgnored, metav1.ConditionTrue, "ProvisionedModeRetained",
+			fmt.Sprintf("spec.disableVPN=%t differs from the mode this node was provisioned with (%s); the provisioned mode is kept. "+
+				"Re-provision the node to change it", cluster.Spec.DisableVPN, recorded))
+	} else {
+		r.clearConditions(ctx, cluster, conditionVPNModeChangeIgnored)
+	}
+
+	if cluster.Spec.NodeInfo.NodeType != "worker" {
+		return ctrl.Result{}, false, nil
+	}
+	cp, err := r.findControlPlane(ctx, cluster)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("listing RemoteClusters: %w", err)
+	}
+	if cp == nil {
+		return ctrl.Result{}, false, nil
+	}
+	workerDisabled, cpDisabled := effectiveVPNDisabled(cluster), effectiveVPNDisabled(cp)
+	if workerDisabled == cpDisabled {
+		r.clearConditions(ctx, cluster, conditionVPNModeMismatch)
+		return ctrl.Result{}, false, nil
+	}
+
+	if recorded != "" {
+		msg := fmt.Sprintf("worker was provisioned with the VPN %s but control-plane %q uses it %s; the whole cluster must use the same mode. "+
+			"The provisioned worker is left untouched — re-provision it or the control-plane",
+			enabledWord(!workerDisabled), cp.Name, enabledWord(!cpDisabled))
+		r.setCondition(ctx, cluster, conditionVPNModeMismatch, metav1.ConditionTrue, conditionVPNModeMismatch, msg)
+		return ctrl.Result{RequeueAfter: time.Minute}, true, nil
+	}
+
+	if !cpDisabled {
+		res, err := r.failNoCount(ctx, cluster, conditionVPNModeMismatch, fmt.Errorf(
+			"spec.disableVPN is set but control-plane %q runs with the VPN; the whole cluster must use the same mode", cp.Name))
+		return res, true, err
+	}
+	logf.FromContext(ctx).Info("Inheriting disableVPN from control-plane", "cp", cp.Name)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("refreshing worker before inheriting disableVPN: %w", err)
+	}
+	cluster.Spec.DisableVPN = true
+	if err := r.Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("inheriting disableVPN from control-plane: %w", err)
+	}
+	return ctrl.Result{Requeue: true}, true, nil
+}
+
+func enabledWord(enabled bool) string {
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
+}
+
 // findControlPlane returns the control-plane RemoteCluster for the same clusterName,
 // or nil if none is found (without error).
 func (r *RemoteClusterReconciler) findControlPlane(ctx context.Context, cluster *infrav1.RemoteCluster) (*infrav1.RemoteCluster, error) {
@@ -1868,6 +2049,19 @@ func (r *RemoteClusterReconciler) removeAuthSecretFinalizer(ctx context.Context,
 
 	if !controllerutil.ContainsFinalizer(secret, authSecretFinalizer) {
 		return
+	}
+	// The user-managed secret may be shared by several RemoteClusters (typically
+	// every node of one cluster): only release it when no other live
+	// RemoteCluster still references it. The controller-owned copy is private.
+	if secret.Name != cluster.Name+controllerAuthSuffix {
+		if used, err := r.secretReferenced(ctx, cluster, secret.Namespace, secret.Name,
+			func(o *infrav1.RemoteCluster) (string, string) { return o.Namespace, authSecretName(o) }); err != nil {
+			log.Error(err, "checking other users of the auth secret — keeping finalizer", "secret", secret.Name)
+			return
+		} else if used {
+			log.Info("Auth secret is still referenced by another RemoteCluster — keeping finalizer", "secret", secret.Name)
+			return
+		}
 	}
 	patch := client.MergeFrom(secret.DeepCopy())
 	controllerutil.RemoveFinalizer(secret, authSecretFinalizer)
@@ -1922,6 +2116,24 @@ func (r *RemoteClusterReconciler) removeVPNSecretFinalizer(ctx context.Context, 
 	}
 
 	if !controllerutil.ContainsFinalizer(secret, vpnSecretFinalizer) {
+		return
+	}
+	// Shared by every node of a VPN cluster: release it only when no other live
+	// RemoteCluster that uses the VPN still references it.
+	used, err := r.secretReferenced(ctx, cluster, secret.Namespace, secret.Name,
+		func(o *infrav1.RemoteCluster) (string, string) {
+			if effectiveVPNDisabled(o) {
+				return "", ""
+			}
+			ref := o.Spec.VPNConfig.VPNSSHCredentialsRef
+			return vpnCredRefNamespace(o, ref), ref.Name
+		})
+	if err != nil {
+		log.Error(err, "checking other users of the VPN secret — keeping finalizer", "secret", secret.Name)
+		return
+	}
+	if used {
+		log.Info("VPN SSH secret is still referenced by another RemoteCluster — keeping finalizer", "secret", secret.Name)
 		return
 	}
 	patch := client.MergeFrom(secret.DeepCopy())
@@ -2057,7 +2269,7 @@ func (r *RemoteClusterReconciler) getSSHClient(ctx context.Context, cluster *inf
 	}
 
 	var host string
-	if cluster.Spec.VPNConfig.IP != "" {
+	if cluster.Spec.VPNConfig.IP != "" && !effectiveVPNDisabled(cluster) {
 		host = cluster.Spec.VPNConfig.IP
 	} else {
 		host = cluster.Spec.Host
@@ -2098,7 +2310,7 @@ func (r *RemoteClusterReconciler) createClusterRepo(ctx context.Context, cluster
 	if err := r.ensurePorchRepository(ctx, cluster, labels, secretRefName); err != nil {
 		return fmt.Errorf("ensuring porch repository: %w", err)
 	}
-	if err := r.ensureNephioRepository(ctx, cluster); err != nil {
+	if err := r.ensureNephioRepository(ctx, cluster, labels); err != nil {
 		return fmt.Errorf("ensuring nephio repository: %w", err)
 	}
 	if err := r.ensureToken(ctx, cluster, labels, secretRefName); err != nil {
@@ -2155,7 +2367,7 @@ func (r *RemoteClusterReconciler) ensurePorchRepository(
 	return r.Create(ctx, obj)
 }
 
-func (r *RemoteClusterReconciler) ensureNephioRepository(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+func (r *RemoteClusterReconciler) ensureNephioRepository(ctx context.Context, cluster *infrav1.RemoteCluster, labels map[string]string) error {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "infra.nephio.org",
@@ -2164,6 +2376,9 @@ func (r *RemoteClusterReconciler) ensureNephioRepository(ctx context.Context, cl
 	})
 	obj.SetName(cluster.Spec.ClusterName)
 	obj.SetNamespace(cluster.Namespace)
+	// Labelled like the other per-cluster objects so deleteClusterResources
+	// (which selects by label) actually finds and removes it.
+	obj.SetLabels(labels)
 
 	err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj)
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -2250,21 +2465,43 @@ func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *inf
 	log := logf.FromContext(ctx)
 	log.Info("Deprovisioning RemoteCluster", "name", cluster.Name, "nodeType", cluster.Spec.NodeInfo.NodeType)
 
+	// Abort and forget any in-flight control-plane init for this object: the
+	// goroutine must not keep driving a host we are about to wipe, and a stale
+	// entry must not be adopted by a later object with the same name.
+	r.cancelControlPlaneJob(cluster.Namespace + "/" + cluster.Name)
+
 	if !controllerutil.ContainsFinalizer(cluster, remoteClusterFinalizer) {
 		return ctrl.Result{}, nil
 	}
 
-	// Step 1: If worker, drain and remove the node from the Kubernetes cluster
-	// before wiping it so workloads migrate away gracefully.
-	if cluster.Spec.NodeInfo.NodeType == "worker" {
-		r.drainWorkerFromCP(ctx, cluster)
-	}
+	// Everything below that touches the node or the VPN server works on a copy
+	// whose spec.disableVPN is the mode the node was actually provisioned with
+	// (recorded annotation; for a node that never got that far, its
+	// control-plane's mode). It is never written back.
+	work := cluster.DeepCopy()
+	work.Spec.DisableVPN = r.resolveVPNDisabledForDelete(ctx, cluster)
 
-	// Step 2: SSH to the node — kubeadm reset, purge packages, remove configs,
-	// bring down WireGuard.  Best-effort: if the node is already unreachable
-	// we still proceed so the finalizer can be removed.
-	if err := r.resetNodeViaSSH(ctx, cluster); err != nil {
-		log.Error(err, "node SSH reset incomplete (continuing with cleanup)")
+	// Steps 1-2 take minutes of SSH work and must not be repeated because a later
+	// step failed and the reconcile re-entered: once attempted, they are recorded
+	// on the object (the rest of the cleanup is cheap and idempotent).
+	if cluster.Annotations[annotationDeleteNodeCleanupDone] != "true" {
+		// Step 1: If worker, drain and remove the node from the Kubernetes cluster
+		// before wiping it so workloads migrate away gracefully.
+		if work.Spec.NodeInfo.NodeType == "worker" {
+			r.drainWorkerFromCP(ctx, work)
+		}
+
+		// Step 2: SSH to the node — kubeadm reset, purge packages, remove configs,
+		// bring down WireGuard.  Best-effort: if the node is already unreachable
+		// we still proceed so the finalizer can be removed.
+		if err := r.resetNodeViaSSH(ctx, work); err != nil {
+			log.Error(err, "node SSH reset incomplete (continuing with cleanup)")
+		}
+		if err := r.patchAnnotation(ctx, cluster, annotationDeleteNodeCleanupDone, "true"); err != nil {
+			log.Error(err, "recording node cleanup as done (non-fatal)")
+		}
+	} else {
+		log.Info("Node drain/reset already attempted on a previous pass — skipping")
 	}
 
 	// Step 3: Remove the WireGuard peer from the VPN server.
@@ -2275,56 +2512,110 @@ func (r *RemoteClusterReconciler) handleDelete(ctx context.Context, cluster *inf
 	// was deleted before finishing provisioning — the worker's own spec.vpnConfig
 	// has an IP but no server credentials. Fall back to reading them fresh from
 	// the sibling control-plane CR so peer removal isn't silently skipped.
-	if cluster.Spec.NodeInfo.NodeType == "worker" && cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" {
-		if clusterParent, err := r.findControlPlane(ctx, cluster); err != nil {
+	if work.Spec.NodeInfo.NodeType == "worker" && !work.Spec.DisableVPN && work.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" {
+		if clusterParent, err := r.findControlPlane(ctx, work); err != nil {
 			log.Error(err, "looking up control-plane for VPN server config (continuing)")
 		} else if clusterParent != nil && clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef.Name != "" {
-			cluster.Spec.VPNConfig.VPNServerPublicIP = clusterParent.Spec.VPNConfig.VPNServerPublicIP
-			cluster.Spec.VPNConfig.VPNServerSSHPort = clusterParent.Spec.VPNConfig.VPNServerSSHPort
-			cluster.Spec.VPNConfig.VPNServerSSHUsername = clusterParent.Spec.VPNConfig.VPNServerSSHUsername
-			cluster.Spec.VPNConfig.VPNSSHCredentialsRef = clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef
+			work.Spec.VPNConfig.VPNServerPublicIP = clusterParent.Spec.VPNConfig.VPNServerPublicIP
+			work.Spec.VPNConfig.VPNServerSSHPort = clusterParent.Spec.VPNConfig.VPNServerSSHPort
+			work.Spec.VPNConfig.VPNServerSSHUsername = clusterParent.Spec.VPNConfig.VPNServerSSHUsername
+			work.Spec.VPNConfig.VPNSSHCredentialsRef = clusterParent.Spec.VPNConfig.VPNSSHCredentialsRef
 		}
 	}
 
-	if cluster.Spec.VPNConfig.IP == "" || cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" {
+	if work.Spec.DisableVPN {
+		log.Info("Skipping VPN peer removal — VPN disabled for this node")
+	} else if work.Spec.VPNConfig.IP == "" || work.Spec.VPNConfig.VPNSSHCredentialsRef.Name == "" {
 		log.Info("Skipping VPN peer removal — no VPN IP or VPN server credentials configured",
-			"vpnIP", cluster.Spec.VPNConfig.IP, "vpnSSHCredentialsRef", cluster.Spec.VPNConfig.VPNSSHCredentialsRef.Name)
-	} else if err := r.removeVPNPeer(ctx, cluster); err != nil {
+			"vpnIP", work.Spec.VPNConfig.IP, "vpnSSHCredentialsRef", work.Spec.VPNConfig.VPNSSHCredentialsRef.Name)
+	} else if err := r.removeVPNPeer(ctx, work); err != nil {
 		log.Error(err, "VPN peer removal incomplete (continuing)")
 	}
 
-	// Step 4: Delete management-cluster resources (Porch repo, Nephio tokens,
-	// PackageVariants).  Errors are logged but do not block finalizer removal.
-	if err := r.deleteClusterResources(ctx, cluster); err != nil {
-		log.Error(err, "deleting management-cluster resources (continuing)")
+	// Step 4: Delete the cluster's management-cluster resources (Porch repo,
+	// Nephio tokens, PackageVariants). They are labelled with the cluster name,
+	// which every node of the cluster shares, so only the control-plane may
+	// delete them — removing one worker must not wipe the cluster's management
+	// resources. Errors are logged but do not block finalizer removal.
+	if cluster.Spec.NodeInfo.NodeType == "control-plane" {
+		if err := r.deleteClusterResources(ctx, cluster); err != nil {
+			log.Error(err, "deleting management-cluster resources (continuing)")
+		}
+	} else {
+		log.Info("Not the control-plane — leaving the cluster's management resources in place")
 	}
 
 	// Step 5: Release the auth and VPN SSH secrets (remove our finalizers) so
-	// that any pending deletions of user-managed secrets can now proceed.
+	// that any pending deletions of user-managed secrets can now proceed —
+	// unless another RemoteCluster still uses them.
 	// This runs after all SSH work is done so both secrets are available throughout.
-	r.removeAuthSecretFinalizer(ctx, cluster)
-	r.removeVPNSecretFinalizer(ctx, cluster)
+	r.removeAuthSecretFinalizer(ctx, work)
+	r.removeVPNSecretFinalizer(ctx, work)
 
 	// Step 6: Remove the RemoteCluster finalizer — lets the API server GC the CR.
-	controllerutil.RemoveFinalizer(cluster, remoteClusterFinalizer)
-	if err := r.Update(ctx, cluster); err != nil {
+	// The object read at the start of this reconcile is minutes old by now: patch a
+	// fresh copy (optimistic lock, retried) so a concurrent write cannot turn into
+	// a conflict that re-runs the whole cleanup.
+	if err := r.removeClusterFinalizer(ctx, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
 	}
 	log.Info("RemoteCluster cleanup complete", "name", cluster.Name)
 	return ctrl.Result{}, nil
 }
 
+// removeClusterFinalizer removes remoteClusterFinalizer with a merge patch on a
+// freshly read object. A vanished object is success.
+func (r *RemoteClusterReconciler) removeClusterFinalizer(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav1.RemoteCluster{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), fresh); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if !controllerutil.ContainsFinalizer(fresh, remoteClusterFinalizer) {
+			return nil
+		}
+		patch := client.MergeFromWithOptions(fresh.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		controllerutil.RemoveFinalizer(fresh, remoteClusterFinalizer)
+		return client.IgnoreNotFound(r.Patch(ctx, fresh, patch))
+	})
+}
+
+// resolveVPNDisabledForDelete decides whether the VPN was in use on the node
+// being deleted. The recorded provisioned mode wins. Without it the node was
+// never provisioned by this controller (or predates the record): the spec
+// applies, except that a worker never reconciled follows its control-plane —
+// on a VPN-less cluster the host was never given WireGuard by this controller
+// and must not have it purged.
+func (r *RemoteClusterReconciler) resolveVPNDisabledForDelete(ctx context.Context, cluster *infrav1.RemoteCluster) bool {
+	if cluster.Annotations[annotationProvisionedVPNMode] != "" {
+		return effectiveVPNDisabled(cluster)
+	}
+	disabled := cluster.Spec.DisableVPN
+	if !disabled && cluster.Spec.NodeInfo.NodeType == "worker" {
+		cp, err := r.findControlPlane(ctx, cluster)
+		if err != nil {
+			logf.FromContext(ctx).Error(err, "looking up control-plane VPN mode for delete (using spec)")
+		} else if cp != nil && effectiveVPNDisabled(cp) {
+			disabled = true
+		}
+	}
+	return disabled
+}
+
 // drainWorkerFromCP gracefully evicts workloads from the worker node by running
 // kubectl drain + kubectl delete node on the control-plane.  Best-effort.
+//
+// The node is identified by its OS hostname (over SSH) or, when the worker is
+// unreachable, by its IP on the control-plane. It is never guessed from
+// spec.clusterName: that name is shared by every node of the cluster, so the
+// drain/delete would hit the wrong node.
 func (r *RemoteClusterReconciler) drainWorkerFromCP(ctx context.Context, cluster *infrav1.RemoteCluster) {
 	log := logf.FromContext(ctx)
 
-	// Determine the Kubernetes node name: try the actual OS hostname via SSH,
-	// fall back to the cluster name which is typically the provisioned hostname.
-	nodeName := cluster.Spec.ClusterName
+	nodeName := ""
 	if nodeClient, err := r.getSSHClient(ctx, cluster); err == nil {
-		if out, err := sshhelper.Run(nodeClient, "hostname"); err == nil {
-			if h := strings.TrimSpace(out); h != "" {
+		if out, err := sshhelper.RunStdoutCtx(ctx, nodeClient, "hostname"); err == nil {
+			if h := strings.ToLower(strings.TrimSpace(out)); validNodeName(h) {
 				nodeName = h
 			}
 		}
@@ -2333,7 +2624,7 @@ func (r *RemoteClusterReconciler) drainWorkerFromCP(ctx context.Context, cluster
 
 	cp, err := r.findControlPlane(ctx, cluster)
 	if err != nil || cp == nil {
-		log.Info("Control-plane not found — skipping kubectl drain", "fallbackNodeName", nodeName)
+		log.Info("Control-plane not found — skipping kubectl drain", "nodeName", nodeName)
 		return
 	}
 	cpClient, err := r.getSSHClient(ctx, cp)
@@ -2343,35 +2634,55 @@ func (r *RemoteClusterReconciler) drainWorkerFromCP(ctx context.Context, cluster
 	}
 	defer cpClient.Conn.Close() //nolint:errcheck
 
+	if nodeName == "" {
+		nodeName = r.nodeNameByIP(ctx, cpClient, cluster)
+	}
+	if nodeName == "" {
+		log.Info("Could not resolve the worker's node name (worker unreachable and its IP is not a known node) — skipping drain")
+		return
+	}
+
 	log.Info("Draining worker from control-plane", "nodeName", nodeName)
 	drainCmd := fmt.Sprintf(
 		"kubectl drain %s --ignore-daemonsets --delete-emptydir-data --force --timeout=120s 2>/dev/null || true",
-		nodeName,
+		shQuote(nodeName),
 	)
 	if out, err := sshhelper.Run(cpClient, drainCmd); err != nil {
 		log.Error(err, "kubectl drain encountered errors", "output", out)
 	}
-	deleteCmd := fmt.Sprintf("kubectl delete node %s --ignore-not-found 2>/dev/null || true", nodeName)
+	deleteCmd := fmt.Sprintf("kubectl delete node %s --ignore-not-found 2>/dev/null || true", shQuote(nodeName))
 	if out, err := sshhelper.Run(cpClient, deleteCmd); err != nil {
 		log.Error(err, "kubectl delete node encountered errors", "output", out)
 	}
 }
 
-// resetNodeViaSSH SSHes to the node and runs kubeadm reset, purges all
-// installed packages (k8s, cri-o, criu, wireguard), removes config files and
-// custom binaries, and brings the WireGuard tunnel down.
-func (r *RemoteClusterReconciler) resetNodeViaSSH(ctx context.Context, cluster *infrav1.RemoteCluster) error {
-	log := logf.FromContext(ctx)
+const wireGuardTeardownScript = `
+# WireGuard teardown runs in the background after a short delay so this SSH
+# session (which routes over the VPN IP) can exit cleanly first.
+# The controller removes the peer from the VPN server in the next step, which
+# permanently severs the tunnel from the server side.
+nohup sudo bash -c '
+  sleep 3
+  systemctl stop    wg-quick@wg0 2>/dev/null || true
+  wg-quick down wg0              2>/dev/null || true
+  systemctl disable wg-quick@wg0 2>/dev/null || true
+  rm -f /etc/wireguard/wg0.conf  2>/dev/null || true
+  apt-get purge -y wireguard wireguard-tools 2>/dev/null || true
+' >/dev/null 2>&1 &
+`
 
-	sshClient, err := r.getSSHClient(ctx, cluster)
-	if err != nil {
-		return fmt.Errorf("SSH connect for node reset: %w", err)
-	}
-	defer sshClient.Conn.Close() //nolint:errcheck
+// controlPlaneInitKillScript stops a kubeadm init that is still running on the
+// host (closing the SSH connection of a cancelled provisioning does not stop the
+// remote process). The "[k]" keeps pkill from matching its own command line (or
+// its sudo parent's).
+const controlPlaneInitKillScript = `
+# A cancelled control-plane provisioning may have left kubeadm init running.
+sudo pkill -f '[k]ubeadm init' 2>/dev/null || true
+sleep 2
+sudo pkill -9 -f '[k]ubeadm init' 2>/dev/null || true
+`
 
-	log.Info("Resetting node via SSH", "host", cluster.Spec.Host)
-
-	const resetScript = `
+const nodeResetScriptBase = `
 # kubeadm reset cleans up apiserver/etcd/kubelet state, CNI config, and iptables rules.
 if command -v kubeadm >/dev/null 2>&1; then
   sudo kubeadm reset --force 2>/dev/null || true
@@ -2440,22 +2751,45 @@ sudo rm -f /var/lib/node-bootstrap-complete 2>/dev/null || true
 
 sudo apt-get autoremove -y 2>/dev/null || true
 
-# WireGuard teardown runs in the background after a short delay so this SSH
-# session (which routes over the VPN IP) can exit cleanly first.
-# The controller removes the peer from the VPN server in the next step, which
-# permanently severs the tunnel from the server side.
-nohup sudo bash -c '
-  sleep 3
-  systemctl stop    wg-quick@wg0 2>/dev/null || true
-  wg-quick down wg0              2>/dev/null || true
-  systemctl disable wg-quick@wg0 2>/dev/null || true
-  rm -f /etc/wireguard/wg0.conf  2>/dev/null || true
-  apt-get purge -y wireguard wireguard-tools 2>/dev/null || true
-' >/dev/null 2>&1 &
-
 echo "node reset complete"
 `
-	out, err := sshhelper.Run(sshClient, resetScript)
+
+// buildNodeResetScript returns the node teardown script. WireGuard teardown is
+// included only when a VPN was in use: nodes provisioned with spec.disableVPN
+// never had WireGuard set up by this controller, so any wireguard on the host
+// is left alone.
+//
+// For a control-plane the script first kills any kubeadm init still running
+// (kubeadm reset itself still runs afterwards).
+func buildNodeResetScript(disableVPN, controlPlane bool) string {
+	const tail = "echo \"node reset complete\"\n"
+	script := nodeResetScriptBase
+	if controlPlane {
+		script = controlPlaneInitKillScript + script
+	}
+	if disableVPN {
+		return script
+	}
+	return strings.Replace(script, tail, wireGuardTeardownScript+"\n"+tail, 1)
+}
+
+// resetNodeViaSSH SSHes to the node and runs kubeadm reset, purges all
+// installed packages (k8s, cri-o, criu, wireguard), removes config files and
+// custom binaries, and brings the WireGuard tunnel down.
+func (r *RemoteClusterReconciler) resetNodeViaSSH(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	log := logf.FromContext(ctx)
+
+	sshClient, err := r.getSSHClient(ctx, cluster)
+	if err != nil {
+		return fmt.Errorf("SSH connect for node reset: %w", err)
+	}
+	defer sshClient.Conn.Close() //nolint:errcheck
+
+	log.Info("Resetting node via SSH", "host", cluster.Spec.Host)
+
+	script := buildNodeResetScript(effectiveVPNDisabled(cluster), cluster.Spec.NodeInfo.NodeType == "control-plane")
+
+	out, err := sshhelper.Run(sshClient, script)
 	if err != nil {
 		log.Error(err, "node reset script reported errors", "output", out)
 		return fmt.Errorf("node reset: %w", err)
@@ -2476,7 +2810,7 @@ func (r *RemoteClusterReconciler) removeVPNPeer(ctx context.Context, cluster *in
 	vpnSecret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      credRef.Name,
-		Namespace: credRef.NameSpace,
+		Namespace: vpnCredRefNamespace(cluster, credRef),
 	}, vpnSecret); err != nil {
 		return fmt.Errorf("fetching VPN server SSH secret %q: %w", credRef.Name, err)
 	}
@@ -2518,7 +2852,7 @@ func (r *RemoteClusterReconciler) removeVPNPeer(ctx context.Context, cluster *in
 	defer vpnClient.Conn.Close() //nolint:errcheck
 
 	// Discover the peer's public key from the live WireGuard state.
-	dumpOut, err := sshhelper.Run(vpnClient, "sudo wg show wg0 dump 2>/dev/null || true")
+	dumpOut, err := sshhelper.RunStdoutCtx(ctx, vpnClient, "sudo wg show wg0 dump 2>/dev/null || true")
 	if err != nil {
 		return fmt.Errorf("reading WireGuard peer table: %w", err)
 	}
@@ -2550,51 +2884,56 @@ func (r *RemoteClusterReconciler) removeVPNPeer(ctx context.Context, cluster *in
 	}
 
 	// Remove from the running WireGuard interface.
-	if out, err := sshhelper.Run(vpnClient, fmt.Sprintf("sudo wg set wg0 peer %s remove", peerKey)); err != nil {
+	if out, err := sshhelper.Run(vpnClient, fmt.Sprintf("sudo wg set wg0 peer %s remove", shQuote(peerKey))); err != nil {
 		log.Error(err, "removing peer from running WireGuard config", "output", out)
 	}
 
 	// Remove the matching [Peer] block from /etc/wireguard/wg0.conf so the
 	// peer is not re-added on VPN server restart.
-	removeFromConf := fmt.Sprintf(`
-WG_CONF=/etc/wireguard/wg0.conf
-if sudo test -f "$WG_CONF"; then
-  sudo awk -v our_key="%s" '
-    /^\[Peer\]/ { in_peer=1; buf=$0"\n"; has_key=0; next }
-    in_peer {
-      buf=buf $0 "\n"
-      if ($0 ~ "PublicKey" && index($0, our_key)) has_key=1
-      if (/^[[:space:]]*$/ || /^\[/) {
-        if (!has_key) printf "%%s", buf
-        if (/^\[/) { in_peer=0; buf=$0"\n"; has_key=0 } else { in_peer=0; buf="" }
-        next
-      }
-      next
-    }
-    { print }
-    END { if (in_peer && !has_key) printf "%%s", buf }
-  ' "$WG_CONF" | sudo tee "${WG_CONF}.tmp" > /dev/null && sudo mv "${WG_CONF}.tmp" "$WG_CONF"
-fi`, peerKey)
-
-	if out, err := sshhelper.Run(vpnClient, removeFromConf); err != nil {
-		log.Error(err, "removing peer block from wg0.conf", "output", out)
+	if err := onprem.RemoveVPNPeerFromServerConf(vpnClient, peerKey); err != nil {
+		log.Error(err, "removing peer block from wg0.conf")
 	}
 
 	log.Info("Removed WireGuard peer from VPN server", "vpnIP", vpnIP)
 	return nil
 }
 
+// deleteClusterResources deletes every management-cluster object labelled with
+// the cluster's name. Only the control-plane's deletion may call it (workers
+// share the label value but not the ownership).
 func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cluster *infrav1.RemoteCluster) error {
 	matchLabels := client.MatchingLabels{remoteClusterLabelKey: cluster.Spec.ClusterName}
-	inNamespace := client.InNamespace(cluster.Namespace)
 
 	for _, gvk := range []schema.GroupVersionKind{
 		{Group: "config.porch.kpt.dev", Version: "v1alpha1", Kind: "RepositoryList"},
 		{Group: "infra.nephio.org", Version: "v1alpha1", Kind: "RepositoryList"},
 		{Group: "infra.nephio.org", Version: "v1alpha1", Kind: "TokenList"},
-		{Group: "config.porch.kpt.dev", Version: "v1alpha1", Kind: "PackageVariantList"},
 	} {
-		if err := r.deleteUnstructuredList(ctx, gvk, matchLabels, inNamespace); err != nil {
+		if err := r.deleteUnstructuredList(ctx, gvk, matchLabels, client.InNamespace(cluster.Namespace)); err != nil {
+			return err
+		}
+	}
+
+	// The Nephio Repository was historically created without the label; remove
+	// that legacy object by name too.
+	legacy := &unstructured.Unstructured{}
+	legacy.SetGroupVersionKind(schema.GroupVersionKind{Group: "infra.nephio.org", Version: "v1alpha1", Kind: "Repository"})
+	legacy.SetName(cluster.Spec.ClusterName)
+	legacy.SetNamespace(cluster.Namespace)
+	if err := r.Delete(ctx, legacy); client.IgnoreNotFound(err) != nil {
+		return err
+	}
+
+	// PackageVariants live in packageVariantNamespace; also sweep the cluster's
+	// own namespace, where earlier versions of the delete path looked.
+	pvNamespaces := []string{packageVariantNamespace}
+	if cluster.Namespace != packageVariantNamespace {
+		pvNamespaces = append(pvNamespaces, cluster.Namespace)
+	}
+	for _, ns := range pvNamespaces {
+		if err := r.deleteUnstructuredList(ctx,
+			schema.GroupVersionKind{Group: "config.porch.kpt.dev", Version: "v1alpha1", Kind: "PackageVariantList"},
+			matchLabels, client.InNamespace(ns)); err != nil {
 			return err
 		}
 	}
@@ -2926,7 +3265,20 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 	return r.upsertPackageVariants(ctx, cluster, variantsOverlays)
 }
 
-// upsertPackageVariants creates or updates each PackageVariant in the default namespace.
+// upsertPackageVariants creates or updates each PackageVariant in
+// packageVariantNamespace.
+//
+// The base names (e.g. harbor-variant) are fixed and packageVariantNamespace is
+// shared by every cluster, so a second cluster would collide with the first. A
+// variant keeps its base name while that name is free or already owned by this
+// cluster (so existing objects are never renamed); when the base name belongs to
+// ANOTHER cluster the variant gets the per-cluster name
+// perClusterPackageVariantName. Another cluster's variant is never overwritten:
+// that would silently repoint it while its label still names the first cluster.
+//
+// Nothing else in the spec collides between clusters: the downstream repository
+// is the cluster's own Porch repository (spec.clusterName) and the upstream
+// package is a shared, read-only source package.
 func (r *RemoteClusterReconciler) upsertPackageVariants(ctx context.Context, cluster *infrav1.RemoteCluster, variants []packageVariantSpec) error {
 	labels := map[string]string{
 		remoteClusterLabelKey: cluster.Spec.ClusterName,
@@ -2968,30 +3320,97 @@ func (r *RemoteClusterReconciler) upsertPackageVariants(ctx context.Context, clu
 			}
 		}
 
+		name, err := r.resolvePackageVariantName(ctx, cluster, v.name)
+		if err != nil {
+			return err
+		}
+
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(packageVariantGVK)
-		obj.SetName(v.name)
-		obj.SetNamespace("default")
+		obj.SetName(name)
+		obj.SetNamespace(packageVariantNamespace)
 		obj.SetLabels(labels)
 		obj.Object["spec"] = spec
 
 		if err := r.Create(ctx, obj); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
-				return fmt.Errorf("creating PackageVariant %q: %w", v.name, err)
+				return fmt.Errorf("creating PackageVariant %q: %w", name, err)
 			}
 
 			existing := &unstructured.Unstructured{}
 			existing.SetGroupVersionKind(packageVariantGVK)
 			if err := r.Get(ctx, client.ObjectKeyFromObject(obj), existing); err != nil {
-				return fmt.Errorf("fetching existing PackageVariant %q: %w", v.name, err)
+				return fmt.Errorf("fetching existing PackageVariant %q: %w", name, err)
 			}
+			// Guards the window between resolvePackageVariantName and Create.
+			if owner, ok := existing.GetLabels()[remoteClusterLabelKey]; ok && owner != cluster.Spec.ClusterName {
+				return packageVariantOwnedError(name, owner, cluster.Spec.ClusterName)
+			}
+			existingLabels := existing.GetLabels()
+			if existingLabels == nil {
+				existingLabels = map[string]string{}
+			}
+			existingLabels[remoteClusterLabelKey] = cluster.Spec.ClusterName
+			existing.SetLabels(existingLabels)
 			existing.Object["spec"] = spec
 			if err := r.Update(ctx, existing); err != nil {
-				return fmt.Errorf("updating PackageVariant %q: %w", v.name, err)
+				return fmt.Errorf("updating PackageVariant %q: %w", name, err)
 			}
 		}
 	}
 	return nil
+}
+
+func packageVariantOwnedError(name, owner, cluster string) error {
+	return fmt.Errorf("PackageVariant %s/%s already belongs to cluster %q; refusing to overwrite it for cluster %q",
+		packageVariantNamespace, name, owner, cluster)
+}
+
+// packageVariantOwner looks up a PackageVariant by name. owner is its cluster
+// label ("" when unlabelled, i.e. created before labelling existed).
+func (r *RemoteClusterReconciler) packageVariantOwner(ctx context.Context, name string) (owner string, exists bool, err error) {
+	pv := &unstructured.Unstructured{}
+	pv.SetGroupVersionKind(packageVariantGVK)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: packageVariantNamespace, Name: name}, pv); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("looking up PackageVariant %q: %w", name, err)
+	}
+	return pv.GetLabels()[remoteClusterLabelKey], true, nil
+}
+
+// resolvePackageVariantName picks the name under which this cluster owns the
+// variant with the given base name: the base name while it is free, unlabelled
+// (legacy) or owned by this cluster; otherwise the per-cluster name. An existing
+// per-cluster object of this cluster is sticky, so the variant never flips
+// between the two names when the other cluster later goes away.
+func (r *RemoteClusterReconciler) resolvePackageVariantName(ctx context.Context, cluster *infrav1.RemoteCluster, base string) (string, error) {
+	me := cluster.Spec.ClusterName
+	baseOwner, baseExists, err := r.packageVariantOwner(ctx, base)
+	if err != nil {
+		return "", err
+	}
+	if baseExists && (baseOwner == "" || baseOwner == me) {
+		return base, nil
+	}
+	scoped := perClusterPackageVariantName(base, me)
+	scopedOwner, scopedExists, err := r.packageVariantOwner(ctx, scoped)
+	if err != nil {
+		return "", err
+	}
+	if scopedExists {
+		if scopedOwner != "" && scopedOwner != me {
+			return "", packageVariantOwnedError(scoped, scopedOwner, me)
+		}
+		return scoped, nil
+	}
+	if !baseExists {
+		return base, nil
+	}
+	logf.FromContext(ctx).Info("PackageVariant base name belongs to another cluster — using a per-cluster name",
+		"base", base, "owner", baseOwner, "name", scoped, "clusterName", me)
+	return scoped, nil
 }
 
 // resolveCnlabRuntimeConfig resolves pkgruntime.Config from the cluster's SoftwareConfig.
@@ -3081,24 +3500,14 @@ func (r *RemoteClusterReconciler) syncCnlabCredentialsToRemote(ctx context.Conte
 	}
 
 	// Push the secret.
-	secretData := fmt.Sprintf("  username: %s\n  token: %s\n",
-		base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Username)),
-		base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Token)),
-	)
 	secretName := "cnlab-runtime-registry"
 	if cr != nil && cr.CredentialsRef.Name != "" {
 		secretName = cr.CredentialsRef.Name
 	}
-	secretYAML := fmt.Sprintf(`apiVersion: v1
-kind: Secret
-metadata:
-  name: %s
-  namespace: %s
-type: Opaque
-data:
-%s`, secretName, ns, secretData)
-
-	secretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", secretYAML)
+	secretCmd := secretApplyCmd(secretName, ns, corev1.SecretTypeOpaque, map[string][]byte{
+		"username": []byte(runtimeCfg.Username),
+		"token":    []byte(runtimeCfg.Token),
+	})
 	if out, sshErr := sshhelper.Run(sshClient, secretCmd); sshErr != nil {
 		return r.recordCnlabSyncFailure(ctx, cluster,
 			fmt.Errorf("applying cnlab-runtime secret on remote cluster: %w\nOutput: %s", sshErr, out))
@@ -3107,15 +3516,15 @@ data:
 
 	// Patch the NodeProvisionNetConfig cnlabRuntime block.
 	cnlabRuntimeYAML := fmt.Sprintf(`    cnlabRuntime:
-      registry: %q
-      repository: %q
-      version: %q
-      orasVersion: %q
+      registry: %s
+      repository: %s
+      version: %s
+      orasVersion: %s
       credentialsRef:
-        name: %q
-        namespace: %q
-`, runtimeCfg.Registry, runtimeCfg.Repository, runtimeCfg.Version, runtimeCfg.OrasVersion,
-		secretName, ns)
+        name: %s
+        namespace: %s
+`, yamlQuote(runtimeCfg.Registry), yamlQuote(runtimeCfg.Repository), yamlQuote(runtimeCfg.Version), yamlQuote(runtimeCfg.OrasVersion),
+		yamlQuote(secretName), yamlQuote(ns))
 
 	netConfigName := cluster.Spec.ClusterName + "-netconfig"
 	patchCmd := fmt.Sprintf(`
@@ -3127,7 +3536,7 @@ metadata:
   namespace: %s
 spec:
   softwareConfig:
-%sNCEOF`, netConfigName, cluster.Namespace, cnlabRuntimeYAML)
+%sNCEOF`, yamlQuote(netConfigName), yamlQuote(cluster.Namespace), cnlabRuntimeYAML)
 
 	if out, sshErr := sshhelper.Run(sshClient, patchCmd); sshErr != nil {
 		return r.recordCnlabSyncFailure(ctx, cluster,
@@ -3135,23 +3544,32 @@ spec:
 	}
 	log.Info("Synced cnlabRuntime config to remote NodeProvisionNetConfig", "netconfig", netConfigName)
 
-	// Reset failure counter and clear the error condition on success.
+	// Reset failure counter and clear the error condition on success. The caller's
+	// object is likely stale after the SSH work, so this goes through mutateStatus
+	// (fresh read + retry on conflict). If it cannot be persisted the credentials
+	// hash is NOT stamped: the next reconcile then repeats the (idempotent) sync
+	// and gets another chance to reset the counter, instead of leaving it
+	// permanently short of the retry limit's reset.
 	if cluster.Status.CnlabSyncRetryCount > 0 {
 		log.Info("cnlab-runtime credential sync recovered after previous failures",
 			"previousAttempts", cluster.Status.CnlabSyncRetryCount)
-		cluster.Status.CnlabSyncRetryCount = 0
-		// Replace any existing CnlabCredentialSyncFailed condition with a success entry.
-		cluster.Status.Conditions = append(cluster.Status.Conditions, metav1.Condition{
-			Type:               cnlabSyncConditionType,
-			Status:             metav1.ConditionTrue,
-			Reason:             "SyncSucceeded",
-			Message:            "cnlab-runtime credentials successfully synced to remote cluster",
-			ObservedGeneration: cluster.Generation,
-			LastTransitionTime: metav1.Now(),
-		})
-		if err := r.Status().Update(ctx, cluster); err != nil {
-			log.Error(err, "updating cnlab sync recovery status (non-fatal)")
+		if err := r.mutateStatus(ctx, cluster, func(fresh *infrav1.RemoteCluster) bool {
+			if fresh.Status.CnlabSyncRetryCount == 0 {
+				return false
+			}
+			fresh.Status.CnlabSyncRetryCount = 0
+			// Replace any existing CnlabCredentialSyncFailed condition with a success entry.
+			upsertCondition(fresh, metav1.Condition{
+				Type:    cnlabSyncConditionType,
+				Status:  metav1.ConditionTrue,
+				Reason:  "SyncSucceeded",
+				Message: "cnlab-runtime credentials successfully synced to remote cluster",
+			})
+			return true
+		}); err != nil {
+			return fmt.Errorf("recording cnlab sync recovery: %w", err)
 		}
+		cluster.Status.CnlabSyncRetryCount = 0
 	}
 
 	if patchErr := r.patchAnnotation(ctx, cluster, annotationCnlabCredentialsHash, newHash); patchErr != nil {
@@ -3175,15 +3593,13 @@ func (r *RemoteClusterReconciler) recordCnlabSyncFailure(ctx context.Context, cl
 		if fresh.Status.CnlabSyncRetryCount >= maxCnlabSyncRetries {
 			msg := fmt.Sprintf("cnlab-runtime credential sync failed after %d attempts (last error: %v) — VPN to remote cluster may be down; patch .status.cnlabSyncRetryCount to 0 to re-enable",
 				fresh.Status.CnlabSyncRetryCount, cause)
-			fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
-				Type:               cnlabSyncConditionType,
-				Status:             metav1.ConditionFalse,
-				Reason:             "SyncRetryLimitReached",
-				Message:            msg,
-				ObservedGeneration: fresh.Generation,
-				LastTransitionTime: metav1.Now(),
+			upsertCondition(fresh, metav1.Condition{
+				Type:    cnlabSyncConditionType,
+				Status:  metav1.ConditionFalse,
+				Reason:  "SyncRetryLimitReached",
+				Message: msg,
 			})
-			fresh.Status.Message = msg
+			fresh.Status.Message = truncateMessage(msg)
 			log.Error(cause, "cnlab-runtime credential sync reached retry limit — no further retries",
 				"attempts", fresh.Status.CnlabSyncRetryCount,
 				"maxRetries", maxCnlabSyncRetries)
@@ -3301,19 +3717,10 @@ func (r *RemoteClusterReconciler) startupSyncCluster(ctx context.Context, cluste
 		if cr != nil && cr.CredentialsRef.Name != "" {
 			secretName = cr.CredentialsRef.Name
 		}
-		secretData := fmt.Sprintf("  username: %s\n  token: %s\n",
-			base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Username)),
-			base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Token)),
-		)
-		secretYAML := fmt.Sprintf(`apiVersion: v1
-kind: Secret
-metadata:
-  name: %s
-  namespace: %s
-type: Opaque
-data:
-%s`, secretName, ns, secretData)
-		secretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", secretYAML)
+		secretCmd := secretApplyCmd(secretName, ns, corev1.SecretTypeOpaque, map[string][]byte{
+			"username": []byte(runtimeCfg.Username),
+			"token":    []byte(runtimeCfg.Token),
+		})
 		if out, sshErr := sshhelper.Run(sshClient, secretCmd); sshErr != nil {
 			return fmt.Errorf("applying credentials secret: %w\nOutput: %s", sshErr, out)
 		}
@@ -3350,10 +3757,54 @@ func netConfigSyncHash(clusterParent *infrav1.RemoteCluster) (string, error) {
 	return fmt.Sprintf("%x", h), nil
 }
 
+// netConfigPatchBody is the JSON merge-patch body pushNetConfigViaSSH sends:
+// desiredNodeProvisionNetConfigFields as JSON. The struct omits vpnRange and
+// vpnServerPublicConfig when the VPN is disabled, but a merge patch leaves an
+// omitted key alone, so on a cluster that is switched from the VPN to no VPN the
+// remote object would keep advertising the old range and VPN server. When the
+// VPN is disabled they are therefore sent as explicit nulls (merge-patch
+// deletions).
+func netConfigPatchBody(cluster *infrav1.RemoteCluster) ([]byte, error) {
+	spec := desiredNodeProvisionNetConfigFields(cluster)
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling NodeProvisionNetConfig patch body: %w", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("marshaling NodeProvisionNetConfig patch body: %w", err)
+	}
+	if spec.DisableVPN {
+		fields["vpnRange"] = nil
+		fields["vpnServerPublicConfig"] = nil
+	}
+	// Same for every optional softwareConfig field: omitempty drops an
+	// empty/unset value from the body, and a merge patch would then leave the
+	// previous value on the remote object — keeping registries insecure, or
+	// images pre-pulled with a stale pull secret, after the user removed them.
+	if sw, ok := fields["softwareConfig"].(map[string]any); ok {
+		if len(spec.SoftwareConfig.InsecureRegistries) == 0 {
+			sw["insecureRegistries"] = nil
+		}
+		if len(spec.SoftwareConfig.ImagePrepulls) == 0 {
+			sw["imagePrepulls"] = nil
+		}
+		if spec.SoftwareConfig.ImagePullSecretRef == nil {
+			sw["imagePullSecretRef"] = nil
+		}
+	}
+	body, err := json.Marshal(map[string]any{"spec": fields})
+	if err != nil {
+		return nil, fmt.Errorf("marshaling NodeProvisionNetConfig patch body: %w", err)
+	}
+	return body, nil
+}
+
 // pushNetConfigViaSSH JSON-merge-patches every field
 // desiredNodeProvisionNetConfigFields computes onto the remote cluster's own
 // NodeProvisionNetConfig, over an already-connected SSH client. A no-op
-// (returns nil without doing anything) when no VPN server is configured yet.
+// (returns nil without doing anything) when the VPN is in use but no VPN server
+// is configured yet.
 //
 // The patch body is produced by encoding/json against the same
 // mlv1alpha1.NodeProvisionNetConfigSpec struct used for the local sync,
@@ -3367,24 +3818,16 @@ func netConfigSyncHash(clusterParent *infrav1.RemoteCluster) (string, error) {
 // desiredNodeProvisionNetConfigFields returns is what gets sent, in full,
 // every time.
 func pushNetConfigViaSSH(sshClient *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
-	if cluster.Spec.VPNConfig.VPNServerPublicIP == "" {
+	if !effectiveVPNDisabled(cluster) && cluster.Spec.VPNConfig.VPNServerPublicIP == "" {
 		return nil
 	}
-	patchBody, err := json.Marshal(map[string]any{
-		"spec": desiredNodeProvisionNetConfigFields(cluster),
-	})
+	patchBody, err := netConfigPatchBody(cluster)
 	if err != nil {
-		return fmt.Errorf("marshaling NodeProvisionNetConfig patch body: %w", err)
+		return err
 	}
-	// Safe to embed patchBody directly inside the outer single quotes: every
-	// value that can appear in it (cluster/secret/image names, versions, IPs,
-	// ports) is restricted to characters that are valid in a Kubernetes name
-	// or a container image reference, none of which include a literal `'`.
-	// This mirrors the existing json.Marshal-into-single-quoted-shell-arg
-	// pattern already used elsewhere in this file (e.g. patchRemoteNetConfigJoinCmd).
 	patchCmd := fmt.Sprintf(
-		"kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge -p '%s'",
-		cluster.Spec.ClusterName, cluster.Namespace, string(patchBody),
+		"kubectl patch nodeprovisionnetconfig %s -n %s --type=merge -p %s",
+		shQuote(cluster.Spec.ClusterName+"-netconfig"), shQuote(cluster.Namespace), shQuote(string(patchBody)),
 	)
 	if out, sshErr := sshhelper.Run(sshClient, patchCmd); sshErr != nil {
 		return fmt.Errorf("patching NodeProvisionNetConfig: %w\nOutput: %s", sshErr, out)
@@ -3411,8 +3854,8 @@ func pushNetConfigViaSSH(sshClient *sshhelper.Client, cluster *infrav1.RemoteClu
 func (r *RemoteClusterReconciler) syncNetConfigToRemote(ctx context.Context, cluster *infrav1.RemoteCluster) error {
 	log := logf.FromContext(ctx)
 
-	if cluster.Spec.VPNConfig.VPNServerPublicIP == "" {
-		// No VPN server configured yet — nothing to push.
+	if !effectiveVPNDisabled(cluster) && cluster.Spec.VPNConfig.VPNServerPublicIP == "" {
+		// VPN in use but no server configured yet — nothing to push.
 		return nil
 	}
 

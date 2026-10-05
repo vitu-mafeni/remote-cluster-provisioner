@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 #
-# reset-node.sh — Tear down a kubeadm cluster node and clean up CRI-O,
+# reset-node-nvidia-nfs-k8s-cni.sh — Tear down a kubeadm cluster node and clean up CRI-O,
 # Cilium/Flannel CNI leftovers, GPU Operator artifacts, and the ad-hoc
 # NFS export, so the box is close to a fresh Ubuntu install again.
 #
 # USAGE:
-#   sudo bash reset-node.sh
+#   sudo bash reset-node-nvidia-nfs-k8s-cni.sh [--force]
 #
 # Review the toggles below before running. This script is intentionally
 # staged with `confirm` prompts on the destructive sections. Run with
-# --force to skip confirmations (for reruns / automation).
+# --force (or FORCE=true) to skip confirmations (for reruns / automation).
+#
+# The risky toggles default to OFF and can be enabled from the environment
+# (sudo needs the variables passed through explicitly), e.g.:
+#   sudo PURGE_K8S_PACKAGES=true bash reset-node-nvidia-nfs-k8s-cni.sh
+#   sudo env PURGE_NVIDIA_DRIVER=true NVIDIA_DRIVER_VERSION=580.126.20 bash reset-node-nvidia-nfs-k8s-cni.sh
+#   sudo REMOVE_KUBE_DIRS=true UNMOUNT_NFS_CLIENTS=true bash reset-node-nvidia-nfs-k8s-cni.sh
 #
 # Recommended: reboot after this script finishes, before reinstalling
 # anything, to clear kernel modules, leftover netns, and mount state.
@@ -18,14 +24,25 @@ set -uo pipefail
 
 # ----------------------------- TOGGLES --------------------------------
 # Leave these OFF unless you specifically want that layer gone too.
-PURGE_NVIDIA_DRIVER=true   # true = unload/remove GPU Operator's driver + kernel modules
-PURGE_NFS_SERVER=true      # true = uninstall nfs-kernel-server entirely (kills ALL exports, not just k8s's)
-PURGE_K8S_PACKAGES=true     # true = apt purge kubelet/kubeadm/kubectl/cri-o/helm binaries
-FORCE=true                 # set true (or pass --force) to skip interactive confirmations
+# All default to false; override via the environment.
+PURGE_NVIDIA_DRIVER="${PURGE_NVIDIA_DRIVER:-true}"   # true = unload/remove the host NVIDIA driver + kernel modules
+PURGE_NFS_SERVER="${PURGE_NFS_SERVER:-true}"         # true = uninstall nfs-kernel-server entirely (kills ALL exports, not just k8s's)
+PURGE_K8S_PACKAGES="${PURGE_K8S_PACKAGES:-true}"     # true = apt purge kubelet/kubeadm/kubectl/cri-o/helm binaries
+REMOVE_KUBE_DIRS="${REMOVE_KUBE_DIRS:-true}"         # true = rm -rf the ~/.kube of root and the invoking (sudo) user, INCLUDING unrelated kubeconfigs/caches
+UNMOUNT_NFS_CLIENTS="${UNMOUNT_NFS_CLIENTS:-true}"   # true = lazily unmount EVERY NFS client mount on this host (listed in the prompt)
+FORCE="${FORCE:-true}"                               # true (or pass --force) skips interactive confirmations
+# Only used in the confirmation prompt text; auto-detected from the loaded
+# kernel module when unset.
+NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-$(cat /sys/module/nvidia/version 2>/dev/null || true)}"
+NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-unknown version}"
 # ------------------------------------------------------------------------
 
-[[ "${1:-}" == "--force" ]] && FORCE=true
-[[ "${2:-}" == "--force" ]] && FORCE=true
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=true ;;
+    *) echo "Unknown argument: $arg (supported: --force)" >&2; exit 2 ;;
+  esac
+done
 
 # stdout would otherwise buffer in blocks when not attached to a real tty
 # (e.g. piped through tee/ssh) — force line buffering so progress shows live
@@ -40,8 +57,46 @@ confirm() {
 }
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Run this as root (sudo bash reset-node.sh)"; exit 1
+  echo "Run this as root (sudo bash reset-node-nvidia-nfs-k8s-cni.sh)"; exit 1
 fi
+
+# ~/.kube may hold kubeconfigs for OTHER clusters plus the kubectl discovery
+# cache, so it is only removed when REMOVE_KUBE_DIRS=true. Under sudo "~" is
+# root's home; the invoking user's ~/.kube is included too.
+KUBE_DIRS=()
+if $REMOVE_KUBE_DIRS; then
+  KUBE_DIRS=("${HOME:-/root}/.kube")
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    sudo_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    [[ -n "$sudo_home" && "$sudo_home/.kube" != "${KUBE_DIRS[0]}" ]] && KUBE_DIRS+=("$sudo_home/.kube")
+  fi
+fi
+
+# NFS client mounts that UNMOUNT_NFS_CLIENTS=true would lazily unmount.
+NFS_CLIENT_MOUNTS=()
+if $UNMOUNT_NFS_CLIENTS && command -v findmnt >/dev/null 2>&1; then
+  mapfile -t NFS_CLIENT_MOUNTS < <(findmnt -rn -t nfs,nfs4 -o TARGET 2>/dev/null)
+fi
+
+echo "This will wipe Kubernetes, CRI-O, CNI and iptables state on $(hostname)."
+echo "  PURGE_K8S_PACKAGES=$PURGE_K8S_PACKAGES PURGE_NVIDIA_DRIVER=$PURGE_NVIDIA_DRIVER PURGE_NFS_SERVER=$PURGE_NFS_SERVER"
+echo "  iptables/ip6tables: all rules are flushed and the INPUT/FORWARD/OUTPUT policies are reset to ACCEPT"
+echo "    (any host firewall such as ufw is lost — re-apply it afterwards)"
+if $REMOVE_KUBE_DIRS; then
+  echo "  REMOVE_KUBE_DIRS=true: will DELETE ${KUBE_DIRS[*]} (all kubeconfigs and caches in them)"
+else
+  echo "  REMOVE_KUBE_DIRS=false: ~/.kube is left untouched (set REMOVE_KUBE_DIRS=true to delete it)"
+fi
+if $UNMOUNT_NFS_CLIENTS; then
+  if ((${#NFS_CLIENT_MOUNTS[@]})); then
+    echo "  UNMOUNT_NFS_CLIENTS=true: will lazily unmount ${#NFS_CLIENT_MOUNTS[@]} NFS mount(s): ${NFS_CLIENT_MOUNTS[*]}"
+  else
+    echo "  UNMOUNT_NFS_CLIENTS=true: no NFS client mounts found"
+  fi
+else
+  echo "  UNMOUNT_NFS_CLIENTS=false: NFS client mounts are left mounted"
+fi
+confirm "Continue?" || { echo "Aborted."; exit 1; }
 
 # =========================================================================
 log "1/9  Draining/removing kubeadm cluster state"
@@ -78,7 +133,7 @@ for m in "${kubelet_mounts[@]}"; do
 done
 
 for d in /etc/kubernetes /var/lib/kubelet /var/lib/etcd /var/lib/dockershim \
-         /etc/systemd/system/kubelet.service.d /usr/lib/systemd/system/kubelet.service.d ~/.kube; do
+         /etc/systemd/system/kubelet.service.d /usr/lib/systemd/system/kubelet.service.d ${KUBE_DIRS[@]+"${KUBE_DIRS[@]}"}; do
   [[ -e "$d" ]] || continue
   echo "   removing: $d"
   rm -rf "$d"
@@ -120,14 +175,19 @@ done
 # =========================================================================
 log "3/9  Flushing iptables / ipvs rules left by kube-proxy & cilium"
 # =========================================================================
-if command -v iptables-save >/dev/null 2>&1; then
-  iptables-save | grep -E 'KUBE-|CILIUM' | iptables-restore --noflush 2>/dev/null
-  for table in filter nat mangle raw; do
-    iptables -t "$table" -F 2>/dev/null
-    iptables -t "$table" -X 2>/dev/null
+# Reset the chain policies to ACCEPT BEFORE flushing: flushing the rules while
+# a policy is DROP (ufw, Docker, hardened images) would cut off remote (SSH)
+# access to this machine mid-run.
+for ipt in iptables ip6tables; do
+  command -v "$ipt" >/dev/null 2>&1 || continue
+  for chain in INPUT FORWARD OUTPUT; do
+    "$ipt" -P "$chain" ACCEPT 2>/dev/null
   done
-  ip6tables -F 2>/dev/null; ip6tables -X 2>/dev/null
-fi
+  for table in filter nat mangle raw; do
+    "$ipt" -t "$table" -F 2>/dev/null
+    "$ipt" -t "$table" -X 2>/dev/null
+  done
+done
 command -v ipvsadm >/dev/null 2>&1 && ipvsadm --clear 2>/dev/null
 
 # =========================================================================
@@ -166,14 +226,14 @@ if $PURGE_K8S_PACKAGES; then
 fi
 
 # =========================================================================
-log "6/9  GPU Operator / NVIDIA toolkit cleanup (host driver kept unless enabled)"
+log "6/9  GPU Operator / NVIDIA toolkit cleanup (host driver kept unless PURGE_NVIDIA_DRIVER=true)"
 # =========================================================================
 # The GPU Operator's toolkit/validator install under /usr/local/nvidia is
-# always safe to remove — it's k8s-managed tooling, not your host driver.
+# k8s-managed tooling, not your host driver; it is removed unconditionally.
 rm -rf /usr/local/nvidia /run/nvidia
 
 if $PURGE_NVIDIA_DRIVER; then
-  if confirm "This will UNLOAD your host NVIDIA driver (580.126.20) and remove kernel modules. Continue?"; then
+  if confirm "This will UNLOAD your host NVIDIA driver (${NVIDIA_DRIVER_VERSION}) and remove kernel modules. Continue?"; then
     systemctl stop nvidia-persistenced 2>/dev/null
     rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>/dev/null || \
       warn "Could not unload modules live (likely still in use) — a reboot will clear them"
@@ -195,10 +255,16 @@ if grep -q '/srv/nfs/k8s' /etc/exports 2>/dev/null; then
 fi
 rm -rf /srv/nfs/k8s
 
-# unmount any client-side NFS mounts left over from testing
-mount | grep 'type nfs' | awk '{print $3}' | while read -r mnt; do
-  umount -l "$mnt" 2>/dev/null && log "   unmounted $mnt"
-done
+# Client-side NFS mounts are only unmounted on explicit opt-in: this host may
+# legitimately mount NFS shares unrelated to Kubernetes (the mounts to be
+# removed were listed in the confirmation prompt above).
+if $UNMOUNT_NFS_CLIENTS; then
+  for mnt in ${NFS_CLIENT_MOUNTS[@]+"${NFS_CLIENT_MOUNTS[@]}"}; do
+    umount -l "$mnt" 2>/dev/null && log "   unmounted $mnt"
+  done
+else
+  log "   Leaving NFS client mounts in place (UNMOUNT_NFS_CLIENTS=false)"
+fi
 
 if $PURGE_NFS_SERVER; then
   if confirm "This removes nfs-kernel-server ENTIRELY, killing /srv/nfs/kubevirt and jupyter-kernels exports too. Continue?"; then
@@ -226,6 +292,8 @@ echo " Toggles used this run:"
 echo "   PURGE_NVIDIA_DRIVER=$PURGE_NVIDIA_DRIVER"
 echo "   PURGE_NFS_SERVER=$PURGE_NFS_SERVER"
 echo "   PURGE_K8S_PACKAGES=$PURGE_K8S_PACKAGES"
+echo "   REMOVE_KUBE_DIRS=$REMOVE_KUBE_DIRS"
+echo "   UNMOUNT_NFS_CLIENTS=$UNMOUNT_NFS_CLIENTS"
 echo
 echo " A reboot is strongly recommended before reinstalling anything,"
 echo " to fully clear kernel modules, leftover mount namespaces, and"

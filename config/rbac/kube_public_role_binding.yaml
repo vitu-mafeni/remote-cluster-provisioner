@@ -3,6 +3,11 @@ kind: RoleBinding
 metadata:
   name: manager-kube-public-rolebinding
   namespace: kube-public
+  annotations:
+    # Read by the `replacements:` in config/default/kustomization.yaml to keep
+    # this RoleBinding and the generated manager-role Role in kube-public despite
+    # the namespace transformer. Do not remove.
+    infra.dcn.ssu.ac.kr/pinned-namespace: kube-public
   labels:
     app.kubernetes.io/name: remote-cluster-provisioner
     app.kubernetes.io/managed-by: kustomize

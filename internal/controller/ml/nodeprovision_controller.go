@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -76,24 +77,36 @@ type NodeProvisionReconciler struct {
 	// CredMgr handles background refresh of AWS STS / MFA-backed sessions.
 	CredMgr *awsprovision.CredentialManager
 	// onPremJobs holds in-flight on-prem provisioning goroutines.
-	// Key: "<namespace>/<name>", Value: <-chan onPremJobResult
+	// Key: "<namespace>/<name>", Value: *onPremJob (result channel, cancel
+	// func and the UID of the NodeProvision it was started for).
 	onPremJobs sync.Map
 	// onPremProgress tracks the current provisioning step for each in-flight goroutine.
 	// Key: "<namespace>/<name>", Value: string
 	onPremProgress sync.Map
 	// mgrCtx is the manager's root context; used as the base for background
-	// goroutines so that they are cancelled on graceful shutdown.
-	// Populated by Start(), which the manager calls before reconciles begin.
-	mgrCtx    context.Context
-	mgrCancel context.CancelFunc
+	// goroutines so that they are cancelled on graceful shutdown. Written by
+	// Start() concurrently with reconciles, so it is only touched through
+	// setManagerContext/baseContext (guarded by mgrMu).
+	mgrMu  sync.RWMutex
+	mgrCtx context.Context
+
+	// nodeResetUIDs holds the UIDs of terminating NodeProvisions whose node
+	// reset already ran (see nodeResetDone).
+	nodeResetUIDs sync.Map
+
+	// Test seams; nil means the real implementation (see nodeprovision_seams.go).
+	awsOverrides  awsAPI
+	gcpOverrides  gcpAPI
+	dialVPNServer func(ctx context.Context, nc *mlv1alpha1.NodeProvisionNetConfig) (vpnServer, error)
+	// nodeReset runs the node-side reset script and reports whether it ran.
+	nodeReset func(ctx context.Context, np *mlv1alpha1.NodeProvision) bool
 }
 
 // Start implements manager.Runnable so the reconciler receives the manager's
 // root context and can propagate it to background goroutines.
 func (r *NodeProvisionReconciler) Start(ctx context.Context) error {
-	r.mgrCtx, r.mgrCancel = context.WithCancel(ctx)
+	r.setManagerContext(ctx)
 	<-ctx.Done()
-	r.mgrCancel()
 	return nil
 }
 
@@ -183,9 +196,10 @@ const (
 	registeringNodeStallTimeout = 15 * time.Minute
 )
 
-// npNodeResetScript is the comprehensive node cleanup script run via SSH during
-// deletion.  It mirrors resetNodeViaSSH in the RemoteCluster controller.
-const npNodeResetScript = `
+// npNodeResetScriptBase is the comprehensive node cleanup script run via SSH
+// during deletion.  It mirrors resetNodeViaSSH in the RemoteCluster controller.
+// See buildNodeResetScript for the WireGuard teardown that is added on top.
+const npNodeResetScriptBase = `
 if command -v kubeadm >/dev/null 2>&1; then
   sudo kubeadm reset --force 2>/dev/null || true
 fi
@@ -232,6 +246,12 @@ sudo rm -f /var/lib/node-bootstrap-complete 2>/dev/null || true
 
 sudo apt-get autoremove -y 2>/dev/null || true
 
+echo "node reset complete"
+`
+
+// npWireGuardTeardownScript brings the node's WireGuard tunnel down and
+// removes it. Only used for nodes that were provisioned with a VPN.
+const npWireGuardTeardownScript = `
 nohup sudo bash -c '
   sleep 3
   systemctl stop    wg-quick@wg0 2>/dev/null || true
@@ -240,9 +260,18 @@ nohup sudo bash -c '
   rm -f /etc/wireguard/wg0.conf  2>/dev/null || true
   apt-get purge -y wireguard wireguard-tools 2>/dev/null || true
 ' >/dev/null 2>&1 &
-
-echo "node reset complete"
 `
+
+// buildNodeResetScript returns the node cleanup script. WireGuard is only torn
+// down when a VPN was in use; nodes provisioned with spec.disableVPN never had
+// it set up by this controller, so any wireguard on the host is left alone.
+func buildNodeResetScript(disableVPN bool) string {
+	if disableVPN {
+		return npNodeResetScriptBase
+	}
+	const tail = "echo \"node reset complete\"\n"
+	return strings.Replace(npNodeResetScriptBase, tail, npWireGuardTeardownScript+"\n"+tail, 1)
+}
 
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisions/status,verbs=get;update;patch
@@ -250,7 +279,10 @@ echo "node reset complete"
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisionnetconfigs,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisionnetconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch;update;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// The namespaced marker below is load-bearing: controller-gen turns it into the
+// Role "manager-role" in kube-public (config/rbac/role.yaml) that
+// config/rbac/kube_public_role_binding.yaml binds. Do not remove it.
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get,namespace=kube-public
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 
@@ -280,6 +312,16 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
+	// The credentials Secret must live in the NodeProvision's own namespace
+	// (see credentialsNamespace). Fail clearly instead of retrying a lookup
+	// that can never be allowed. Phases that never read credentials
+	// (Failed handling, Ready) are exempt so a terminal state is not rewritten.
+	if np.Status.Phase != mlv1alpha1.NodeProvisionPhaseFailed && np.Status.Phase != mlv1alpha1.NodeProvisionPhaseReady {
+		if _, nsErr := credentialsNamespace(np); nsErr != nil {
+			return r.failNodeProvision(ctx, np, nsErr.Error())
+		}
+	}
+
 	// For AWS nodes, keep a controller-owned copy of the credentials secret up-to-date.
 	// The user-supplied secret can be deleted at any time; during teardown the
 	// controller falls back to this owned copy to terminate the EC2 instance.
@@ -292,10 +334,10 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// For AWS nodes, keep a controller-owned copy of the image-pull registry
+	// For AWS and GCP nodes, keep a controller-owned copy of the image-pull registry
 	// credentials so that the pre-pull path can still function if the user
 	// deletes the original secret after provisioning.
-	if np.Spec.Provider == mlv1alpha1.CloudProviderAWS {
+	if np.Spec.Provider == mlv1alpha1.CloudProviderAWS || np.Spec.Provider == mlv1alpha1.CloudProviderGCP {
 		if netConfig, ncErr := r.requireNetConfig(ctx, np); ncErr == nil {
 			if ref := netConfig.Spec.SoftwareConfig.ImagePullSecretRef; ref != nil {
 				regSecret := &corev1.Secret{}
@@ -339,6 +381,15 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			_ = r.Status().Update(ctx, np)
 			return ctrl.Result{RequeueAfter: requeueShort}, nil
 		}
+		// Crash recovery: RunInstances may have succeeded while the InstanceID
+		// never reached status (crash, persist failure). The instance carries
+		// this NodeProvision's UID tag, so look for it on every pass, before
+		// the stall timeout, and adopt it. Only this branch runs from these
+		// phases, so without this the instance would only be found after a
+		// failure reset, by which time its VPN peer has been released.
+		if res, handled, err := r.recoverLaunchedInstance(ctx, np); handled {
+			return res, err
+		}
 		// Safety net: if this phase has been sitting without an InstanceID for
 		// longer than creatingInstanceStallTimeout, the in-flight reconcile that
 		// was supposed to complete it must have exited early (e.g. via a bare
@@ -349,7 +400,7 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			log.Info("NodeProvision stalled without an InstanceID, failing for retry",
 				"phase", np.Status.Phase, "stalledFor", time.Since(np.Status.LastUpdated.Time))
 			return r.failNodeProvision(ctx, np, fmt.Sprintf(
-				"stalled in phase %s for over %s without an EC2 instance being created", np.Status.Phase, creatingInstanceStallTimeout))
+				"stalled in phase %s for over %s without a cloud instance being created", np.Status.Phase, creatingInstanceStallTimeout))
 		}
 		log.Info("Instance creation in progress, requeueing")
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
@@ -372,8 +423,7 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// Skip getSecret when the goroutine is already running — it is only
 		// needed if we need to restart provisioning (no goroutine in map).
 		if np.Spec.Provider == mlv1alpha1.CloudProviderOnPrem {
-			key := np.Namespace + "/" + np.Name
-			if _, running := r.onPremJobs.Load(key); running {
+			if _, running := r.loadOnPremJob(np); running {
 				return r.pollOnPremBootstrap(ctx, np, nil)
 			}
 			secret, err := r.getSecret(ctx, np)
@@ -396,50 +446,7 @@ func (r *NodeProvisionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.syncRuntimeCredentials(ctx, np)
 
 	case mlv1alpha1.NodeProvisionPhaseFailed:
-		// Terminal: retry limit already reached — do not auto-retry.
-		if np.Status.ProvisionRetryCount >= maxProvisionRetries {
-			log.Info("NodeProvision in terminal Failed state — retry limit reached, manual intervention required",
-				"attempts", np.Status.ProvisionRetryCount,
-				"maxRetries", maxProvisionRetries,
-				"message", np.Status.Message)
-			return ctrl.Result{}, nil
-		}
-
-		if err := r.cleanupVPNPeer(ctx, np); err != nil {
-			log.Error(err, "releasing stale VPN peer before retry (continuing)")
-		}
-		// Re-fetch to get the latest ResourceVersion before writing — a parallel
-		// reconcile may have already reset the phase, in which case we do nothing.
-		fresh := &mlv1alpha1.NodeProvision{}
-		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
-			return ctrl.Result{}, err
-		}
-		if fresh.Status.Phase != mlv1alpha1.NodeProvisionPhaseFailed {
-			return ctrl.Result{}, nil
-		}
-		if fresh.Status.ProvisionRetryCount >= maxProvisionRetries {
-			log.Info("NodeProvision reached terminal state on re-fetch — not resetting",
-				"attempts", fresh.Status.ProvisionRetryCount)
-			return ctrl.Result{}, nil
-		}
-		now := metav1.Now()
-		fresh.Status.Phase = ""
-		fresh.Status.VpnIP = ""
-		fresh.Status.IPAddress = ""
-		fresh.Status.Message = fmt.Sprintf("Retrying after failure (attempt %d/%d)", fresh.Status.ProvisionRetryCount, maxProvisionRetries)
-		fresh.Status.LastUpdated = &now
-		log.Info("Retrying NodeProvision after failure — releasing stale VPN IP and resetting phase",
-			"attempt", fresh.Status.ProvisionRetryCount,
-			"maxRetries", maxProvisionRetries)
-		if err := r.Status().Update(ctx, fresh); err != nil {
-			// Another reconcile won the race — its reset will trigger re-provisioning.
-			log.Info("Phase reset race lost, other reconcile already reset", "err", err)
-			return ctrl.Result{}, nil
-		}
-		if err := r.clearPrepullRetryCount(ctx, fresh); err != nil {
-			log.Error(err, "failed to reset pre-pull retry count (continuing)")
-		}
-		return ctrl.Result{RequeueAfter: requeueFailed}, nil
+		return r.reconcileFailed(ctx, np)
 
 	default:
 		return ctrl.Result{}, nil
@@ -457,6 +464,13 @@ func (r *NodeProvisionReconciler) reconcileProvisioning(
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// The VPN mode is decided by the cluster (via its NodeProvisionNetConfig),
+	// so make this node follow it before anything below reads
+	// np.Spec.DisableVPN.
+	if res, done, err := r.reconcileVPNMode(ctx, np); done || err != nil {
+		return res, err
+	}
+
 	switch np.Spec.Provider {
 	case mlv1alpha1.CloudProviderAWS:
 		return r.reconcileAWSProvisioning(ctx, np, secret)
@@ -465,8 +479,7 @@ func (r *NodeProvisionReconciler) reconcileProvisioning(
 		return r.reconcileOnPremProvisioning(ctx, np, secret)
 
 	case mlv1alpha1.CloudProviderGCP:
-		log.Info("GCP provisioning not yet implemented")
-		return ctrl.Result{}, fmt.Errorf("GCP provider not yet implemented")
+		return r.reconcileGCPProvisioning(ctx, np, secret)
 
 	case mlv1alpha1.CloudProviderAzure:
 		log.Info("Azure provisioning not yet implemented")
@@ -544,19 +557,36 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
 
+	// ── Adopt an instance a previous attempt already launched ───────────────
+	// RunInstances may have succeeded without the InstanceID reaching status
+	// (crash / conflict). The instance is tagged with this NodeProvision's UID,
+	// so look it up before allocating a second VPN peer and a second instance.
+	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
+	if err != nil {
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving AWS credentials failed: %v", err))
+	}
+	if res, handled, aErr := r.adoptExistingInstance(ctx, np, creds, netConfig); handled {
+		return res, aErr
+	}
+
 	// ── Connect to VPN server ───────────────────────────────────────────────
-	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseConfiguringVPN, "Configuring VPN client", 15)
-	if sErr := r.Status().Update(ctx, np); sErr != nil {
-		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
-			return ctrl.Result{}, err
+	if !np.Spec.DisableVPN {
+		r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseConfiguringVPN, "Configuring VPN client", 15)
+		if sErr := r.Status().Update(ctx, np); sErr != nil {
+			if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
-	vpnServerClient, err := r.getVPNServerSSHClient(ctx, netConfig)
-	if err != nil {
-		return r.failNodeProvision(ctx, np, fmt.Sprintf("connecting to VPN server: %v", err))
+	var vpnServerClient *ssh.Client
+	if !np.Spec.DisableVPN {
+		vpnServerClient, err = r.getVPNServerSSHClient(ctx, netConfig)
+		if err != nil {
+			return r.failNodeProvision(ctx, np, fmt.Sprintf("connecting to VPN server: %v", err))
+		}
+		defer vpnServerClient.Conn.Close() //nolint:errcheck
 	}
-	defer vpnServerClient.Conn.Close() //nolint:errcheck
 
 	// ── Launch EC2 instance with cloud-init ─────────────────────────────────
 	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseCreatingInstance, "Creating EC2 instance", 25)
@@ -567,59 +597,55 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	}
 	log.Info("Creating EC2 instance")
 
-	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
-	if err != nil {
-		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving AWS credentials: %v", err))
-	}
-
 	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, netConfig.Spec.SoftwareConfig, netConfig.Namespace)
 	if err != nil {
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving cnlab-runtime config: %v", err))
 	}
 
-	result, err := awsprovision.ProvisionEC2Node(ctx, np, creds, vpnServerClient, netConfig, runtimeCfg)
+	result, err := r.aws().ProvisionEC2Node(ctx, np, creds, vpnServerClient, netConfig, runtimeCfg)
+	if errors.Is(err, awsprovision.ErrInstanceAlreadyLaunched) {
+		// RunInstances reports that an instance for this NodeProvision exists
+		// already and the peer registered for this attempt was released. Not a
+		// failure: the next reconcile (phase CreatingInstance/ConfiguringVPN)
+		// finds the instance by its UID tag and adopts it.
+		log.Info("An EC2 instance was already launched for this NodeProvision; requeueing to adopt it")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 	// Always persist VPN allocation immediately — even on EC2 failure — so that
 	// cleanupVPNPeer can find and release the peer on the next retry instead of
 	// leaving it as an orphan and allocating yet another IP.
+	var recordVPN func(*mlv1alpha1.NodeProvisionStatus)
 	if result != nil && result.VpnIP != "" {
 		if uErr := r.updateNetConfigStatus(ctx, netConfig, result.VpnIP, result.PublicKey, name); uErr != nil {
 			log.Error(uErr, "persisting VPN allocation to NetConfig (non-fatal)")
 		}
-		np.Status.VpnIP = result.VpnIP
-		np.Status.IPAddress = result.VpnIP
+		vpnIP := result.VpnIP
+		recordVPN = func(st *mlv1alpha1.NodeProvisionStatus) {
+			st.VpnIP = vpnIP
+			st.IPAddress = vpnIP
+		}
 	}
 	if err != nil {
-		return r.failNodeProvision(ctx, np, fmt.Sprintf("EC2 provisioning failed: %v", err))
+		return r.failNodeProvisionWith(ctx, np, fmt.Sprintf("EC2 provisioning failed: %v", err), recordVPN)
+	}
+	if result.Adopted {
+		// ProvisionEC2Node found an instance launched earlier and allocated no
+		// peer: recover the peer recorded for it (or terminate if none).
+		log.Info("ProvisionEC2Node adopted an existing EC2 instance", "instanceId", result.InstanceID)
+		return r.adoptInstance(ctx, np, result.InstanceID, netConfig)
 	}
 	log.Info("EC2 instance created", "instanceId", result.InstanceID)
 
 	// Persist the InstanceID with a bounded retry against conflicts/transient
 	// API errors. The EC2 instance already exists at this point, so we must
 	// not fall back to failNodeProvision here: that would leave the phase
-	// stuck without an InstanceID, and a subsequent retry (which does not
-	// reset InstanceID) would launch a second, orphaned instance alongside
-	// this one. If every retry attempt fails, the creatingInstanceStallTimeout
-	// safety net in the CreatingInstance/ConfiguringVPN branch will eventually
-	// fail the NodeProvision for manual investigation instead of looping forever.
-	persistErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &mlv1alpha1.NodeProvision{}
-		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
-			return err
-		}
-		now := metav1.Now()
-		fresh.Status.Phase = mlv1alpha1.NodeProvisionPhaseWaitingForInstance
-		fresh.Status.Message = "Waiting for instance to become running"
-		fresh.Status.InstanceID = result.InstanceID
-		fresh.Status.VpnIP = result.VpnIP
-		fresh.Status.IPAddress = result.VpnIP
-		fresh.Status.Progress = 30
-		fresh.Status.LastUpdated = &now
-		if fresh.Status.StartTime == nil {
-			fresh.Status.StartTime = &now
-		}
-		return r.Status().Update(ctx, fresh)
-	})
-	if persistErr != nil {
+	// stuck without an InstanceID. If every retry attempt fails the instance is
+	// still recoverable: it is tagged with this NodeProvision's UID, so the
+	// CreatingInstance/ConfiguringVPN branch (recoverLaunchedInstance) finds and
+	// adopts it on the next reconcile, and deletion terminates it by tag. The
+	// creatingInstanceStallTimeout safety net only fires when no instance
+	// can be found.
+	if persistErr := r.persistInstanceID(ctx, np, result.InstanceID, result.VpnIP); persistErr != nil {
 		log.Error(persistErr, "failed to persist InstanceID after retries — will retry on next reconcile",
 			"instanceId", result.InstanceID)
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
@@ -733,7 +759,7 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 
 	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
 	if err != nil {
-		return false, fmt.Errorf("resolving AWS credentials: %w", err)
+		return false, fmt.Errorf("resolving AWS credentials failed: %w", err)
 	}
 	base := np.DeepCopy()
 	if np.Spec.AWSConfig == nil {
@@ -769,7 +795,7 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 	// ── Network: default VPC / subnet / security group ───────────────────────
 	if needsNetwork {
 		log.Info("Resolving default network config", "region", np.Spec.Region)
-		netCfg, err := awsprovision.ResolveOrCreateNetworkConfig(ctx, np.Spec.Region, creds)
+		netCfg, err := awsprovision.ResolveOrCreateNetworkConfig(ctx, np.Spec.Region, creds, !np.Spec.DisableVPN)
 		if err != nil {
 			return false, fmt.Errorf("resolving AWS network config: %w", err)
 		}
@@ -815,9 +841,13 @@ func (r *NodeProvisionReconciler) reconcileWaitingForInstance(
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	if np.Spec.Provider == mlv1alpha1.CloudProviderGCP {
+		return r.reconcileGCPWaitingForInstance(ctx, np, secret)
+	}
+
 	creds, err := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
 	if err != nil {
-		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving AWS credentials: %v", err))
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving AWS credentials failed: %v", err))
 	}
 
 	privateIP, publicIP, err := awsprovision.WaitForInstanceRunning(ctx, np, creds, np.Status.InstanceID)
@@ -832,6 +862,11 @@ func (r *NodeProvisionReconciler) reconcileWaitingForInstance(
 	now := metav1.Now()
 	np.Status.PrivateIP = privateIP
 	np.Status.PublicIP = publicIP
+	if np.Spec.DisableVPN {
+		// Without a tunnel the kubelet node IP is the instance's private IP
+		// (matches the IP cloud-init reads from instance metadata).
+		np.Status.IPAddress = privateIP
+	}
 	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseBootstrapping
 	np.Status.Message = "Instance running; cloud-init bootstrap in progress"
 	np.Status.Progress = 50
@@ -857,12 +892,30 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	secret *corev1.Secret,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	key := np.Namespace + "/" + np.Name
+	key := onPremKey(np)
 
 	// If a goroutine is already running for this node, just requeue to poll it.
-	if _, running := r.onPremJobs.Load(key); running {
+	if _, running := r.loadOnPremJob(np); running {
 		log.Info("On-prem bootstrap goroutine already running, requeueing")
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
+	}
+
+	// If the node this NodeProvision bootstrapped earlier is already registered
+	// in the cluster (e.g. the controller restarted after the join, or a retry
+	// after a post-join failure), do not run the SSH bootstrap again on a
+	// working node — go straight to the join step.
+	if node := r.findRegisteredNode(ctx, np); node != nil {
+		log.Info("Node already registered in the cluster — skipping bootstrap", "node", node.Name)
+		now := metav1.Now()
+		applyAdoptedNode(np, node)
+		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseJoining
+		np.Status.Message = "Node already registered; resuming at join"
+		np.Status.Progress = 60
+		np.Status.LastUpdated = &now
+		if err := r.Status().Update(ctx, np); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating NodeProvision status: %w", err)
+		}
+		return ctrl.Result{RequeueAfter: requeueJoining}, nil
 	}
 
 	// ── Phase: Validating ────────────────────────────────────────────────────
@@ -899,26 +952,36 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	log.Info("Validation successful")
 
 	// ── Phase: Configuring VPN ───────────────────────────────────────────────
-	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseConfiguringVPN, "Configuring WireGuard VPN", 15)
-	if err := r.Status().Update(ctx, np); err != nil {
-		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
-			sshClient.Conn.Close()
-			return r.failNodeProvision(ctx, np, fmt.Sprintf("re-fetching NodeProvision after status conflict: %v", ferr))
+	if !np.Spec.DisableVPN {
+		r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseConfiguringVPN, "Configuring WireGuard VPN", 15)
+		if err := r.Status().Update(ctx, np); err != nil {
+			if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
+				sshClient.Conn.Close()
+				return r.failNodeProvision(ctx, np, fmt.Sprintf("re-fetching NodeProvision after status conflict: %v", ferr))
+			}
 		}
 	}
 
-	vpnServerClient, err := r.getVPNServerSSHClient(ctx, netConfig)
-	if err != nil {
-		sshClient.Conn.Close()
-		return r.failNodeProvision(ctx, np, fmt.Sprintf("connecting to VPN server: %v", err))
+	var vpnServerClient *ssh.Client
+	if !np.Spec.DisableVPN {
+		vpnServerClient, err = r.getVPNServerSSHClient(ctx, netConfig)
+		if err != nil {
+			sshClient.Conn.Close()
+			return r.failNodeProvision(ctx, np, fmt.Sprintf("connecting to VPN server: %v", err))
+		}
+	}
+	closeVPNClient := func() {
+		if vpnServerClient != nil {
+			vpnServerClient.Conn.Close() //nolint:errcheck
+		}
 	}
 
 	// ── Phase: Bootstrapping — launch background goroutine ───────────────────
 	r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseBootstrapping, "Installing packages and joining cluster (background)", 25)
 	if err := r.Status().Update(ctx, np); err != nil {
 		if ferr := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); ferr != nil {
-			sshClient.Conn.Close()       //nolint:errcheck
-			vpnServerClient.Conn.Close() //nolint:errcheck
+			sshClient.Conn.Close() //nolint:errcheck
+			closeVPNClient()
 			// Unlike the Validating/ConfiguringVPN cases above, ConfiguringVPN was
 			// already successfully persisted at this point (the Status().Update
 			// call a few lines up succeeded). A bare error return here would leave
@@ -935,8 +998,8 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	// within the reconcile context (which has a proper timeout and client).
 	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, netConfig.Spec.SoftwareConfig, netConfig.Namespace)
 	if err != nil {
-		sshClient.Conn.Close()       //nolint:errcheck
-		vpnServerClient.Conn.Close() //nolint:errcheck
+		sshClient.Conn.Close() //nolint:errcheck
+		closeVPNClient()
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving cnlab-runtime config: %v", err))
 	}
 
@@ -945,33 +1008,30 @@ func (r *NodeProvisionReconciler) reconcileOnPremProvisioning(
 	secretCopy := secret.DeepCopy()
 	netConfigCopy := netConfig.DeepCopy()
 
+	baseCtx := r.baseContext()
+	// Bound the goroutine's total runtime. NewInClusterProvisioner runs a
+	// series of blocking SSH commands with no deadline of its own; without
+	// this, a hung remote command (e.g. an apt-get lock wait, a stalled
+	// kubeadm join) would run forever. pollOnPremBootstrap's own no-progress
+	// stall check is the backstop in case a blocking step doesn't actually
+	// observe context cancellation. The cancel func is also kept on the job so
+	// deletion or a stall can stop the bootstrap.
+	goroutineCtx, cancel := context.WithTimeout(baseCtx, onPremBootstrapStallTimeout)
+
 	ch := make(chan onPremJobResult, 1)
-	r.onPremJobs.Store(key, (<-chan onPremJobResult)(ch))
+	r.onPremJobs.Store(key, &onPremJob{uid: np.UID, ch: ch, cancel: cancel})
 
 	reportStep := func(step string) { r.onPremProgress.Store(key, step) }
 
 	go func() {
 		defer sshClient.Conn.Close()
-		defer vpnServerClient.Conn.Close()
-		defer r.onPremProgress.Delete(key)
-		// Do NOT delete from onPremJobs here. The map entry must remain
-		// until pollOnPremBootstrap reads the result from the channel.
-		// Deleting here creates a window where the goroutine has finished
-		// but the result hasn't been consumed yet: the next poll would see
-		// no map entry, no VpnIP in status, and falsely restart provisioning.
-
-		baseCtx := r.mgrCtx
-		if baseCtx == nil {
-			baseCtx = context.Background()
-		}
-		// Bound the goroutine's total runtime. NewInClusterProvisioner runs a
-		// series of blocking SSH commands with no deadline of its own; without
-		// this, a hung remote command (e.g. an apt-get lock wait, a stalled
-		// kubeadm join) would run forever. pollOnPremBootstrap's own no-progress
-		// stall check is the backstop in case a blocking step doesn't actually
-		// observe context cancellation.
-		goroutineCtx, cancel := context.WithTimeout(baseCtx, onPremBootstrapStallTimeout)
+		defer closeVPNClient()
 		defer cancel()
+		// Do NOT delete from onPremJobs here. The map entry must remain
+		// until pollOnPremBootstrap has persisted the result. Deleting here
+		// creates a window where the goroutine has finished but the result
+		// hasn't been consumed yet: the next poll would see no map entry, no
+		// VpnIP in status, and falsely restart provisioning.
 		vpnNodeIP, publicKey, err := remotenodeprovision.NewInClusterProvisioner(
 			goroutineCtx,
 			npCopy,
@@ -997,34 +1057,70 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 	secret *corev1.Secret,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	key := np.Namespace + "/" + np.Name
+	key := onPremKey(np)
 
 	// If VpnIP is already persisted the goroutine completed in a prior reconcile
 	// (or the controller restarted after completion). Advance to Joining.
-	if np.Status.VpnIP != "" {
+	if np.Status.VpnIP != "" || np.Status.IPAddress != "" {
+		if job, ok := r.loadOnPremJob(np); ok {
+			r.dropOnPremJob(np, job)
+		}
 		return r.reconcileJoining(ctx, np)
 	}
 
-	v, running := r.onPremJobs.Load(key)
+	job, running := r.loadOnPremJob(np)
 	if !running {
 		// No goroutine in memory — controller likely restarted mid-provisioning.
 		// Re-enter provisioning to restart the SSH session.
 		// secret is guaranteed non-nil here: the Bootstrapping case only passes
 		// nil when it has already confirmed the goroutine is running.
 		log.Info("No in-flight bootstrap goroutine found (possible restart), restarting provisioning")
+		if secret == nil {
+			var err error
+			if secret, err = r.getSecret(ctx, np); err != nil {
+				return ctrl.Result{}, fmt.Errorf("getting credentials secret: %w", err)
+			}
+		}
 		return r.reconcileOnPremProvisioning(ctx, np, secret)
 	}
 
-	ch := v.(<-chan onPremJobResult)
-	select {
-	case res := <-ch:
-		// Goroutine finished — consume the result and remove the map entry.
-		// The entry is only removed here (not in the goroutine) so there is
-		// no window between "goroutine done" and "result consumed" that would
-		// cause the next poll to falsely treat this as a controller restart.
-		r.onPremJobs.Delete(key)
+	// Collect the result if the goroutine has finished. It is cached on the job
+	// so that a step below failing does not lose it (which would re-run the
+	// whole bootstrap and allocate a second IP/peer).
+	if job.result == nil {
+		select {
+		case res := <-job.ch:
+			job.result = &res
+		default:
+		}
+	}
+
+	if job.result != nil {
+		res := *job.result
 		if res.err != nil {
-			return r.failNodeProvision(ctx, np, fmt.Sprintf("on-prem provisioning failed: %v", res.err))
+			// The provisioner reports the VPN allocation together with the
+			// error once the peer is registered. Record it (NetConfig + status,
+			// in the same write as the Failed transition) so cleanupVPNPeer can
+			// release the peer on retry/delete instead of leaking it.
+			var record func(*mlv1alpha1.NodeProvisionStatus)
+			if res.vpnIP != "" && !np.Spec.DisableVPN {
+				r.recordAllocationInNetConfig(ctx, np, res.vpnIP, res.publicKey)
+				vpnIP := res.vpnIP
+				record = func(st *mlv1alpha1.NodeProvisionStatus) {
+					st.VpnIP = vpnIP
+					st.IPAddress = vpnIP
+				}
+			}
+			// Forget the job only once the failure (with any allocated vpnIP)
+			// is durably persisted. If the write fails the job and its cached
+			// result stay, so the next poll retries the write instead of
+			// restarting provisioning and allocating a second peer.
+			fres, ferr := r.failNodeProvisionWith(ctx, np, fmt.Sprintf("on-prem provisioning failed: %v", res.err), record)
+			if ferr != nil {
+				return fres, ferr
+			}
+			r.dropOnPremJob(np, job)
+			return fres, nil
 		}
 		log.Info("On-prem bootstrap completed", "vpnIP", res.vpnIP)
 
@@ -1032,8 +1128,10 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("getting NetConfig after bootstrap: %w", err)
 		}
-		if err := r.updateNetConfigStatus(ctx, netConfig, res.vpnIP, res.publicKey, np.Name); err != nil {
-			return ctrl.Result{}, fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
+		if !np.Spec.DisableVPN {
+			if err := r.updateNetConfigStatus(ctx, netConfig, res.vpnIP, res.publicKey, np.Name); err != nil {
+				return ctrl.Result{}, fmt.Errorf("updating NodeProvisionNetConfig status: %w", err)
+			}
 		}
 
 		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, np); err != nil {
@@ -1043,44 +1141,72 @@ func (r *NodeProvisionReconciler) pollOnPremBootstrap(
 		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseJoining
 		np.Status.Message = "Node bootstrapped; waiting for cluster registration"
 		np.Status.IPAddress = res.vpnIP
-		np.Status.VpnIP = res.vpnIP
+		if !np.Spec.DisableVPN {
+			np.Status.VpnIP = res.vpnIP
+		}
 		np.Status.Progress = 60
 		np.Status.LastUpdated = &now
 		if err := r.Status().Update(ctx, np); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating NodeProvision status: %w", err)
 		}
+		// Only now is the result persisted; forget the job.
+		r.dropOnPremJob(np, job)
 		log.Info("On-prem node provisioned, waiting for cluster join", "vpnIP", res.vpnIP)
 		return ctrl.Result{RequeueAfter: requeueJoining}, nil
+	}
 
-	default:
-		// Still running — surface the current step in status so the user can see progress.
-		step := "bootstrapping node (packages and cluster join in progress)"
-		if v, ok := r.onPremProgress.Load(key); ok {
-			if s, ok := v.(string); ok {
-				step = s
+	// Still running — surface the current step in status so the user can see progress.
+	step := "bootstrapping node (packages and cluster join in progress)"
+	if v, ok := r.onPremProgress.Load(key); ok {
+		if s, ok := v.(string); ok {
+			step = s
+		}
+	}
+	msg := fmt.Sprintf("Bootstrapping: %s", step)
+	if np.Status.Message != msg {
+		now := metav1.Now()
+		np.Status.Message = msg
+		np.Status.LastUpdated = &now
+		_ = r.Status().Update(ctx, np)
+	} else if np.Status.LastUpdated != nil && time.Since(np.Status.LastUpdated.Time) > onPremBootstrapStallTimeout {
+		// No progress has been reported for over onPremBootstrapStallTimeout.
+		// The background goroutine's context has its own deadline (set when
+		// it was started), but if a blocking SSH call doesn't observe context
+		// cancellation the goroutine (and its SSH connection) may still leak —
+		// the NodeProvision itself must not be left stuck forever regardless.
+		log.Info("On-prem bootstrap stalled with no progress, failing for retry",
+			"step", step, "stalledFor", time.Since(np.Status.LastUpdated.Time))
+		// Cancel the goroutine so it cannot keep mutating the node or the VPN
+		// server, and pick up any VPN allocation it made so the peer is
+		// released on retry.
+		var record func(*mlv1alpha1.NodeProvisionStatus)
+		job.cancel()
+		if job.result == nil {
+			select {
+			case res := <-job.ch:
+				job.result = &res
+			case <-time.After(5 * time.Second):
+			case <-ctx.Done():
 			}
 		}
-		msg := fmt.Sprintf("Bootstrapping: %s", step)
-		if np.Status.Message != msg {
-			now := metav1.Now()
-			np.Status.Message = msg
-			np.Status.LastUpdated = &now
-			_ = r.Status().Update(ctx, np)
-		} else if np.Status.LastUpdated != nil && time.Since(np.Status.LastUpdated.Time) > onPremBootstrapStallTimeout {
-			// No progress has been reported for over onPremBootstrapStallTimeout.
-			// The background goroutine's context has its own deadline (set when
-			// it was started), but if a blocking SSH call doesn't observe context
-			// cancellation the goroutine (and its SSH connection) may still leak —
-			// the NodeProvision itself must not be left stuck forever regardless.
-			log.Info("On-prem bootstrap stalled with no progress, failing for retry",
-				"step", step, "stalledFor", time.Since(np.Status.LastUpdated.Time))
-			r.onPremJobs.Delete(key)
-			return r.failNodeProvision(ctx, np, fmt.Sprintf(
-				"on-prem bootstrap made no progress past step %q for over %s", step, onPremBootstrapStallTimeout))
+		if job.result != nil && job.result.vpnIP != "" && !np.Spec.DisableVPN {
+			r.recordAllocationInNetConfig(ctx, np, job.result.vpnIP, job.result.publicKey)
+			vpnIP := job.result.vpnIP
+			record = func(st *mlv1alpha1.NodeProvisionStatus) {
+				st.VpnIP = vpnIP
+				st.IPAddress = vpnIP
+			}
 		}
-		log.Info("On-prem bootstrap in progress", "step", step)
-		return ctrl.Result{RequeueAfter: requeueShort}, nil
+		fres, ferr := r.failNodeProvisionWith(ctx, np, fmt.Sprintf(
+			"on-prem bootstrap made no progress past step %q for over %s", step, onPremBootstrapStallTimeout), record)
+		if ferr != nil {
+			return fres, ferr // job (and any cached result) kept; retried on the next poll
+		}
+		r.dropOnPremJob(np, job)
+		return fres, nil
 	}
+	log.Info("On-prem bootstrap in progress", "step", step)
+	return ctrl.Result{RequeueAfter: requeueShort}, nil
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1116,7 +1242,11 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 		}
 		log.Info("Node not yet visible in cluster — waiting for kubelet to register",
 			"lookingForIP", targetIP, "elapsed", elapsed)
-		msg := fmt.Sprintf("Waiting for node to register with control plane (VPN IP: %s)", targetIP)
+		addrKind := "VPN IP"
+		if np.Status.VpnIP == "" {
+			addrKind = "node IP"
+		}
+		msg := fmt.Sprintf("Waiting for node to register with control plane (%s: %s)", addrKind, targetIP)
 		// Only bump LastUpdated when something actually changed (phase just
 		// became RegisteringNode, or the target IP changed). Otherwise
 		// LastUpdated would be refreshed on every ~15s poll regardless of
@@ -1135,12 +1265,26 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 			log.Info("Node registration stalled, failing for retry",
 				"lookingForIP", targetIP, "stalledFor", time.Since(np.Status.LastUpdated.Time))
 			return r.failNodeProvision(ctx, np, fmt.Sprintf(
-				"node with VPN IP %s did not register with the control plane within %s", targetIP, registeringNodeStallTimeout))
+				"node with %s %s did not register with the control plane within %s", addrKind, targetIP, registeringNodeStallTimeout))
 		}
 		return ctrl.Result{RequeueAfter: requeueJoining}, nil
 	}
 
 	log.Info("Node registered with control plane", "node", found.Name)
+
+	// Persist the node name BEFORE touching the Node object: once the Node
+	// carries our finalizer and labels, deletion must be able to find it. If
+	// this write fails we return before stamping anything.
+	if np.Status.NodeName != found.Name {
+		now := metav1.Now()
+		np.Status.NodeName = found.Name
+		np.Status.LastUpdated = &now
+		if err := r.Status().Update(ctx, np); err != nil {
+			return ctrl.Result{}, fmt.Errorf("persisting node name before stamping node: %w", err)
+		}
+	}
+
+	gpu := isGPUNode(np)
 
 	// Stamp ownership labels + hardware-type label + management finalizer onto
 	// the Kubernetes Node object in a single patch.  We always do this so that
@@ -1167,13 +1311,13 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 		// Mirrors the labeling done by RemoteCluster reconcileWorker for SSH-joined nodes.
 		found.Labels["infra.dcn.ssu.ac.kr/worker"] = "true"
 		hwType := "cpu"
-		if strings.EqualFold(np.Spec.HardwareType, "gpu") || strings.Contains(np.Spec.NodeLabel, "gpu") {
+		if gpu {
 			hwType = "gpu"
 		}
 		found.Labels["infra.dcn.ssu.ac.kr/hardware-type"] = hwType
 		// GPU-specific labels and taint — mirrors what RemoteCluster does for
 		// GPU workers via kubectl label/taint on the control-plane.
-		if strings.Contains(np.Spec.NodeLabel, "gpu") {
+		if gpu {
 			found.Labels["gpu"] = "on"
 			gpuTaint := corev1.Taint{
 				Key:    "hardware-type",
@@ -1213,7 +1357,7 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	// GPU CDI configuration — mirrors JoinWorkerNode Phase 6 in kubeadm.go.
 	// Creates the CDI directories and enables CDI support in CRI-O so that
 	// the GPU Operator can inject GPU devices via CDI specs.
-	if strings.Contains(np.Spec.NodeLabel, "gpu") {
+	if gpu {
 		if sshClient, err := r.getSSHClientByProvider(ctx, np); err != nil {
 			log.Error(err, "Cannot SSH to GPU node for CDI configuration (continuing)")
 		} else {
@@ -1237,7 +1381,7 @@ func (r *NodeProvisionReconciler) reconcileJoining(ctx context.Context, np *mlv1
 	// background goroutine can pull without blocking further reconciles.
 	// Works for both on-prem (SSH via VPN IP) and AWS (SSH via VPN IP set during provisioning).
 	// Image list comes from NodeProvisionNetConfig.Spec.SoftwareConfig.ImagePrepulls.
-	if strings.Contains(np.Spec.NodeLabel, "gpu") {
+	if gpu {
 		netConfig, err := r.requireNetConfig(ctx, np)
 		if err == nil && len(netConfig.Spec.SoftwareConfig.ImagePrepulls) > 0 {
 			np.Status.Phase = mlv1alpha1.NodeProvisionPhasePrePullingImages
@@ -1279,10 +1423,10 @@ func (r *NodeProvisionReconciler) reconcileNPImagePrepull(
 		return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
 	}
 	// Filter images by node target: GPU nodes pull "gpu" and "all"; CPU nodes pull "all" only.
-	hwType := strings.ToLower(np.Spec.HardwareType)
+	gpu := isGPUNode(np)
 	images := make([]mlv1alpha1.ImagePrepull, 0, len(netConfig.Spec.SoftwareConfig.ImagePrepulls))
 	for _, ip := range netConfig.Spec.SoftwareConfig.ImagePrepulls {
-		if ip.NodeTarget == "gpu" && hwType != "gpu" {
+		if ip.NodeTarget == "gpu" && !gpu {
 			continue
 		}
 		images = append(images, ip)
@@ -1340,6 +1484,22 @@ func (r *NodeProvisionReconciler) reconcileImagePrepullJob(
 			return r.markNodeProvisionReady(ctx, np)
 		}
 		if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+			// The Job came from the informer cache, which can still show a Job
+			// this reconciler already counted and deleted (the annotation write
+			// below wakes the reconciler before the cache catches up). Confirm
+			// against the API server so one failure is counted exactly once.
+			live := &batchv1.Job{}
+			if err := r.apiReader().Get(ctx, types.NamespacedName{Name: jobName, Namespace: np.Namespace}, live); err != nil {
+				if apierrors.IsNotFound(err) {
+					log.V(1).Info("Cached pre-pull Job is already gone; not counting its failure again", "job", jobName)
+					return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+				}
+				return ctrl.Result{}, fmt.Errorf("confirming pre-pull job failure: %w", err)
+			}
+			if live.UID != job.UID || !jobFailed(live) {
+				log.V(1).Info("Cached pre-pull Job is stale; waiting for the current one", "job", jobName)
+				return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+			}
 			attempts := prepullRetryCount(np) + 1
 			_ = r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))
 			if attempts >= maxPrepullRetries {
@@ -1359,6 +1519,16 @@ func (r *NodeProvisionReconciler) reconcileImagePrepullJob(
 
 	log.V(1).Info("Image pre-pull job running", "job", jobName)
 	return ctrl.Result{RequeueAfter: npPrepullPollInterval}, nil
+}
+
+// jobFailed reports whether the Job carries a true Failed condition.
+func jobFailed(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // prepullRetryCount reads the image pre-pull retry count persisted on the
@@ -1523,51 +1693,68 @@ func (r *NodeProvisionReconciler) createImagePrepullJob(
 }
 
 // buildPrepullScript returns a bash script that pulls each image via crictl.
+// Image references come from a user-editable CR and the registry credentials
+// from a Secret, so nothing is interpolated unquoted: images are single-quoted
+// shell words and the credentials are passed as one argv element.
 func buildPrepullScript(images []mlv1alpha1.ImagePrepull) string {
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
 	b.WriteString("CRICTL=/usr/local/bin/crictl\n")
 	b.WriteString("ENDPOINT=unix:///var/run/crio/crio.sock\n")
+	b.WriteString("CREDS=()\n")
 	b.WriteString("if [ -n \"${REGISTRY_USER:-}\" ] && [ -n \"${REGISTRY_PASS:-}\" ]; then\n")
-	b.WriteString("  CREDS=\"--creds ${REGISTRY_USER}:${REGISTRY_PASS}\"\n")
-	b.WriteString("else\n")
-	b.WriteString("  CREDS=\"\"\n")
+	b.WriteString("  CREDS=(--creds \"${REGISTRY_USER}:${REGISTRY_PASS}\")\n")
 	b.WriteString("fi\n")
 	for _, ip := range images {
 		img := strings.TrimSpace(ip.Image)
 		if img == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "echo \"[prepull] Pulling %s...\"\n", img)
-		fmt.Fprintf(&b, "$CRICTL --runtime-endpoint \"$ENDPOINT\" pull $CREDS %q\n", img)
+		q := shellQuote(img)
+		fmt.Fprintf(&b, "printf '[prepull] Pulling %%s...\\n' %s\n", q)
+		fmt.Fprintf(&b, "\"$CRICTL\" --runtime-endpoint \"$ENDPOINT\" pull ${CREDS[@]+\"${CREDS[@]}\"} %s\n", q)
 	}
 	b.WriteString("echo \"[prepull] Done.\"\n")
 	return b.String()
 }
 
+// nodeSSHHost returns the address the controller should use to reach the node
+// after provisioning: the VPN IP when a tunnel is in use, otherwise the node's
+// own recorded address (status IP, then spec IP, then hostname). It follows
+// what was provisioned, not the mutable spec.disableVPN: a VPN-less node's
+// status IP (its real address, e.g. an AWS private IP that has no spec
+// counterpart) stays the right address if the flag is edited afterwards.
+func nodeSSHHost(np *mlv1alpha1.NodeProvision) string {
+	if np.Status.VpnIP != "" {
+		return np.Status.VpnIP
+	}
+	if np.Status.IPAddress != "" {
+		return np.Status.IPAddress
+	}
+	if np.Spec.IPAddress != "" {
+		return np.Spec.IPAddress
+	}
+	return np.Spec.Hostname
+}
+
 // getSSHClientByProvider opens an SSH connection to the node using the correct
 // credentials for each provider: on-prem uses the user credential secret;
-// AWS uses the dedicated SSH key secret (<name>-ssh-key) created during EC2
-// provisioning.  Both connect via the VPN IP that is reachable in-cluster.
+// AWS and GCP use the dedicated SSH key secret (<name>-ssh-key) created during
+// instance provisioning.  All connect via the VPN IP that is reachable
+// in-cluster (or the node's own address when the VPN is disabled).
 func (r *NodeProvisionReconciler) getSSHClientByProvider(ctx context.Context, np *mlv1alpha1.NodeProvision) (*ssh.Client, error) {
-	host := np.Status.VpnIP
-	if host == "" {
-		host = np.Spec.IPAddress
-		if host == "" {
-			host = np.Spec.Hostname
-		}
-	}
+	host := nodeSSHHost(np)
 	user := np.Spec.SSHUsernameOverride
 	if user == "" {
 		user = "ubuntu"
 	}
-	if np.Spec.Provider == mlv1alpha1.CloudProviderAWS {
+	if np.Spec.Provider == mlv1alpha1.CloudProviderAWS || np.Spec.Provider == mlv1alpha1.CloudProviderGCP {
 		sshKeySecret := &corev1.Secret{}
 		if err := r.Get(ctx, types.NamespacedName{
 			Name:      np.Name + "-ssh-key",
 			Namespace: np.Namespace,
 		}, sshKeySecret); err != nil {
-			return nil, fmt.Errorf("fetching AWS SSH key secret %q: %w", np.Name+"-ssh-key", err)
+			return nil, fmt.Errorf("fetching %s SSH key secret %q: %w", np.Spec.Provider, np.Name+"-ssh-key", err)
 		}
 		credBytes, err := resolveSecretKey(sshKeySecret, "")
 		if err != nil {
@@ -1582,11 +1769,8 @@ func (r *NodeProvisionReconciler) getSSHClientByProvider(ctx context.Context, np
 // (np.Status.VpnIP), which is reachable from the controller once the node has
 // joined the cluster.  Falls back to the spec IP/hostname if VPN IP is empty.
 func (r *NodeProvisionReconciler) getSSHClientPostJoin(ctx context.Context, np *mlv1alpha1.NodeProvision) (*ssh.Client, error) {
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      np.Spec.CredentialsRef.Name,
-		Namespace: np.Namespace,
-	}, secret); err != nil {
+	secret, err := r.getSecret(ctx, np)
+	if err != nil {
 		return nil, fmt.Errorf("fetching SSH credential secret %q: %w", np.Spec.CredentialsRef.Name, err)
 	}
 
@@ -1595,13 +1779,7 @@ func (r *NodeProvisionReconciler) getSSHClientPostJoin(ctx context.Context, np *
 		return nil, err
 	}
 
-	host := np.Status.VpnIP
-	if host == "" {
-		host = np.Spec.IPAddress
-	}
-	if host == "" {
-		host = np.Spec.Hostname
-	}
+	host := nodeSSHHost(np)
 	user := np.Spec.SSHUsernameOverride
 	if user == "" {
 		user = "ubuntu"
@@ -1627,50 +1805,41 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 
 	log.Info("Deprovisioning node")
 
-	np.Status.Phase = mlv1alpha1.NodeProvisionPhaseDeleting
-	now := metav1.Now()
-	np.Status.LastUpdated = &now
-	_ = r.Status().Update(ctx, np)
+	if np.Status.Phase != mlv1alpha1.NodeProvisionPhaseDeleting {
+		np.Status.Phase = mlv1alpha1.NodeProvisionPhaseDeleting
+		now := metav1.Now()
+		np.Status.LastUpdated = &now
+		_ = r.Status().Update(ctx, np)
+	}
+
+	// ── Stop any in-flight on-prem bootstrap ─────────────────────────────────
+	// The goroutine keeps SSHing into the node and may register a VPN peer; it
+	// must be cancelled, and what it allocated recorded, before cleanup runs.
+	// Otherwise it runs on after deletion and a recreated CR of the same name
+	// could pick up its result.
+	if np.Spec.Provider == mlv1alpha1.CloudProviderOnPrem {
+		pending, err := r.stopOnPremJob(ctx, np, 5*time.Second, deletionElapsed(np) < onPremJobStopWait)
+		if err != nil {
+			log.Error(err, "recording allocation of cancelled bootstrap — will retry")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if pending {
+			log.Info("Waiting for cancelled on-prem bootstrap to stop")
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+	}
 
 	// ── Remove Kubernetes node ──────────────────────────────────────────────
-	nodeDeleted := false
-	if np.Status.NodeName != "" {
-		node := &corev1.Node{}
-		if err := r.Get(ctx, types.NamespacedName{Name: np.Status.NodeName}, node); err == nil {
-			// Strip our management finalizer first.  This is necessary because if
-			// the node already has a DeletionTimestamp (e.g. from a previous
-			// controller run that called Delete before crashing, or from a manual
-			// `kubectl delete node`), removing the last finalizer causes the API
-			// server to GC the node immediately — so the subsequent Delete call
-			// would hit "not found".  We handle that below with IgnoreNotFound.
-			if controllerutil.ContainsFinalizer(node, nodeProvisionNodeFinalizer) {
-				patch := client.MergeFrom(node.DeepCopy())
-				controllerutil.RemoveFinalizer(node, nodeProvisionNodeFinalizer)
-				if err := r.Patch(ctx, node, patch); err != nil {
-					log.Error(err, "removing node finalizer (continuing)", "node", np.Status.NodeName)
-				} else {
-					log.Info("Removed management finalizer from node", "node", np.Status.NodeName)
-				}
-			}
-			// If DeletionTimestamp is already set the API server will delete the
-			// node as soon as all finalizers are gone (handled above).  Calling
-			// Delete again is harmless but produces a confusing "not found" log
-			// line, so skip it in that case.
-			if node.DeletionTimestamp.IsZero() {
-				if err := r.Delete(ctx, node); client.IgnoreNotFound(err) != nil {
-					log.Error(err, "deleting node from cluster", "node", np.Status.NodeName)
-				} else if err == nil {
-					log.Info("Removed node from cluster", "node", np.Status.NodeName)
-				}
-			} else {
-				log.Info("Node already terminating — finalizer removal will complete deletion", "node", np.Status.NodeName)
-			}
-		} else if apierrors.IsNotFound(err) {
-			nodeDeleted = true
-			log.Info("Node confirmed deleted from cluster", "node", np.Status.NodeName)
-		}
-	} else {
-		nodeDeleted = true
+	// status.nodeName may be empty if the node registered but the name was never
+	// persisted; fall back to the Node stamped with this CR's UID.
+	nodeName, err := r.resolveNodeName(ctx, np)
+	if err != nil {
+		log.Error(err, "resolving node to remove — will retry")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	nodeDeleted := true
+	if nodeName != "" {
+		nodeDeleted = r.removeK8sNode(ctx, np, nodeName)
 	}
 
 	// ── Wait for node deletion confirmation before cleaning up AWS resources ──
@@ -1685,53 +1854,12 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 		// SSH reset is skipped for AWS: the EC2 key pair (.pem) is not reliably
 		// available post-provisioning. Terminating the instance is sufficient cleanup.
 		if np.Status.InstanceID != "" {
-			// Prefer the user-supplied secret; fall back to the controller-owned copy
-			// in case the user deleted their secret before deleting the NodeProvision.
-			secret, err := r.getSecret(ctx, np)
-			if err != nil {
-				if !apierrors.IsNotFound(err) {
-					log.Error(err, "getting credentials for EC2 termination, trying controller copy")
-				} else {
-					log.Info("User credentials secret not found, falling back to controller copy",
-						"userSecret", np.Spec.CredentialsRef.Name)
-				}
-				secret, err = r.getControllerCredsSecret(ctx, np)
-				if err != nil {
-					// Neither the user secret nor the controller copy is available.
-					// Return an error so the controller requeues — do not delete
-					// secrets or remove the finalizer until the instance is gone.
-					return ctrl.Result{}, fmt.Errorf("no credentials to terminate EC2 instance %s; both user and controller-copy secrets unavailable: %w",
-						np.Status.InstanceID, err)
-				}
-			}
-			terminateCreds, credsErr := r.resolveAWSCreds(ctx, np.Spec.Region, secret)
-			if credsErr != nil {
-				log.Error(credsErr, "resolving AWS credentials for termination — using static fallback")
-				terminateCreds = awsprovision.ResolveAWSCredentials(secret)
-			}
-			if err := awsprovision.TerminateInstance(ctx, np, terminateCreds, np.Status.InstanceID); err != nil {
-				if awsprovision.IsAWSAuthFailure(err) {
-					// Cached STS session is likely expired. Evict the CredMgr cache so
-					// the next reconcile forces a fresh credential resolution, then
-					// retry once now with static-only credentials (session token stripped)
-					// in case the IAM key itself is still valid.
-					if r.CredMgr != nil {
-						r.CredMgr.Evict(secret.Namespace, secret.Name)
-					}
-					staticCreds := awsprovision.StaticCredsNoSession(awsprovision.ResolveAWSCredentials(secret))
-					if retryErr := awsprovision.TerminateInstance(ctx, np, staticCreds, np.Status.InstanceID); retryErr != nil {
-						log.Error(retryErr, "EC2 termination failed after static-credential retry — requeuing with delay",
-							"instanceId", np.Status.InstanceID)
-						return ctrl.Result{RequeueAfter: 30 * time.Second},
-							fmt.Errorf("terminating EC2 instance %s: %w", np.Status.InstanceID, retryErr)
-					}
-					// static-credential retry succeeded — fall through to cleanup
-				} else {
-					// Return the error so the controller requeues. Secrets and the
-					// finalizer must not be removed until the instance is confirmed
-					// gone — otherwise the instance is orphaned with no retry path.
-					return ctrl.Result{}, fmt.Errorf("terminating EC2 instance %s: %w", np.Status.InstanceID, err)
-				}
+			// Secrets and the finalizer must not be removed until the instance is
+			// confirmed gone — otherwise it is orphaned with no retry path. On
+			// failure requeue with a delay (not a tight loop).
+			if err := r.terminateAWSInstance(ctx, np, np.Status.InstanceID); err != nil {
+				log.Error(err, "EC2 termination failed — requeuing with delay", "instanceId", np.Status.InstanceID)
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 			}
 			log.Info("EC2 instance terminated", "instanceId", np.Status.InstanceID)
 			// Clear InstanceID so any duplicate or requeued reconcile skips
@@ -1740,14 +1868,33 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 			if statusErr := r.Status().Update(ctx, np); statusErr != nil {
 				log.Error(statusErr, "clearing InstanceID from status after termination (non-fatal)")
 			}
+		} else if r.terminateOrphanedInstance(ctx, np) {
+			// No InstanceID was ever persisted, but an instance may have been
+			// launched anyway (crash between RunInstances and the status write).
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+	case mlv1alpha1.CloudProviderGCP:
+		// Deletes the instance and the node's firewall rules; the SSH key lives in
+		// the instance metadata and the <name>-ssh-key Secret is removed below.
+		if res, wait := r.cleanupGCPOnDelete(ctx, np); wait {
+			return res, nil
 		}
 	case mlv1alpha1.CloudProviderOnPrem:
 		r.cleanupOnPremNode(ctx, np)
 	}
 
 	// ── Remove VPN peer ─────────────────────────────────────────────────────
+	// A failure here would leak the peer and its IP once the finalizer is gone,
+	// so keep the finalizer and retry. An unreachable VPN server must not block
+	// deletion forever though: give up loudly after deletionGiveUpAfter.
 	if err := r.cleanupVPNPeer(ctx, np); err != nil {
-		log.Error(err, "cleaning up VPN peer (continuing)")
+		if deletionElapsed(np) < deletionGiveUpAfter {
+			log.Error(err, "cleaning up VPN peer failed — keeping finalizer and retrying",
+				"giveUpIn", (deletionGiveUpAfter - deletionElapsed(np)).Round(time.Second).String())
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		log.Error(err, "GIVING UP on VPN peer cleanup after the deletion grace period; the WireGuard peer and its IP may be leaked and need manual removal",
+			"vpnIP", np.Status.VpnIP, "gracePeriod", deletionGiveUpAfter.String())
 	}
 
 	// ── Clean up node-related secrets (after cloud resources are gone) ────────
@@ -1765,6 +1912,7 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 	if err := r.Update(ctx, np); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
 	}
+	r.nodeResetUIDs.Delete(np.UID)
 	log.Info("Cleanup complete")
 	return ctrl.Result{}, nil
 }
@@ -1783,15 +1931,29 @@ func (r *NodeProvisionReconciler) handleDelete(ctx context.Context, np *mlv1alph
 func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1alpha1.NodeProvision) error {
 	log := logf.FromContext(ctx)
 
-	netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
-	if err := r.List(ctx, netConfigList, client.InNamespace(np.Namespace)); err != nil {
-		return fmt.Errorf("listing NodeProvisionNetConfigs for VPN cleanup: %w", err)
-	}
-	if len(netConfigList.Items) == 0 {
-		log.Info("No NodeProvisionNetConfig found — skipping VPN peer cleanup")
+	// A node provisioned without the VPN never allocates a VPN IP or peer, and
+	// its Status.IPAddress is its real address — not a VPN IP to look up on the
+	// server (which a VPN-less cluster does not even have). Gate on what was
+	// provisioned, not on the mutable spec flag alone: with no recorded VPN IP,
+	// either the flag or a recorded node address means "no VPN", so a VPN-less
+	// node whose spec.disableVPN was edited back to false still never contacts
+	// a VPN server, while a peer that was actually allocated (VpnIP recorded)
+	// is still released whatever the flag says.
+	if provisionedWithoutVPN(np) {
+		log.Info("VPN disabled for this node — skipping VPN peer cleanup")
 		return nil
 	}
-	netConfig := &netConfigList.Items[0]
+
+	netConfig, err := r.netConfigFor(ctx, np)
+	if errors.Is(err, errNetConfigNotFound) {
+		log.Info("No matching NodeProvisionNetConfig found — skipping VPN peer cleanup", "reason", err.Error())
+		return nil
+	}
+	if err != nil {
+		// Ambiguous (or a failed list): never release a peer from a guessed
+		// config. Surfaces through the deletion retry until spec.clusterName is set.
+		return fmt.Errorf("selecting NodeProvisionNetConfig for VPN cleanup: %w", err)
+	}
 
 	// ── 1. Resolve public key and VPN IP from CR status ─────────────────────
 	// Do this BEFORE connecting to the VPN server so we still have the peer key
@@ -1815,16 +1977,25 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 		vpnIP = np.Status.IPAddress
 	}
 
+	// Nothing was ever allocated for this node (no recorded peer, no VPN IP):
+	// there is nothing to release, so do not depend on the VPN server being
+	// reachable — e.g. when the failure being retried is "cannot reach the
+	// VPN server" itself.
+	if peerPublicKey == "" && vpnIP == "" {
+		log.Info("No VPN allocation recorded for this node — nothing to release")
+		return nil
+	}
+
 	// ── 2. Connect to VPN server ─────────────────────────────────────────────
-	vpnClient, err := r.getVPNServerSSHClient(ctx, netConfig)
+	vpn, err := r.dialVPN(ctx, netConfig)
 	if err != nil {
 		return fmt.Errorf("connecting to VPN server for peer removal: %w", err)
 	}
-	defer vpnClient.Conn.Close() //nolint:errcheck
+	defer vpn.Close() //nolint:errcheck
 
 	// ── 3. Fallback: look up public key from live server when CR has no record ─
 	if peerPublicKey == "" && vpnIP != "" {
-		serverPeers, lookupErr := remotenodeprovision.ReadVPNServerPeers(vpnClient)
+		serverPeers, lookupErr := vpn.ReadPeers()
 		if lookupErr != nil {
 			log.Error(lookupErr, "reading live VPN peer list for fallback lookup")
 		} else if key, ok := serverPeers[vpnIP]; ok {
@@ -1834,6 +2005,14 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 		}
 	}
 
+	if key, ok := usablePeerKey(peerPublicKey); !ok {
+		log.Error(fmt.Errorf("invalid WireGuard public key format"),
+			"refusing to use malformed peer key for removal; releasing the IP only", "vpnIP", vpnIP)
+		peerPublicKey = ""
+	} else {
+		peerPublicKey = key
+	}
+
 	if peerPublicKey == "" {
 		if vpnIP != "" {
 			log.Info("No peer found in CR status or on VPN server for this node — nothing to remove",
@@ -1841,36 +2020,9 @@ func (r *NodeProvisionReconciler) cleanupVPNPeer(ctx context.Context, np *mlv1al
 		}
 		// Still fall through to release the IP from the NetConfig status below.
 	} else {
-		// ── 4. Remove from running WireGuard config ───────────────────────────
-		removeCmd := fmt.Sprintf("sudo wg set wg0 peer %s remove", peerPublicKey)
-		if _, err := ssh.Run(vpnClient, removeCmd); err != nil {
-			log.Error(err, "removing WireGuard peer from running config", "publicKey", peerPublicKey)
-		}
-
-		// ── 5. Remove block from persisted wg0.conf ──────────────────────────
-		cleanCmd := fmt.Sprintf(`
-sudo awk -v our_key="%s" '
-  /^\[Peer\]/ {
-    in_peer=1; buf=$0"\n"; has_key=0; next
-  }
-  in_peer {
-    buf=buf $0 "\n"
-    if ($0 ~ "PublicKey" && index($0, our_key)) has_key=1
-    if (/^[[:space:]]*$/ || /^\[/) {
-      if (!has_key) printf "%%s", buf
-      if (/^\[/) { in_peer=0; buf=$0"\n"; has_key=0 } else { in_peer=0; buf="" }
-      next
-    }
-    next
-  }
-  { print }
-  END { if (in_peer && !has_key) printf "%%s", buf }
-' /etc/wireguard/wg0.conf 2>/dev/null | sudo tee /etc/wireguard/wg0.conf.tmp > /dev/null &&
-sudo mv /etc/wireguard/wg0.conf.tmp /etc/wireguard/wg0.conf 2>/dev/null || true`,
-			peerPublicKey,
-		)
-		if _, err := ssh.Run(vpnClient, cleanCmd); err != nil {
-			log.Error(err, "removing peer block from wg0.conf on VPN server")
+		// ── 4./5. Remove from the running config and from wg0.conf ────────────
+		if err := vpn.RemovePeer(peerPublicKey); err != nil {
+			log.Error(err, "removing WireGuard peer from the VPN server", "publicKey", peerPublicKey)
 		}
 
 		log.Info("Removed VPN peer from server", "publicKey", peerPublicKey, "vpnIP", vpnIP)
@@ -1916,10 +2068,68 @@ sudo mv /etc/wireguard/wg0.conf.tmp /etc/wireguard/wg0.conf 2>/dev/null || true`
 	return fmt.Errorf("releasing NetConfig IP: too many conflicts")
 }
 
-// cleanupOnPremNode SSHes into the physical node (best-effort) and reverses
-// the provisioning: resets kubeadm, stops WireGuard, and removes its config.
-// Failures are logged but never block the finalizer removal.
+// usablePeerKey returns k when it may be used to remove a peer. The key ends
+// up in shell commands on the VPN server, so anything that is not a well-formed
+// WireGuard public key (from a tampered NetConfig status or a bad server
+// line) is rejected and must never be interpolated. An empty key is fine: it
+// simply means there is no peer to remove.
+func usablePeerKey(k string) (string, bool) {
+	if k == "" {
+		return "", true
+	}
+	if !validWireGuardKey(k) {
+		return "", false
+	}
+	return k, true
+}
+
+// wireGuardProvisioned reports whether this controller set WireGuard up on the
+// node. It follows what was provisioned (see provisionedWithoutVPN), not the
+// mutable spec: VPN-less nodes — including ones whose spec.disableVPN was
+// edited back to false — leave any host-owned WireGuard alone, while a node
+// whose VPN mode was flipped to true after provisioning is still torn down
+// correctly.
+func wireGuardProvisioned(np *mlv1alpha1.NodeProvision) bool {
+	return !provisionedWithoutVPN(np)
+}
+
+// provisionedWithoutVPN reports whether np has no VPN allocation to clean up.
+// A node with a recorded VPN IP always had one. Otherwise it is VPN-less when
+// spec.disableVPN says so, or when a node address was recorded without a VPN
+// IP: every VPN path records the two together (status.vpnIP == status.ipAddress)
+// while a VPN-less node records only its real address, so that combination
+// survives a later edit of spec.disableVPN back to false.
+func provisionedWithoutVPN(np *mlv1alpha1.NodeProvision) bool {
+	if np.Status.VpnIP != "" {
+		return false
+	}
+	return np.Spec.DisableVPN || np.Status.IPAddress != ""
+}
+
+// cleanupOnPremNode resets the physical node once per deletion. Deletion is
+// retried while a later step (VPN peer release) keeps failing; without the
+// marker the reset script would rerun on every retry. Failures are logged but
+// never block the finalizer removal.
 func (r *NodeProvisionReconciler) cleanupOnPremNode(ctx context.Context, np *mlv1alpha1.NodeProvision) {
+	log := logf.FromContext(ctx)
+	if r.nodeResetDone(np) {
+		log.Info("Node reset already ran for this deletion — not repeating it")
+		return
+	}
+	reset := r.nodeReset
+	if reset == nil {
+		reset = r.resetOnPremNodeViaSSH
+	}
+	if reset(ctx, np) {
+		r.markNodeResetDone(ctx, np)
+	}
+}
+
+// resetOnPremNodeViaSSH SSHes into the physical node (best-effort) and reverses
+// the provisioning: resets kubeadm, stops WireGuard, and removes its config.
+// It reports whether the script actually ran (false when the node could not be
+// reached, so a later retry may still try).
+func (r *NodeProvisionReconciler) resetOnPremNodeViaSSH(ctx context.Context, np *mlv1alpha1.NodeProvision) bool {
 	log := logf.FromContext(ctx)
 
 	sshClient, err := r.getSSHClient(ctx, np)
@@ -1929,14 +2139,15 @@ func (r *NodeProvisionReconciler) cleanupOnPremNode(ctx context.Context, np *mlv
 		// best-effort kubeadm reset on the physical node.
 		log.Info("Cannot SSH to on-prem node for kubeadm reset — credential secret missing or node unreachable; skipping node-side cleanup",
 			"err", err)
-		return
+		return false
 	}
 	defer sshClient.Conn.Close()
 
-	if out, err := ssh.Run(sshClient, npNodeResetScript); err != nil {
-		log.Error(err, "on-prem node reset script reported errors (continuing)", "output", out)
+	if out, err := ssh.Run(sshClient, buildNodeResetScript(!wireGuardProvisioned(np))); err != nil {
+		log.Error(err, "on-prem node reset script reported errors (continuing)", "output", redactSecrets(out))
 	}
 	log.Info("On-prem node reset complete")
+	return true
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1947,13 +2158,66 @@ func (r *NodeProvisionReconciler) cleanupOnPremNode(ctx context.Context, np *mlv
 // which the NodeProvision controller proactively issues a fresh bootstrap token.
 const joinTokenMaxAge = 20 * time.Hour
 
+// reconcileVPNMode makes np.Spec.DisableVPN follow the cluster's mode, which is
+// carried by the NodeProvisionNetConfig (synced from the control-plane): flannel
+// is pinned to wg0 on VPN clusters and the API server is advertised on the wg0
+// (or, without a VPN, the host) address, so a mixed cluster cannot work.
+//   - cluster without the VPN, node unset → the node inherits it (persisted, so
+//     deletion cleanup does not depend on the NetConfig still existing).
+//   - cluster with the VPN, node disabled → the node is failed.
+//
+// done is true when the caller must return res immediately. When no
+// NetConfig exists yet this is a no-op; requireNetConfig handles that later.
+func (r *NodeProvisionReconciler) reconcileVPNMode(ctx context.Context, np *mlv1alpha1.NodeProvision) (res ctrl.Result, done bool, err error) {
+	nc, err := r.netConfigFor(ctx, np)
+	if errors.Is(err, errNetConfigNotFound) {
+		return ctrl.Result{}, false, nil
+	}
+	if errors.Is(err, errNetConfigAmbiguous) {
+		// A spec error the user must fix (set spec.clusterName); like the VPN
+		// mode mismatch below it must not consume the retry budget.
+		res, ferr := r.failNodeProvisionWith(ctx, np, err.Error(), func(st *mlv1alpha1.NodeProvisionStatus) {
+			if st.ProvisionRetryCount > 0 {
+				st.ProvisionRetryCount--
+			}
+		})
+		return res, true, ferr
+	}
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+	if nc.Spec.DisableVPN == np.Spec.DisableVPN {
+		return ctrl.Result{}, false, nil
+	}
+	if !nc.Spec.DisableVPN {
+		// A spec error the user must fix, not a transient failure: it does not
+		// consume the retry budget (failNodeProvisionWith counts one, undone
+		// here), like the RemoteCluster worker's mismatch, so fixing the spec
+		// later is never blocked by a terminal Failed state.
+		res, err := r.failNodeProvisionWith(ctx, np, fmt.Sprintf(
+			"spec.disableVPN is set but NodeProvisionNetConfig %q describes a cluster that runs with the VPN; the whole cluster must use the same mode (set spec.disableVPN on the control-plane RemoteCluster, or on the NodeProvisionNetConfig, or unset it here)",
+			nc.Name), func(st *mlv1alpha1.NodeProvisionStatus) {
+			if st.ProvisionRetryCount > 0 {
+				st.ProvisionRetryCount--
+			}
+		})
+		return res, true, err
+	}
+	logf.FromContext(ctx).Info("Inheriting disableVPN from NodeProvisionNetConfig", "netconfig", nc.Name)
+	base := np.DeepCopy()
+	np.Spec.DisableVPN = true
+	if err := r.Patch(ctx, np, client.MergeFrom(base)); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("inheriting disableVPN from NodeProvisionNetConfig: %w", err)
+	}
+	return ctrl.Result{Requeue: true}, true, nil
+}
+
 // requireNetConfig returns the NodeProvisionNetConfig for this cluster.
 // If the bootstrap token is absent or older than joinTokenMaxAge, the controller
 // creates a new one directly via the Kubernetes API — no SSH or external
 // dependency required.
 func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1alpha1.NodeProvision) (*mlv1alpha1.NodeProvisionNetConfig, error) {
 	log := logf.FromContext(ctx)
-	netConfigList := &mlv1alpha1.NodeProvisionNetConfigList{}
 	// Read directly from the API server (bypassing the informer cache) rather
 	// than via r.List/r.Client. Every field of this object — VPN config,
 	// credentials refs, Kubernetes version — is load-bearing for provisioning,
@@ -1963,18 +2227,19 @@ func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1
 	// confusing "field X is empty" failure despite the object being fully
 	// correct in etcd. This read is infrequent enough that the extra API
 	// server round-trip is a non-issue.
-	lister := r.APIReader
-	if lister == nil {
-		lister = r.Client
+	lister := r.netConfigReader()
+	nc, err := r.netConfigFor(ctx, np)
+	switch {
+	case errors.Is(err, errNetConfigNotFound):
+		log.Info("No matching NodeProvisionNetConfig found yet; requeueing", "reason", err.Error())
+		return nil, err
+	case errors.Is(err, errNetConfigAmbiguous):
+		// Needs a user fix; reconcileVPNMode reports it on the NodeProvision status.
+		log.Error(err, "Cannot choose a NodeProvisionNetConfig")
+		return nil, err
+	case err != nil:
+		return nil, err
 	}
-	if err := lister.List(ctx, netConfigList, client.InNamespace(np.Namespace)); err != nil {
-		return nil, fmt.Errorf("listing NodeProvisionNetConfigs: %w", err)
-	}
-	if len(netConfigList.Items) == 0 {
-		log.Info("No NodeProvisionNetConfig found yet; requeueing")
-		return nil, fmt.Errorf("no NodeProvisionNetConfig")
-	}
-	nc := &netConfigList.Items[0]
 
 	needsRefresh := nc.Status.ClusterJoinCommand == "" ||
 		nc.Status.JoinTokenRefreshedAt == nil ||
@@ -2017,8 +2282,12 @@ func (r *NodeProvisionReconciler) requireNetConfig(ctx context.Context, np *mlv1
 // already has in-cluster credentials and does not need SSH access to the
 // control-plane node.
 //
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch,namespace=kube-system
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get,namespace=kube-public
+// RBAC: creating the bootstrap-token Secret in kube-system is covered by the
+// cluster-wide secrets rule on Reconcile above, and reading cluster-info in
+// kube-public by the namespaced configmaps marker on Reconcile (its Role and
+// RoleBinding are config/rbac/role.yaml and config/rbac/kube_public_role_binding.yaml;
+// deploy/kube-public-rbac.yaml for plain-manifest installs). No marker is
+// repeated here.
 func (r *NodeProvisionReconciler) refreshLocalJoinToken(ctx context.Context, nc *mlv1alpha1.NodeProvisionNetConfig) error {
 	// ── 1. Generate token ID (6 chars) and secret (16 chars) ─────────────────
 	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -2064,8 +2333,15 @@ func (r *NodeProvisionReconciler) refreshLocalJoinToken(ctx context.Context, nc 
 	}
 
 	// ── 3. Read cluster-info to get API server URL and CA cert ───────────────
+	// Read through the uncached API reader: a cached Get would start a
+	// cluster-wide ConfigMap informer (needing list/watch on every namespace)
+	// when the RBAC only grants a namespaced `get` in kube-public.
+	var cmReader client.Reader = r.Client
+	if r.APIReader != nil {
+		cmReader = r.APIReader
+	}
 	clusterInfo := &corev1.ConfigMap{}
-	if err := r.Get(ctx, types.NamespacedName{
+	if err := cmReader.Get(ctx, types.NamespacedName{
 		Name:      "cluster-info",
 		Namespace: "kube-public",
 	}, clusterInfo); err != nil {
@@ -2131,10 +2407,17 @@ func (r *NodeProvisionReconciler) refreshLocalJoinToken(ctx context.Context, nc 
 }
 
 func (r *NodeProvisionReconciler) getSecret(ctx context.Context, np *mlv1alpha1.NodeProvision) (*corev1.Secret, error) {
+	// Always the NodeProvision's own namespace (see credentialsNamespace); the
+	// same rule applies to every credentials lookup and to the controller-owned
+	// copy, which is created in np.Namespace.
+	ns, err := credentialsNamespace(np)
+	if err != nil {
+		return nil, err
+	}
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, client.ObjectKey{
 		Name:      np.Spec.CredentialsRef.Name,
-		Namespace: np.Spec.CredentialsRef.Namespace,
+		Namespace: ns,
 	}, secret); err != nil {
 		return nil, fmt.Errorf("getting credentials secret: %w", err)
 	}
@@ -2260,11 +2543,8 @@ func (r *NodeProvisionReconciler) ensureRegistryCredsSecret(ctx context.Context,
 
 // getSSHClient creates an SSH client for the node being provisioned.
 func (r *NodeProvisionReconciler) getSSHClient(ctx context.Context, np *mlv1alpha1.NodeProvision) (*ssh.Client, error) {
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      np.Spec.CredentialsRef.Name,
-		Namespace: np.Namespace,
-	}, secret); err != nil {
+	secret, err := r.getSecret(ctx, np)
+	if err != nil {
 		return nil, fmt.Errorf("fetching SSH credential secret %q: %w", np.Spec.CredentialsRef.Name, err)
 	}
 
@@ -2388,8 +2668,25 @@ func (r *NodeProvisionReconciler) setPhaseStatus(np *mlv1alpha1.NodeProvision, p
 // Once the retry limit is reached the resource is left in a terminal Failed
 // state with no RequeueAfter — manual intervention (patch .status.provisionRetryCount
 // to 0) is required.
+//
+// msg is redacted (tokens, private keys, passwords) and truncated before it is
+// written to Status.Message or logged. A failed status write is returned as an
+// error (the work queue requeues) rather than swallowed.
 func (r *NodeProvisionReconciler) failNodeProvision(ctx context.Context, np *mlv1alpha1.NodeProvision, msg string) (ctrl.Result, error) {
+	return r.failNodeProvisionWith(ctx, np, msg, nil)
+}
+
+// failNodeProvisionWith is failNodeProvision plus an optional mutation applied
+// to the status in the same write as the Failed transition — used to persist a
+// VPN allocation together with the failure so the peer can be released.
+func (r *NodeProvisionReconciler) failNodeProvisionWith(
+	ctx context.Context,
+	np *mlv1alpha1.NodeProvision,
+	msg string,
+	mutate func(*mlv1alpha1.NodeProvisionStatus),
+) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+	msg = sanitizeStatusMessage(msg)
 	var terminal bool
 	var attempts int
 
@@ -2403,19 +2700,29 @@ func (r *NodeProvisionReconciler) failNodeProvision(ctx context.Context, np *mlv
 		now := metav1.Now()
 		fresh.Status.Phase = mlv1alpha1.NodeProvisionPhaseFailed
 		fresh.Status.LastUpdated = &now
+		if mutate != nil {
+			mutate(&fresh.Status)
+		}
 		if fresh.Status.ProvisionRetryCount >= maxProvisionRetries {
 			terminal = true
-			fresh.Status.Message = fmt.Sprintf(
+			fresh.Status.Message = sanitizeStatusMessage(fmt.Sprintf(
 				"provisioning failed after %d attempts (last error: %s) — manual intervention required",
-				fresh.Status.ProvisionRetryCount, msg)
+				fresh.Status.ProvisionRetryCount, msg))
 		} else {
-			fresh.Status.Message = fmt.Sprintf("provisioning failed (attempt %d/%d): %s",
-				fresh.Status.ProvisionRetryCount, maxProvisionRetries, msg)
+			fresh.Status.Message = sanitizeStatusMessage(fmt.Sprintf("provisioning failed (attempt %d/%d): %s",
+				fresh.Status.ProvisionRetryCount, maxProvisionRetries, msg))
 		}
 		return r.Status().Update(ctx, fresh)
 	})
 	if updateErr != nil {
-		log.Error(updateErr, "failed to persist provisioning failure status")
+		if apierrors.IsNotFound(updateErr) {
+			return ctrl.Result{}, nil // the NodeProvision is gone; nothing to record
+		}
+		// Not durable: surface it so the caller keeps whatever it would drop
+		// after a persisted failure (on-prem job, allocation) and the work
+		// queue retries with backoff.
+		log.Error(updateErr, "failed to persist provisioning failure status", "reason", msg)
+		return ctrl.Result{}, fmt.Errorf("persisting provisioning failure: %w", updateErr)
 	}
 
 	if terminal {
@@ -2542,17 +2849,23 @@ func (r *NodeProvisionReconciler) syncRuntimeCredentials(ctx context.Context, np
 	}
 	defer sshClient.Conn.Close() //nolint:errcheck
 
-	// Write the token to a temp file so it is never visible in the process list.
+	// The token goes through a private (0600) temp file and into oras via stdin so
+	// it never appears as a command-line argument of oras. Every interpolated
+	// value is shell-quoted (registry/username/token come from a Secret and a
+	// CR), and a trap removes the file on every exit path, including failure.
 	syncCmd := fmt.Sprintf(`set -euo pipefail
+umask 077
 export HOME="${HOME:-/root}"
-install -m 0600 /dev/null /tmp/.reg-sync
-printf '%%s' '%s' > /tmp/.reg-sync
-cat /tmp/.reg-sync | oras login '%s' --username '%s' --password-stdin
-rm -f /tmp/.reg-sync`,
-		runtimeCfg.Token, runtimeCfg.Registry, runtimeCfg.Username)
+tmp="$(mktemp /tmp/.reg-sync.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT
+printf '%%s' %s > "$tmp"
+oras login %s --username %s --password-stdin < "$tmp"`,
+		shellQuote(runtimeCfg.Token), shellQuote(runtimeCfg.Registry), shellQuote(runtimeCfg.Username))
 
 	if out, sshErr := ssh.Run(sshClient, syncCmd); sshErr != nil {
-		log.Error(sshErr, "oras login sync failed (will retry)", "output", string(out))
+		safeOut := redactSecrets(strings.ReplaceAll(out, runtimeCfg.Token, redacted))
+		log.Error(fmt.Errorf("%s", redactSecrets(strings.ReplaceAll(sshErr.Error(), runtimeCfg.Token, redacted))),
+			"oras login sync failed (will retry)", "output", safeOut)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -2582,7 +2895,9 @@ rm -f /tmp/.reg-sync`,
 // intended ~1-2 minutes apart — hammering the VPN SSH server and the AWS API
 // on every single failure instead of backing off.
 //
-// It still lets through anything that is NOT a pure status-only change:
+// It still lets through anything that is NOT a pure status-only change, plus
+// the two status fields the state machine reacts to (phase and
+// provisionRetryCount — see the UpdateFunc):
 //   - Generation changes: any .spec edit, including our own
 //     resolveAWSDefaults patch.
 //   - Finalizer changes: critical — the finalizer-add step early in
@@ -2593,9 +2908,12 @@ rm -f /tmp/.reg-sync`,
 //     added, since finalizer changes don't bump generation.
 //   - DeletionTimestamp changes: so an external delete request is picked up
 //     promptly instead of waiting for the next unrelated status write.
-//   - Annotation/label changes: for parity with finalizers. Nothing
-//     currently depends on this (annotation writes here always pair with an
-//     explicit RequeueAfter), but it costs nothing to let through.
+//   - Annotation/label changes: this controller's own annotation writes
+//     (the pre-pull retry counter, the node-reset-done marker) therefore wake
+//     the reconciler too, right after the write. Handlers must be idempotent
+//     under that extra wake-up; reconcileImagePrepullJob, for one, confirms a
+//     Job failure against the API server before counting it because the
+//     woken reconcile can still see the deleted Job in the informer cache.
 func nodeProvisionReconcilePredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc:  func(event.CreateEvent) bool { return true },
@@ -2622,8 +2940,46 @@ func nodeProvisionReconcilePredicate() predicate.Predicate {
 			if (oldDel == nil) != (newDel == nil) {
 				return true
 			}
-			// Pure status-only (or no-op) change — skip; RequeueAfter drives pacing instead.
+			// Status changes that matter to the state machine: a phase
+			// transition, or a change of the retry counter — the latter is how
+			// an operator re-arms a terminal Failed resource
+			// (patch .status.provisionRetryCount to 0). The Failed handler
+			// honours requeueFailed measured from the failure time, so waking
+			// on these does not turn into a retry burst.
+			if oldNP, ok := e.ObjectOld.(*mlv1alpha1.NodeProvision); ok {
+				if newNP, ok := e.ObjectNew.(*mlv1alpha1.NodeProvision); ok {
+					if oldNP.Status.Phase != newNP.Status.Phase ||
+						oldNP.Status.ProvisionRetryCount != newNP.Status.ProvisionRetryCount {
+						return true
+					}
+				}
+			}
+			// Other status-only (or no-op) change — skip; RequeueAfter drives pacing instead.
 			return false
+		},
+	}
+}
+
+// netConfigChangePredicate limits the NodeProvisionNetConfig watch, which
+// re-enqueues every NodeProvision in the namespace, to changes a NodeProvision
+// can act on: spec edits (generation) and the join command written to status.
+// Peer/IP bookkeeping writes — which the controller itself makes for every
+// provisioned node — must not fan out to every NodeProvision.
+func netConfigChangePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return true },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNC, ok1 := e.ObjectOld.(*mlv1alpha1.NodeProvisionNetConfig)
+			newNC, ok2 := e.ObjectNew.(*mlv1alpha1.NodeProvisionNetConfig)
+			if !ok1 || !ok2 {
+				return true
+			}
+			if oldNC.GetGeneration() != newNC.GetGeneration() {
+				return true
+			}
+			return oldNC.Status.ClusterJoinCommand != newNC.Status.ClusterJoinCommand
 		},
 	}
 }
@@ -2647,7 +3003,15 @@ func (r *NodeProvisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					return nil
 				}
 				reqs := make([]reconcile.Request, 0, len(npList.Items))
+				ncCluster := ""
+				if nc, ok := obj.(*mlv1alpha1.NodeProvisionNetConfig); ok {
+					ncCluster = nc.Spec.ClusterName
+				}
 				for i := range npList.Items {
+					// A NodeProvision bound to another cluster is not affected.
+					if c := npList.Items[i].Spec.ClusterName; c != "" && ncCluster != "" && c != ncCluster {
+						continue
+					}
 					reqs = append(reqs, reconcile.Request{
 						NamespacedName: types.NamespacedName{
 							Name:      npList.Items[i].Name,
@@ -2657,6 +3021,7 @@ func (r *NodeProvisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 				return reqs
 			}),
+			builder.WithPredicates(netConfigChangePredicate()),
 		).
 		Complete(r)
 }

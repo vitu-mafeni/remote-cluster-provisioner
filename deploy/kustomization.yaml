@@ -4,17 +4,54 @@ kind: Kustomization
 namespace: remote-cluster-provisioner-system
 
 resources:
+  # CRDs (RemoteCluster, NodeProvision, NodeProvisionNetConfig). The generated
+  # files under config/crd/bases are cluster-scoped, so the namespace above
+  # does not affect them. Re-run `make manifests` after changing API types.
+  - ../config/crd
   - namespace.yaml
   - serviceaccount.yaml
   - clusterrole.yaml
   - clusterrolebinding.yaml
   - role.yaml
   - rolebinding.yaml
+  - kube-public-rbac.yaml
+  - metrics_service.yaml
   - deployment.yaml
 
-# Override the image tag for a specific release:
-#   kubectl apply -k deploy/ --image=ghcr.io/<ORG>/remote-cluster-provisioner:v1.2.3
-# Or set it here:
-# images:
-#   - name: ghcr.io/<ORG>/remote-cluster-provisioner
-#     newTag: v1.2.3
+# Image: deployment.yaml references the placeholder
+# `ghcr.io/<ORG>/remote-cluster-provisioner`. Set the real repository and an
+# immutable tag/digest below (or with `kustomize edit set image`), e.g.
+#   cd deploy && kustomize edit set image \
+#     ghcr.io/<ORG>/remote-cluster-provisioner=ghcr.io/my-org/remote-cluster-provisioner:v1.2.3
+# then `kubectl apply -k deploy/`. The placeholder reference is intentionally
+# not a valid image name (`<ORG>` and the tag below are not real), so applying
+# without editing makes the pod fail with InvalidImageName instead of silently
+# running an unknown `latest`.
+images:
+  - name: ghcr.io/<ORG>/remote-cluster-provisioner
+    newTag: REPLACE_WITH_RELEASE_TAG
+
+# [KUBE-PUBLIC] The `namespace:` above rewrites the namespace of every namespaced
+# resource, which would move the kube-public Role/RoleBinding for cluster-info
+# reads (kube-public-rbac.yaml) into the controller namespace, where the grant
+# is useless. Do NOT pin them with a plain `patches:` entry (or by running
+# `kustomize edit fix` on a `patchesJson6902:`): `patches:` run BEFORE the
+# namespace transformer and are silently overridden. `replacements:` run after
+# it, so the namespace is copied from the RoleBinding's `pinned-namespace`
+# annotation. Verify with `kustomize build deploy | grep -B2 -A1 kube-public`.
+replacements:
+  - source:
+      kind: RoleBinding
+      name: remote-cluster-provisioner-cluster-info-reader
+      fieldPath: metadata.annotations.[infra.dcn.ssu.ac.kr/pinned-namespace]
+    targets:
+      - select:
+          kind: Role
+          name: remote-cluster-provisioner-cluster-info-reader
+        fieldPaths:
+          - metadata.namespace
+      - select:
+          kind: RoleBinding
+          name: remote-cluster-provisioner-cluster-info-reader
+        fieldPaths:
+          - metadata.namespace

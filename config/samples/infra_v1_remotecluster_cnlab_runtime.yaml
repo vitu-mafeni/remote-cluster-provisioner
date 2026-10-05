@@ -16,7 +16,7 @@ metadata:
 type: Opaque
 stringData:
   username: "vitu-mafeni"
-  token: "ghp_tzldwREXAMPLEhuzkIS6SFgEBT3H22Bf"  # packages:read scope minimum
+  token: "ghp_tzldwRXWTY9QEXAMPLE6SFgEBT3H22Bf"  # packages:read scope minimum
 
 ---
 
@@ -65,12 +65,18 @@ spec:
           nodeTarget: "gpu"  # gpu or all download on all nodes
         - image: "docker.io/vitu1/kernel-tf-gpu:3.2.3-cu121"
           nodeTarget: "gpu"
-        - image: "docker.io/vitu1/kernel-pytorch-gpu-vscode:3.2.3-cu121"
-          nodeTarget: "gpu"
-        - image: "docker.io/vitu1/kernel-tf-gpu-vscode:3.2.3-cu121"
-          nodeTarget: "gpu"
+        # - image: "docker.io/vitu1/kernel-pytorch-gpu-vscode:3.2.3-cu121"
+        #   nodeTarget: "gpu"
+        # - image: "docker.io/vitu1/kernel-tf-gpu-vscode:3.2.3-cu121"
+        #   nodeTarget: "gpu"
       imagePullSecretRef:
         name: dockerhub-creds
+
+      # Registries reached over plain HTTP / untrusted TLS (host or host:port),
+      # e.g. an in-cluster Harbor NodePort. Hosts of the imagePrepulls images
+      # above are ALSO marked insecure (backward compatible).
+      # insecureRegistries:
+      #   - harbor.example.com:30002
 
       # cnlabRuntime configures the prebuilt CRI-O runtime OCI artifact.
       # All fields are optional; the defaults listed here are shown for clarity.
@@ -80,7 +86,7 @@ spec:
         # Image repository path. Default: vitu-mafeni/cnlab-runtime
         repository: "vitu-mafeni/cnlab-runtime"
         # Artifact version tag. Default: 1.0.0-beta
-        version: "1.0.0-beta"
+        version: "1.0.2-beta"
         # ORAS CLI version used to pull the artifact. Default: 1.3.2
         orasVersion: "1.3.2"
         # Secret containing "username" and "token" for registry auth.
@@ -115,21 +121,21 @@ spec:
         - key: KEYCLOAK_ADMIN_PASSWORD
           value: "changeme123"
         - key: JUPYTERHUB_API_TOKEN        # must match hub.services.quota-api.apiToken in jhub-values.yaml
-          value: "79044be905ddf5EXAMPLE972fcb6f479eeec9d8dfad4ea7"
+          value: "79044be905ddf54c21eb2EXAMPLE679c972fcb6f479eeec9d8dfad4ea7"
         - key: QUOTA_API_TOKEN             # must match hub.extraEnv.QUOTA_API_TOKEN — different from above
           value: "testtoken123"
         - key: DB_PASSWORD
           value: "quota-api"
         - key: CREDENTIAL_KEY              # Fernet key — generate once, never rotate without migrating data
-          value: "zz_dakGbNuJyvJIX8zvA_ZcYb7bMgGcUo1i6E7zoepU="
+          value: "AQJL23-VxrSDvFzN-boWATO_lZccptMvQEQXosSVOv4="
         - key: GHCR_DOCKERCONFIGJSON       # raw JSON (not base64) — see generation command above
-          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldEXAMPLEzkIS6SFgEBT3H22Bf","auth":"dml0dS1tYWZlbmk6Z2hwXEXAMPLE6a0lTNlNGZ0VCVDNIMjJCZg=="}}}'
+          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldwRXWTY9QEXAMPLE6SFgEBT3H22Bf","auth":"dml0dS1tYWZlbmk6Z2hwX3R6bGR3UlhXVFk5UU9memk0aHV6a0lTNlNGZ0VCVDNIMjJCZg=="}}}'
 
         # ── Image tags (required — whatever you built and pushed to GHCR) ──────
         - key: QUOTA_API_IMAGE
-          value: "ghcr.io/vitu-mafeni/quota-api:0.1.0-gist"
+          value: "ghcr.io/vitu-mafeni/quota-api:0.1.0-fluidcr"
         - key: FRONTEND_IMAGE
-          value: "ghcr.io/vitu-mafeni/ml-platform-frontend:0.1.0-gist"
+          value: "ghcr.io/vitu-mafeni/ml-platform-frontend:0.1.0-fluidcr"
 
         # ── Network overrides (optional — auto-computed from spec.host) ────────
         - key: JUPYTERHUB_PUBLIC_URL
@@ -201,6 +207,12 @@ spec:
         - key: RECLAMATION_REQUIRE_GPU_IDLE  # also require GPU memory idle before reclaiming
           value: "false"
 
+        # checkpoint feature via fluidCR (optional)
+        - key: FLUIDCR_API_TOKEN
+          value: "7fK9mQ2xV8nR4pL6sT3wY5zA1bC0dE8"
+        - key: FLUIDCR_STAGER_TOKEN
+          value: "cN8zP4hJ7vX2kM9qL5rW1yT3sE6bA0"
+
   auth:
     sshPrivateKeySecretRef:
       name: cp-node-ssh-secret
@@ -243,7 +255,10 @@ stringData:
     6naU2QNVfQ2r2gGEeLhidktFmJE3oA+YJ2lGpQIDAQABAoIBAA8byNrGbkdBXjIJ
     izXUrnyP2zG1AqpxMWo6n0ncmXOEGc/wvDEOCtAO/6K+xd1yM9CWcJfSpKP7eV+i
     V3xzpGodSV2kvOEok72+hcfj+YClmtNAZgk8Y9tMvG9hGkMh+PL5Hs2Tbs29DSJb
-    cRZHaIsEXAMPLE
+    cRZHaIs3w26CxIM8n5jxIwmQCgwKY+ISP9t6l/0axOOPwECpgOCQ3yWFeikmVKNe
+    xA/N894Ru/yG0JdJMIbcQJAUd7v53jZI/F2F7QvTLBJtM5zBoH1ycnidGGzPagIn
+    +WaRXxuEe2ZbHEXAMPLED9+WeI0NTKy6DpbZ6rd4
+    twMcdbvQPKKwGkQlqW6B/k1QMrub2hEjQuHgy7kCgYBOkLSvzP9hJKNSBX/PhNUF
     tA2kHQN9OarIrbFI8Ib/GG5ifPszcqeTHx2zUzciTbG+2maytPBn9ux5mKtrvtQT
     6TpcDPIREuyrm1V69Ifj25zDDOYyNluLo4KuDBSjtlR+ep9p7veSadeeHClWzn65
     4whYT5uz0XPQQ7RfmvcyTQKBgAa+MlZsnb/81LZgzERE5mUULC73Ve6tzomZMceb
@@ -264,7 +279,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: dckr_patEXAMPLEjCbAaQ8TWo
+  password: dckr_pat_gBvEXAMPLE24kjCbAaQ8TWo
 ---
 # ============================================================
 # RemoteCluster — GPU worker node

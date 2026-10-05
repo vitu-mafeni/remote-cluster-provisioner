@@ -1,0 +1,106 @@
+# GCP credentials: the service-account key JSON under `credentials.json`
+# (or `serviceAccountKey`, or any key named in credentialsRef.key).
+# Create it from a key file instead of pasting the key into YAML:
+#   kubectl create secret generic gcp-node-credentials \
+#     --from-file=credentials.json=./sa-key.json
+# The service account needs roles/compute.instanceAdmin.v1 and
+# roles/compute.securityAdmin (per-node firewall rules), and the Compute
+# Engine API must be enabled in the project.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gcp-node-credentials
+  namespace: default
+type: Opaque
+stringData:
+  credentials.json: |
+    {
+      "type": "service_account",
+      "project_id": "my-project",
+      "private_key_id": "REPLACE_ME",
+      "private_key": "-----BEGIN PRIVATE KEY-----\nREPLACE_ME\n-----END PRIVATE KEY-----\n",
+      "client_email": "node-provisioner@my-project.iam.gserviceaccount.com",
+      "token_uri": "https://oauth2.googleapis.com/token"
+    }
+---
+# 1) WITH a VPN (the default): the node joins the cluster over WireGuard.
+#    The controller registers the peer on the VPN server, the firewall admits
+#    the WireGuard UDP port from the VPN server's address only, and the
+#    kubelet node IP is the tunnel IP.
+#
+# Minimal spec: only a location + nodeLabel are required. The controller
+# resolves the project (from the key), zone, network, boot image (latest
+# Ubuntu 22.04 LTS from ubuntu-os-cloud) and machine type automatically.
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: gcp-node-001            # becomes the GCE instance name AND the node name:
+                                # lowercase letters, digits and '-', starting with a letter
+  namespace: default
+spec:
+  provider: GCP
+  clusterName: my-cluster   # selects the NodeProvisionNetConfig whose spec.clusterName matches (required when the namespace has several clusters)
+  role: worker
+  nodeLabel: cpu                # "cpu" -> e2-standard-4  |  "gpu" -> n1-standard-8 + 1x nvidia-tesla-t4
+  region: us-central1           # a zone of this region that offers the machine type is chosen;
+                                # set gcpConfig.zone to pin one (it is authoritative if both are set)
+  # instanceType: n2-standard-8 # exact GCE machine type; skips the nodeLabel lookup
+  credentialsRef:
+    name: gcp-node-credentials
+    namespace: default
+  # gcpConfig is optional — every field below is auto-populated when absent.
+  # Uncomment to override any individual value:
+  # gcpConfig:
+  #   projectId: my-project
+  #   zone: us-central1-a
+  #   network: default                       # or projects/<host>/global/networks/<vpc> (Shared VPC)
+  #   subnetwork: default                    # required for custom-mode networks
+  #   imageFamily: ubuntu-2204-lts           # + imageProject: ubuntu-os-cloud (the defaults)
+  #   # sourceImage: projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260101
+  #   bootDiskSizeGB: 100                    # default 50
+  #   bootDiskType: pd-ssd                   # default pd-balanced
+  #   labels:
+  #     team: ml
+  #   networkTags: [ml-nodes]
+  #   serviceAccountEmail: node@my-project.iam.gserviceaccount.com   # none attached by default
+  #   spot: false
+  #   disableExternalIP: false               # true needs Cloud NAT for package downloads
+  #   firewallSourceRanges: []               # VPN mode: adds a TCP 22 rule for these CIDRs
+---
+# 2) WITHOUT a VPN: no VPN server is contacted and no WireGuard is installed.
+#    The mode belongs to the whole cluster: set `disableVPN: true` on the
+#    control-plane RemoteCluster; it is inherited via the NodeProvisionNetConfig,
+#    so it normally does not need to be set here (setting it against a VPN
+#    cluster fails the provision).
+#
+#    The kubelet node IP is the VM's INTERNAL IP, so the control plane must be
+#    able to route to it (same VPC, VPC peering, Cloud VPN/Interconnect), and
+#    the control plane's API endpoint must be reachable from the VM.
+#    The per-node firewall rule admits TCP 22, TCP 10250 (kubelet), UDP 8472
+#    (flannel VXLAN) and ICMP from firewallSourceRanges.
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: gcp-gpu-node-002
+  namespace: default
+spec:
+  provider: GCP
+  clusterName: my-cluster   # selects the NodeProvisionNetConfig whose spec.clusterName matches (required when the namespace has several clusters)
+  role: worker
+  nodeLabel: gpu
+  hardwareType: gpu             # image pre-pull targeting; GPU Operator installs the NVIDIA stack
+  disableVPN: true              # normally inherited from the cluster; shown here for clarity
+  credentialsRef:
+    name: gcp-node-credentials
+    namespace: default
+  gcpConfig:
+    zone: europe-west4-a
+    # The control plane's / controller's address ranges (default: RFC1918 10/8, 172.16/12, 192.168/16).
+    firewallSourceRanges:
+      - 172.20.0.0/16
+    # GPUs: N1 machine types take an accelerator ...
+    accelerator:
+      type: nvidia-tesla-t4
+      count: 1
+    # ... while a2/a3/g2 machine types include their GPUs (set spec.instanceType, leave accelerator unset):
+    #   spec.instanceType: g2-standard-8

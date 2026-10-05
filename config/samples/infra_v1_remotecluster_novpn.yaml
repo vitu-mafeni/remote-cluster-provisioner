@@ -1,0 +1,193 @@
+# ============================================================================
+# RemoteCluster — cluster WITHOUT a VPN (spec.disableVPN: true)
+#
+# No WireGuard: no VPN server is contacted, no VPN range/credentials are
+# published, no peers are created or removed, WireGuard is not installed, and
+# flannel is pinned to the node's own address instead of wg0. Use it when every
+# node is directly reachable by the controller AND by the other nodes (same LAN,
+# routed network, or peered cloud VPCs).
+#
+# Requirements:
+#   - spec.host must be an IP address that is bound to a local interface on the
+#     node (a DNS name or a NATed public IP is rejected). It becomes the kubelet
+#     node IP and, on the control-plane, the API server advertise address.
+#   - Workers must be able to reach https://<control-plane host>:6443.
+#
+# The whole cluster uses ONE mode, decided by the control-plane. Workers inherit
+# disableVPN from it; setting it explicitly (as below) is allowed and makes the
+# intent obvious. A worker that sets disableVPN under a VPN control-plane is
+# failed with VPNModeMismatch. Flipping the mode of an already provisioned node
+# is ignored (re-provision it instead). VPN version: infra_v1_remotecluster_vpn.yaml.
+#
+# Contents: a SINGLE-NODE-CAPABLE GPU control-plane + GPU worker + CPU worker.
+# All secret values are placeholders — replace every CHANGE_ME.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Control-plane that is ALSO a GPU node
+#
+# hardwareType "gpu" on a control-plane means the box runs GPU workloads too
+# (e.g. a one-box cluster, or a GPU head node next to separate workers). It is
+# then labelled gpu=on and infra.dcn.ssu.ac.kr/hardware-type=gpu (+ worker=true)
+# so the pre-pull DaemonSets target it, and CRI-O gets CDI enabled for the
+# NVIDIA Container Toolkit. The control-plane taint is removed so it schedules
+# pods, but it does NOT get the hardware-type=gpu:PreferNoSchedule taint that
+# pure GPU workers get — CPU pods must still be able to land on it.
+# Use hardwareType "cpu" for a control-plane without GPUs.
+# ----------------------------------------------------------------------------
+apiVersion: infra.dcn.ssu.ac.kr/v1
+kind: RemoteCluster
+metadata:
+  name: ml-novpn-cp
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # Unique per cluster; workers and NodeProvision.spec.clusterName reference it.
+  clusterName: "ml-novpn"
+
+  host: "192.168.3.234" # IP bound to a local interface on the node
+  port: "22"
+  user: "ubuntu"
+
+  # No vpnConfig: it is ignored when disableVPN is true.
+  disableVPN: true
+
+  nodeInfo:
+    nodeType: "control-plane"
+    hardwareType: "gpu"
+    softwareConfig:
+      kubernetesVersion: "v1.35.0"
+
+      imagePrepulls:
+        - image: "192.168.3.234:30728/example/kernel-pytorch-gpu:3.2.3-cu121"
+          nodeTarget: "gpu"
+        - image: "docker.io/example/base-tools:1.0"
+          nodeTarget: "all"
+      imagePullSecretRef:
+        name: ml-novpn-registry-creds
+
+      # Plain-HTTP registries (host or host:port). The host of the first
+      # imagePrepulls image above (192.168.3.234:30728) is marked insecure
+      # automatically; list it here as well, or list registries that are
+      # pulled from by other workloads but are not in imagePrepulls. Written
+      # before CRI-O first starts; already-provisioned nodes need the manual
+      # drop-in + `systemctl restart crio` from the user guide.
+      insecureRegistries:
+        - "192.168.3.234:30728"
+        - "registry.internal.example:5000"
+
+      # cnlabRuntime is optional; defaults apply when omitted.
+      # cnlabRuntime:
+      #   version: "1.0.2-beta"
+      #   credentialsRef:
+      #     name: ml-novpn-cnlab-runtime-registry
+      #     namespace: default
+
+  auth:
+    passwordSecretRef:
+      name: ml-novpn-cp-ssh
+      key: password
+
+  # Optional GitOps (Nephio/Porch) platform deployment.
+  # gitConfig:
+  #   enable: "true"
+  #   gitServer: "http://git.example.com:31810"
+  #   gitUsername: "nephio"
+  #   upstreamPlatformRepo: "cnlab-catalog"
+  #   packageRevision: "v1.0.0"
+
+---
+# ----------------------------------------------------------------------------
+# GPU worker — joins ml-novpn-cp directly (no tunnel)
+# ----------------------------------------------------------------------------
+apiVersion: infra.dcn.ssu.ac.kr/v1
+kind: RemoteCluster
+metadata:
+  name: ml-novpn-gpu-worker-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  clusterName: "ml-novpn" # must match the control-plane
+  host: "192.168.3.235"   # IP bound to a local interface on this worker
+  port: "22"
+  user: "ubuntu"
+  disableVPN: true        # inherited from the control-plane if omitted
+  nodeInfo:
+    nodeType: "worker"
+    hardwareType: "gpu"
+  auth:
+    passwordSecretRef:
+      name: ml-novpn-gpu-worker-ssh
+      key: password
+
+---
+# ----------------------------------------------------------------------------
+# CPU worker — joins ml-novpn-cp directly (no tunnel)
+# ----------------------------------------------------------------------------
+apiVersion: infra.dcn.ssu.ac.kr/v1
+kind: RemoteCluster
+metadata:
+  name: ml-novpn-cpu-worker-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  clusterName: "ml-novpn"
+  host: "192.168.3.236"
+  port: "22"
+  user: "ubuntu"
+  disableVPN: true
+  nodeInfo:
+    nodeType: "worker"
+    hardwareType: "cpu"
+  auth:
+    passwordSecretRef:
+      name: ml-novpn-cpu-worker-ssh
+      key: password
+
+---
+# ----------------------------------------------------------------------------
+# Secrets (placeholders)
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-novpn-cp-ssh
+  namespace: default
+type: Opaque
+stringData:
+  password: "CHANGE_ME"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-novpn-gpu-worker-ssh
+  namespace: default
+type: Opaque
+stringData:
+  password: "CHANGE_ME"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-novpn-cpu-worker-ssh
+  namespace: default
+type: Opaque
+stringData:
+  password: "CHANGE_ME"
+---
+# Registry credentials for imagePrepulls (keys: username, password).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-novpn-registry-creds
+  namespace: default
+type: Opaque
+stringData:
+  username: "CHANGE_ME"
+  password: "CHANGE_ME"

@@ -12,15 +12,67 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Gate: nothing is pushed to GHCR (including `latest`) unless the code builds,
+  # vets and passes the unit tests that do not need envtest/kind. The controller
+  # (internal/...) tests need envtest binaries and run in test.yml instead.
+  test:
+    name: Build, vet and unit test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      go-version: ${{ steps.gover.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # go.mod is the single source of truth for the Go version. The gate above
+      # (setup-go with go-version-file) and the image (Dockerfile GO_VERSION
+      # build arg, passed below) must use the same toolchain. Fail early if the
+      # Dockerfile default (which carries the matching digest pin) has drifted.
+      - name: Resolve Go version from go.mod
+        id: gover
+        run: |
+          v="$(sed -n 's/^toolchain go\([0-9][0-9.]*\)$/\1/p' go.mod | head -n1)"
+          if [ -z "$v" ]; then
+            v="$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' go.mod | head -n1)"
+          fi
+          if [ -z "$v" ]; then
+            echo "::error::could not determine the Go version from go.mod"
+            exit 1
+          fi
+          d="$(sed -n 's/^ARG GO_VERSION=\(.*\)$/\1/p' Dockerfile | head -n1)"
+          if [ "$v" != "$d" ]; then
+            echo "::error::go.mod uses Go $v but Dockerfile ARG GO_VERSION is '$d'; update GO_VERSION and GO_IMAGE_DIGEST in the Dockerfile"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./api/... ./pkg/... ./provider/...
+
   # Build each platform natively on its own runner instead of cross-building
   # linux/arm64 under QEMU emulation on an amd64 runner — QEMU-emulated
   # compilation is commonly 10-20x slower than native and, combined with the
-  # garble build step below (which recompiles the whole dependency tree from
-  # source on every build), was the main driver of multi-hour build times.
+  # garble build step (opt-in, see the OBFUSCATE build arg below), which
+  # recompiles the whole dependency tree from source on every build, was the
+  # main driver of multi-hour build times.
   # Each job pushes its image by digest only; the merge job below assembles
   # the final multi-arch manifest list and applies the real tags.
   build:
     name: Build (${{ matrix.platform }})
+    needs: test
     runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: read
@@ -59,6 +111,12 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          # Obfuscation is opt-in: set the repository variable OBFUSCATE=true
+          # (Settings > Secrets and variables > Actions > Variables) after
+          # verifying an obfuscated image works. Default is a plain build.
+          build-args: |
+            GO_VERSION=${{ needs.test.outputs.go-version }}
+            OBFUSCATE=${{ vars.OBFUSCATE || 'false' }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=build-${{ env.PLATFORM_PAIR }}

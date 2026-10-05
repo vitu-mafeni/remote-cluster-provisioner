@@ -138,6 +138,12 @@ added and removed.
 <figcaption>NodeProvision validates, provisions via SSH or EC2, joins the cluster, optionally pre-pulls GPU images, then becomes Ready.</figcaption>
 </figure>
 
+`status.phase` takes the values listed in [§10.2](#102-nodeprovision) (`Pending`, `Validating`,
+`Provisioning`, `CreatingInstance`, `WaitingForInstance`, `ConfiguringVPN`, `Bootstrapping`,
+`Joining`, `RegisteringNode`, `VerifyingHealth`, `PrePullingImages`, `Ready`, `Failed`,
+`Deleting`); which ones you see depends on the provider. `ConfiguringVPN` is skipped when the VPN
+is disabled (`disableVPN: true`).
+
 ---
 
 ## 3. Prerequisites
@@ -158,8 +164,11 @@ added and removed.
   it connects directly.
 - **Passwordless `sudo`** for the SSH user on every host you provision.
 - **Ubuntu 22.04 (Jammy)** on every host that becomes a cluster node.
-- **A WireGuard VPN server** reachable over SSH — see
+- **A WireGuard VPN server** reachable over SSH — **required only when `disableVPN` is `false`**
+  (the default); clusters created with `disableVPN: true` never contact a VPN server (see
+  [§5.1](#51-remotecluster--createmanage-a-cluster-from-the-management-cluster)). See
   [WIREGUARD_SETUP.md](wireguard-setup-bundle/WIREGUARD_SETUP.md) if you need to stand one up.
+  Without a VPN, the nodes must be directly reachable from the controller and from each other.
 - **GPU nodes**: NVIDIA drivers must already be installed on the host beforehand — this project
   does not install GPU drivers for you.
 - **AWS credentials**, if you'll provision nodes with `provider: AWS` — either an access key/secret
@@ -169,13 +178,31 @@ added and removed.
 
 The controller needs a `ClusterRole` covering the `RemoteCluster`, `NodeProvision`, and
 `NodeProvisionNetConfig` resources (including their status), Kubernetes `Node` objects, `Secret`s
-and `ConfigMap`s (including in `kube-system`/`kube-public`, for join-token management), `Job`s
-(for GPU image pre-pulling), and — only if you enable GitOps deployment — the Nephio/Porch
-resource types. All of this is already defined in the manifests you'll apply in
-[§4](#4-installation); you don't need to hand-write any RBAC.
+(for join-token management, including in `kube-system`), read access (`get`) to the single
+`kube-public/cluster-info` `ConfigMap` through a namespaced `Role` in `kube-public` (no
+cluster-wide `ConfigMap` access is granted), `Job`s (for GPU image pre-pulling), and — only if you
+enable GitOps deployment — the Nephio/Porch resource types. All of this is already defined in the
+manifests you'll apply in [§4](#4-installation); you don't need to hand-write any RBAC.
 
-> **Security note:** SSH connections from the controller do not verify host keys. Make sure the
-> network path to your nodes and VPN server (e.g. the VPN tunnel itself) is one you trust.
+#### SSH host key verification
+
+By default the controller does **not** verify SSH host keys (it logs one warning), so make sure
+the network path to your nodes and VPN server (e.g. the VPN tunnel itself) is one you trust. To
+turn verification on, set the environment variable **`SSH_KNOWN_HOSTS_FILE`** on the controller
+container to the path of an OpenSSH `known_hosts` file (mount it from a ConfigMap or Secret; a
+commented example is in `deploy/deployment.yaml`). This is opt-in — defaults are unchanged. When it is set:
+
+- the controller **fails closed**: a host that is not listed in the file is rejected, so every
+  node, on-prem host and VPN server must be **pre-seeded** in the file *before* the resource that
+  uses it is created (`ssh-keyscan -t ed25519,ecdsa,rsa <host>`; for a new AWS instance the host
+  key is not known in advance, so verification will reject it unless you have a way to
+  pre-seed it);
+- only the host key types present in the file for a host are negotiated, so list the type the
+  host actually offers;
+- if the file cannot be read or parsed, **every** SSH connection fails (there is no silent fallback
+  to "no verification");
+- there is no trust-on-first-use cache: a reinstalled node presents a new host key and must be
+  re-seeded.
 
 ---
 
@@ -222,6 +249,12 @@ Point `IMG` at the pre-built image you were given. This creates:
 - Namespace **`remote-cluster-provisioner-system`**
 - The controller's service account and permissions
 - `Deployment/remote-cluster-provisioner-controller-manager` (1 replica)
+
+> If you install from the static manifests in `deploy/` instead (`kubectl apply -k deploy/`, after
+> setting the image as described in `deploy/kustomization.yaml`), the Deployment and service
+> account are named `remote-cluster-provisioner` (no `-controller-manager` suffix) in the same
+> namespace; substitute that name in the `deployment/...` commands used throughout this guide.
+> RBAC there grants only `get` on `kube-public/cluster-info` for ConfigMaps (namespaced Role).
 
 The same steps (§4.1 and §4.2) are what you'll also run **on every remote cluster** you create,
 before you start applying `NodeProvision` resources there.
@@ -318,6 +351,30 @@ Key fields to get right:
   password.
 - **`vpnConfig.ip`** — once set, the controller talks to the node over its VPN IP instead of
   `spec.host`, which keeps working even after the node moves onto a different network path.
+- **`disableVPN`** (default `false`) — run the **whole cluster** without WireGuard, when
+  `spec.host` is a public (or otherwise directly routable) IP that is fully reachable by the
+  controller and by the other nodes. Set it on the **control-plane**; it decides for the cluster:
+  the control-plane publishes it in the cluster's `NodeProvisionNetConfig`, and every worker
+  (`RemoteCluster` workers and `NodeProvision`s, on-prem and AWS) inherits it. A node that sets
+  `disableVPN: true` under a VPN control-plane is failed with a clear message, because a mixed
+  cluster cannot work. Inheritance flows control-plane `RemoteCluster` → `NodeProvisionNetConfig`
+  → `NodeProvision`/worker (see [§7.5](#75-operational-notes) for the resulting conditions).
+  - `spec.host` must be an **IP bound to a local interface on the node** (a NATed public IP fails
+    early with a clear error); it becomes the kubelet node IP and, for the control-plane, the API
+    server advertise address, in place of the `wg0` address.
+  - Nothing VPN-related is touched: no VPN server contact, no VPN range/credentials published or
+    copied, no peer allocation or removal, no WireGuard install or teardown, no AWS security
+    group rule for UDP 51820. Instead of `--iface=wg0`, flannel is pinned **per node to the
+    node's own address** (`--iface=$(FLANNEL_NODE_IP)`, taken from the pod's `status.hostIP`, which
+    is the kubelet node IP), so the VXLAN endpoint is always the interface that carries the node
+    IP, even on multi-homed hosts. `vpnConfig` is ignored.
+  - Nodes must reach the address the control-plane advertises. Pod traffic (flannel VXLAN,
+    UDP 8473) then crosses the network unencrypted.
+  - Firewalling is yours to manage: the controller only opens what it needs itself (for AWS
+    nodes the default security group it creates gets **SSH only**). The kubelet port
+    (**TCP 10250**) and flannel VXLAN (**UDP 8473**) between the cluster's nodes must be allowed
+    by your own security group / firewall (and TCP 6443 to the control-plane for joins).
+  - Choose the mode when you create the cluster; switching an existing cluster is not supported.
 - **`gitConfig.enable`** — a **string** `"true"`/`"false"`, not a bare `true`/`false`. Only when
   `"true"` does the platform stack get deployed via GitOps.
 
@@ -333,18 +390,21 @@ metadata:
   name: my-cluster-netconfig
 spec:
   clusterName: my-cluster
+  disableVPN: false             # true = cluster without WireGuard; vpnRange/vpnServerPublicConfig are then unused
   vpnRange: "10.9.0.0/24"
   vpnServerPublicConfig:
     publicIP: "13.215.206.108"
-    sshPort: 22
+    sshPort: "22"
     sshUsername: ubuntu
-    vpnPort: 51820
+    vpnPort: "51820"
     vpnSshCredentialsRef:
       name: vpn-server-secret
       namespace: default
       key: id_rsa
   softwareConfig:
     kubernetesVersion: "v1.34.2"
+    insecureRegistries:         # optional; see "Insecure (plain-HTTP) registries" below
+      - harbor.example.com:30002
     cnlabRuntime:
       registry: "ghcr.io"
       repository: "vitu-mafeni/cnlab-runtime"
@@ -355,10 +415,60 @@ spec:
         namespace: default
 ```
 
-> Some sample files also show `softwareConfig.nvidiaDriverVersion`,
-> `nvidiaContainerToolkitVersion`, and `k8sDevicePluginVersion`. **These aren't supported fields**
-> today — don't rely on them. GPU driver/toolkit versions aren't configurable through this
-> resource; install them on the host yourself beforehand.
+**Which NetConfig does a `NodeProvision` use?** `spec.clusterName` of the `NodeProvision` selects
+the `NodeProvisionNetConfig` whose `spec.clusterName` is equal (`RemoteCluster.spec.clusterName`
+is what the controller writes there). Provisioning fails with a clear error when none, or more
+than one, matches. For backward compatibility the field may be left empty **only while the
+namespace holds exactly one `NodeProvisionNetConfig`**: that one is then used, as before. As soon
+as a namespace holds several (several clusters), a `NodeProvision` without `spec.clusterName`
+is failed (without consuming a retry) with an error asking you to set it — the controller never
+guesses, because a wrong pick would use another cluster's VPN range, VPN mode, pre-pull images
+and registry secret. A VPN peer is likewise never released from a guessed config when such a node
+is deleted: deletion keeps reporting the error until `spec.clusterName` is set.
+
+#### Insecure (plain-HTTP) registries
+
+`softwareConfig.insecureRegistries` (also on `RemoteCluster.spec.nodeInfo.softwareConfig`, which
+syncs it here, including clearing it when removed) lists registries (`host` or `host:port`, e.g.
+`harbor.example.com:30002`) that are served over **plain HTTP or with an untrusted certificate**.
+Every node the operator provisions — on-prem control-plane/worker (`RemoteCluster`), on-prem,
+AWS and GCP `NodeProvision` — gets a `/etc/containers/registries.conf.d/50-insecure-<host>.conf`
+drop-in with `insecure = true`, written **before** CRI-O (re)starts. Use it for registries that
+other workloads pull from but that are not in `imagePrepulls`.
+
+- Entries are bare `host` or `host:port` (port 1-65535): no `http://`, path, spaces, quotes or
+  shell characters; at most 32. An invalid entry is rejected by the CRD and, on the controller
+  side, fails the `RemoteCluster` (condition/message `InvalidInsecureRegistries`) or the
+  `NodeProvision` with a message naming the entry.
+- **Backward compatibility:** the registry host of every fully-qualified image in `imagePrepulls`
+  (e.g. `harbor.example.com:30002` from `harbor.example.com:30002/team/img:1`) is **also** marked
+  insecure, exactly as before. The effective list is the de-duplicated, sorted union of both.
+  There is no opt-out for the derived hosts.
+- **Already-provisioned nodes** are not touched, and CRI-O only reads `registries.conf.d` when it
+  starts. On each existing node run once (ideally after cordoning/draining it, since restarting
+  CRI-O restarts its containers):
+
+  ```bash
+  sudo mkdir -p /etc/containers/registries.conf.d
+  sudo tee /etc/containers/registries.conf.d/50-insecure-harbor-example-com-30002.conf >/dev/null <<'EOF'
+  [[registry]]
+  location = "harbor.example.com:30002"
+  insecure = true
+  EOF
+  sudo systemctl restart crio
+  ```
+
+  (the file name is only a label: `.` and `:` in the host are replaced by `-`).
+
+`disableVPN` is normally set for you: the control-plane `RemoteCluster` publishes it here, and every
+`NodeProvision` reads it (see [§5.1](#51-remotecluster--createmanage-a-cluster-from-the-management-cluster)
+and [§7.5](#75-operational-notes)). Only set it by hand on a NetConfig you manage yourself, and
+keep it consistent with the cluster's real mode.
+
+> Older examples showed `softwareConfig.nvidiaDriverVersion`, `nvidiaContainerToolkitVersion`,
+> and `k8sDevicePluginVersion`. **These are not fields of this resource** (the API server rejects
+> them) — GPU driver/toolkit/device-plugin versions aren't configurable here; the controller does
+> not install them for you.
 
 ### 5.3 `NodeProvision` — add a node from the remote cluster
 
@@ -372,6 +482,7 @@ metadata:
   namespace: default
 spec:
   provider: OnPrem
+  clusterName: my-cluster        # which NodeProvisionNetConfig (spec.clusterName) to use; required when the namespace has several
   role: worker
   hardwareType: gpu              # controls which pre-pull images target this node
   nodeLabel: gpu
@@ -394,6 +505,7 @@ metadata:
   namespace: default
 spec:
   provider: AWS
+  clusterName: my-cluster        # which NodeProvisionNetConfig (spec.clusterName) to use; required when the namespace has several
   role: worker
   nodeLabel: cpu                 # "cpu" → t3.xlarge | "gpu" → p3.2xlarge (auto-resolved)
   region: ap-northeast-2
@@ -415,6 +527,21 @@ spec:
 
 Important fields:
 
+- **`disableVPN`** (default `false`) joins the node without a WireGuard tunnel — no VPN server
+  connection, IP allocation, peer, WireGuard package or AWS security group rule. It is a property
+  of the whole cluster, so you normally don't set it here: it is inherited from the cluster's
+  `NodeProvisionNetConfig` (see `RemoteCluster.spec.disableVPN`), and setting it against a VPN
+  cluster fails the provision. Use it only when the node is directly reachable from the
+  controller and the control plane, **and** the control plane's API endpoint (the address in the
+  kubeadm join command, i.e. what the control plane advertises) is reachable from the node. The
+  node's own address becomes the kubelet node IP:
+  - **OnPrem** — `spec.ipAddress`, which must be an IP actually bound to an interface on the
+    node (a NATed public IP fails early with a clear error).
+  - **AWS** — the instance's *private* IP (a public EC2 IP is NATed and cannot be a kubelet node
+    IP), so the control plane must be able to route to it (same or peered VPC).
+  - **GCP** — the instance's *internal* (VPC) IP, for the same reason; see [§5.4](#54-nodeprovision-on-google-cloud-gcp).
+
+  Set it when you create the resource; changing it on an existing node is not supported.
 - **`nodeLabel`** drives the AWS defaults — `"cpu"` → `t3.xlarge`, `"gpu"` → `p3.2xlarge`. Set
   `spec.awsConfig.instanceType` (or the top-level `spec.instanceType`) to pick an exact instance
   type instead.
@@ -424,6 +551,138 @@ Important fields:
   cluster, it never bootstraps a brand-new one (that's what `RemoteCluster` is for).
 - **`credentialsRef.key`** — if omitted, the controller tries a few common key names
   automatically (`privateKey`, `id_rsa`, `ssh-privatekey`, `password`, `key`).
+
+---
+
+### 5.4 `NodeProvision` on Google Cloud (GCP)
+
+`provider: GCP` creates a Compute Engine (GCE) VM, bootstraps it with a startup script (the same
+bootstrap the AWS path renders into cloud-init: CRI-O, the cnlab-runtime, kubeadm packages,
+WireGuard when a VPN is used, and `kubeadm join` with a reachability wait and retries) and joins it
+to the cluster. The lifecycle mirrors AWS: `Validating` → (`ConfiguringVPN`) → `CreatingInstance` →
+`WaitingForInstance` → `Bootstrapping` → `RegisteringNode` → (`PrePullingImages`) → `Ready`.
+
+**Prerequisites**
+
+- A GCP project with the **Compute Engine API** enabled (`gcloud services enable compute.googleapis.com`).
+- A **service account** the controller uses, with a JSON key. It needs the permissions of
+  `roles/compute.instanceAdmin.v1` (instances, disks, images, zone/machine/accelerator lookups) and
+  `roles/compute.securityAdmin` (per-node firewall rules; optional, see "Firewall rules" below).
+  Attaching a service account to the VM (`gcpConfig.serviceAccountEmail`) additionally needs
+  `roles/iam.serviceAccountUser` on that account. On a Shared VPC add `roles/compute.networkUser` on
+  the subnetwork and let the controller create firewall rules in the host project.
+- A VPC network. The default is the `default` network; if your project has no `default` network (or it
+  is custom-mode) set `gcpConfig.network` and `gcpConfig.subnetwork`.
+- **Quota** for the machine type (and GPUs) in the region.
+- An organisation policy that **enforces OS Login** (`compute.requireOsLogin`) is not supported: the
+  controller logs in with an SSH key from instance metadata, which OS Login ignores.
+
+**Secret format** — the service-account key JSON, under `credentials.json` (or `serviceAccountKey`;
+or any key named in `credentialsRef.key`). Only `"type": "service_account"` keys are accepted. The
+Secret must live in the NodeProvision's namespace. There is no MFA/STS equivalent: the Google client
+libraries renew OAuth2 tokens from the key themselves.
+
+```bash
+kubectl create secret generic gcp-node-credentials -n default \
+  --from-file=credentials.json=./sa-key.json
+```
+
+**Location** — `spec.gcpConfig.zone` (e.g. `us-central1-a`) is authoritative. `spec.region` is
+optional and, when both are set, must be the zone's region. With only `region`, the controller picks
+the first `UP` zone of that region that offers the machine type (and GPU) and records it in
+`gcpConfig.zone`. The machine type is the top-level `spec.instanceType`
+(`nodeLabel: cpu` → `e2-standard-4`; `nodeLabel: gpu` → `n1-standard-8` + one `nvidia-tesla-t4`).
+Resolved defaults (project from the key, zone, network, boot image — latest Ubuntu 22.04 LTS from
+`ubuntu-os-cloud`) are patched into the spec on the first pass; values you set are never overwritten.
+
+**With a VPN** (the default; the cluster runs WireGuard):
+
+```yaml
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: gcp-node-001            # must be a valid GCE instance name (it becomes the instance + node name)
+  namespace: default
+spec:
+  provider: GCP
+  role: worker
+  nodeLabel: cpu
+  region: us-central1           # or set gcpConfig.zone instead
+  credentialsRef:
+    name: gcp-node-credentials
+  # gcpConfig is optional — everything below is auto-populated when omitted:
+  # gcpConfig:
+  #   projectId: my-project
+  #   zone: us-central1-a
+  #   network: default
+  #   subnetwork: default
+  #   bootDiskSizeGB: 100
+  #   bootDiskType: pd-ssd
+  #   labels: {team: ml}
+  #   networkTags: [ml-nodes]
+  #   spot: false
+```
+
+The controller registers a WireGuard peer on the VPN server before the VM boots; the node reaches the
+control plane over `wg0` and its kubelet node IP is the tunnel IP.
+
+**Without a VPN** (`disableVPN: true` on the control-plane `RemoteCluster`, inherited by the node):
+
+```yaml
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: gcp-node-002
+  namespace: default
+spec:
+  provider: GCP
+  role: worker
+  nodeLabel: gpu                # n1-standard-8 + 1x nvidia-tesla-t4
+  hardwareType: gpu
+  gcpConfig:
+    zone: europe-west4-a
+    firewallSourceRanges: ["172.20.0.0/16"]   # the control plane / controller (default: RFC1918)
+  credentialsRef:
+    name: gcp-node-credentials
+```
+
+No VPN server is contacted. The kubelet node IP is the VM's **internal** IP (read from the GCE
+metadata server), so the control plane must be able to route to it (same VPC, VPC peering, Cloud
+VPN/Interconnect), and the control plane's API endpoint must be reachable from the VM.
+
+**GPUs** — N1: `gcpConfig.accelerator: {type: nvidia-tesla-t4, count: 1}`. A2/A3/G2 machine types
+(`a2-highgpu-1g`, `g2-standard-8`, …) include their GPUs: leave `accelerator` unset. GPU VMs use
+`onHostMaintenance: TERMINATE`. As on AWS, the bootstrap installs no NVIDIA software: the GPU Operator
+owns the driver, container toolkit and CDI (leave Secure Boot off, the default, so its driver loads).
+
+**Firewall rules** — created per node, targeted at the node's own network tag, named
+`np-<instance>-<wg|ssh|mgmt>`, and deleted with the node:
+
+| Mode | Rule | Allows |
+|---|---|---|
+| VPN | `wg` | UDP `vpnPort` (default 51820) **from the VPN server's IP only** |
+| VPN | `ssh` (only if `firewallSourceRanges` is set) | TCP 22 from those ranges — with a VPN, SSH travels inside the tunnel |
+| no VPN | `mgmt` | TCP 22, TCP 10250 (kubelet), UDP 8472 (flannel VXLAN) and ICMP from `firewallSourceRanges` (default RFC1918) |
+
+If the service account may not create firewall rules the controller logs a warning and carries on
+(rules managed centrally); pre-create equivalent rules in that case.
+
+**What is created and deleted** — the instance (boot disk auto-deleted), the firewall rules above, the
+VPN peer (VPN mode) and the `<name>-ssh-key` Secret (the generated private key; its public half is
+injected through the instance's `ssh-keys` metadata for user `ubuntu`, or `sshUsernameOverride`).
+`status.instanceId` is the GCE instance name. A relaunch after a controller crash adopts the existing
+instance (matched by name **and** the `nodeprovision-uid` label) instead of creating a second one; an
+instance of the same name that belongs to something else is never adopted or deleted.
+
+**Notes**
+
+- The startup script (which embeds the registry token and, in VPN mode, the WireGuard private key) is
+  stored in instance metadata and is readable by anyone with `compute.instances.get` on the project —
+  the same exposure as EC2 user-data. Restrict that permission; the node needs no service account.
+- Pods can reach the GCE metadata server unless you block `169.254.169.254` with a NetworkPolicy.
+- Spot VMs (`spot: true`) are deleted when preempted; the NodeProvision then fails and retries.
+- `disableExternalIP: true` creates the VM without a public address; give it Cloud NAT for package
+  downloads (and, with a VPN, to reach the VPN server).
 
 ---
 
@@ -762,7 +1021,18 @@ INFO  RemoteCluster cleanup complete
 | GitOps platform resources not appearing / stuck | The platform hasn't synced the new cluster's repository yet, or a stale resource exists from a previous attempt | Check your Nephio/Porch resources; delete stale ones to force re-creation |
 | Login page works after cluster is Ready, but auth fails | The identity provider's Service selector doesn't match its pod labels | Patch the Service's selector to match (see your platform's docs) |
 | A `NodeProvision` never advances past `RegisteringNode` | Node isn't visible yet — kubelet failed to register, or its VPN IP doesn't match any Node's address | SSH into the node, check the Kubernetes agent status, and check the VPN peer list on both the node and VPN server |
-| `not yet implemented` error for a GCP/Azure `provider` | Only `AWS` and `OnPrem` are supported today | Use `AWS` or `OnPrem` |
+| `VPNModeMismatch` condition on a `RemoteCluster` worker (or a `NodeProvision` failed with "spec.disableVPN is set but ... runs with the VPN") | The node's VPN mode differs from its cluster's | See [§7.5](#75-operational-notes): make the worker's `disableVPN` match the control-plane (usually just unset it) |
+| `VPNModeChangeIgnored` condition | `spec.disableVPN` was edited after the node was provisioned | Nothing breaks; the provisioned mode is kept. Revert the edit, or delete and re-create the node to change its mode |
+| `WorkerFinalizeFailed` condition on a worker `RemoteCluster` | The worker joined, but recording its Ready status / IP on the control-plane failed (e.g. SSH to the control-plane) | The controller retries automatically; fix SSH reachability to the control-plane (see `status.message`) and wait — no manual reset is needed |
+| SSH fails with a host key error, or `cannot load SSH_KNOWN_HOSTS_FILE` | `SSH_KNOWN_HOSTS_FILE` is set and the host is not listed / the file is unreadable | Add the host's key (of the type it offers) to the file, or fix the mount/path; see [§3.3](#33-permissions) |
+| `NodeProvision` failed with "namespace ... has N NodeProvisionNetConfigs ... does not set spec.clusterName" (or "N NodeProvisionNetConfigs ... have spec.clusterName ...") | Several clusters share a namespace and the node does not say which one it joins (or two NetConfigs claim the same `clusterName`) | Set `spec.clusterName` on the `NodeProvision` to the cluster's `clusterName`; make each `NodeProvisionNetConfig.spec.clusterName` unique ([§5.2](#52-nodeprovisionnetconfig--shared-cluster-settings)). The retry budget is not consumed |
+| `no NodeProvisionNetConfig with spec.clusterName "x"` in the controller log | The `NodeProvision`'s `spec.clusterName` matches no NetConfig (typo, or the cluster's NetConfig is not synced yet) | Fix the name, or wait for the `RemoteCluster` sync; the node requeues |
+| `InvalidInsecureRegistries` / `insecureRegistries[i]: ... is not a valid registry host[:port]` | An `insecureRegistries` entry has a scheme, path, spaces, quotes, or a bad port | Use bare `host` or `host:port` ([§5.2](#52-nodeprovisionnetconfig--shared-cluster-settings)) |
+| Pull fails with `server gave HTTP response to HTTPS client` on a node | The registry is plain HTTP but is not in `insecureRegistries` / `imagePrepulls`, or the node was provisioned before it was added, or CRI-O was not restarted | Add it to `insecureRegistries`; on existing nodes apply the one-time drop-in + `systemctl restart crio` from [§5.2](#52-nodeprovisionnetconfig--shared-cluster-settings) |
+| `not yet implemented` error for an Azure `provider` | Only `AWS`, `GCP` and `OnPrem` are supported today | Use one of those |
+| GCP: `permission denied` / `GCP quota exceeded` / `no capacity` in `status.message` | The service account lacks a role or the Compute Engine API is off; the project quota for the machine type/GPU is used up; or the zone has no capacity | Grant the roles in [§5.4](#54-nodeprovision-on-google-cloud-gcp), enable the API, raise the quota, or set another `gcpConfig.zone` |
+| GCP: `instance ... belongs to something else` / name already in use | An instance with the NodeProvision's name exists in the zone but was not created for it | Rename the NodeProvision or delete the stray instance; the controller never adopts or deletes it |
+| GCP node stuck in `Bootstrapping`, or `Joining` never completes | The startup script failed, or (no VPN) the control plane cannot route to the VM's internal IP | `gcloud compute instances get-serial-port-output <name> --zone <zone>` and `sudo journalctl -u google-startup-scripts`; the log is `/var/log/node-bootstrap.log` |
 
 ### 7.4 Debugging / diagnostic commands
 
@@ -786,6 +1056,73 @@ ssh ubuntu@<cp-ip> 'sudo tail -50 /var/log/node-provision.log'
 ssh ubuntu@<cp-ip> 'sudo crictl info'
 ssh ubuntu@<cp-ip> 'wg show wg0'
 ```
+
+### 7.5 Operational notes
+
+**VPN mode conditions (`RemoteCluster.status.conditions`)**
+
+- **`VPNModeMismatch`** — a worker's VPN mode disagrees with its control-plane's (the whole cluster
+  must use one mode). An *unprovisioned* worker that sets `disableVPN: true` under a VPN
+  control-plane is failed **without consuming a retry**; edit the worker to remove `disableVPN`
+  (or change the control-plane) and it proceeds. A worker that is *already provisioned* is left
+  untouched and re-checked every minute; re-provision the worker or the control-plane to make
+  them agree. A `NodeProvision` in the same situation is set to `Failed` with the explanation in
+  `status.message` (this one does count as a failure; reset `provisionRetryCount` after fixing the
+  spec, see [§7.3](#73-common-errors--how-to-resolve-them)).
+- **`VPNModeChangeIgnored`** — `spec.disableVPN` was changed on a node that is already
+  provisioned. The mode the node was provisioned with (annotation
+  `infra.dcn.ssu.ac.kr/provisioned-vpn-mode`, `vpn` or `novpn`) is authoritative and is what
+  teardown uses; the edit is ignored. The condition clears when the spec matches again.
+- **`WorkerFinalizeFailed`** — the worker has joined, but the follow-up bookkeeping (Ready status
+  and its VPN/node IP entry on the control-plane) could not be completed. It is retried
+  automatically and the pending IP is remembered in an annotation, so nothing is lost; resolve
+  whatever the message says (typically SSH access to the control-plane).
+
+**SSH host keys** — opt-in via `SSH_KNOWN_HOSTS_FILE`, fails closed for unlisted hosts; see
+[§3.3](#33-permissions).
+
+**AWS nodes**
+
+- Instances are launched with **IMDSv2 required** (`HttpTokens: required`); IMDSv1 requests are
+  rejected. The bootstrap script already uses IMDSv2 tokens; any other tooling on the node must too.
+- The default IMDS hop limit (1) is kept, so the metadata service is **unreachable from containers/pods**
+  on those nodes; workloads that need instance credentials must use another mechanism.
+- Every instance (and its root volume) is tagged **`ml.dcn.ssu.ac.kr/nodeprovision-uid`** with the
+  owning `NodeProvision`'s UID. The controller uses the tag to adopt or clean up an instance whose
+  ID never reached `status` (for example a crash right after launch); do not remove or edit it.
+  Launches are idempotent within one provisioning attempt (the EC2 client token combines the UID
+  with `status.provisionRetryCount`), so a repeated launch call does not create a second instance;
+  each retry after a failure terminates the old instance first and launches a fresh one.
+
+**Failure, retry and deletion behaviour**
+
+- **`NodeProvision` retries.** Before each retry of a failed AWS node the controller removes the
+  joined Node, terminates the instance and releases its VPN peer, then clears the identity fields
+  in `status`; if termination fails it waits and retries rather than resetting. An on-prem node that
+  already registered in the cluster is left alone and provisioning resumes at the join step.
+- **Terminal `Failed`.** When `provisionRetryCount` reaches the limit, AWS resources are released once
+  (instance, Node, VPN peer; the status message gains `[resources released]`) so nothing keeps
+  billing. Patching `status.provisionRetryCount` to 0 starts a fresh attempt. An already-registered
+  on-prem node and its peer are deliberately not touched.
+- **`NodeProvision` deletion.** The on-prem node reset runs once (annotation
+  `ml.dcn.ssu.ac.kr/node-reset-done`). A failing VPN peer cleanup keeps the finalizer and is retried
+  every 30 s; after 10 minutes it gives up loudly so an unreachable VPN server cannot block deletion.
+- **`RemoteCluster` deletion.** Node drain/reset run once (annotation
+  `infra.dcn.ssu.ac.kr/delete-node-cleanup-done`). Only deleting the **control-plane** removes the
+  cluster's Porch repositories, Nephio tokens and PackageVariants; deleting a worker never does.
+- **PackageVariants with several clusters.** Existing names (for example `harbor-variant`) are kept for
+  the cluster that owns them. A second control-plane with a different `spec.clusterName` gets
+  `<name>-<clusterName>` variants in the same namespace instead of failing; two control-planes with
+  the *same* `clusterName` still share their objects.
+- **Bootstrap token.** The control-plane reschedules itself to refresh the kubeadm bootstrap token
+  before it expires; a token that is overdue is retried after one minute.
+- **Redaction.** Secrets are redacted from `status.message` and logs (tokens, private keys, and values
+  after `password`/`secret`/`token`/`key` style keys). Because the rule is deliberately broad, a
+  diagnostic such as `secret: <word>` may lose the word that follows it.
+
+**Controller image** — the published image is **no longer obfuscated**. Obfuscation (garble)
+is opt-in at build time with `--build-arg OBFUSCATE=true` (or the `OBFUSCATE` repository variable
+for the publish workflow) and makes crash traces much harder to read.
 
 ---
 
@@ -926,12 +1263,14 @@ metrics endpoint on the controller Deployment.
 | `nodeInfo.softwareConfig.kubernetesVersion` | string | e.g. `v1.34.2` |
 | `nodeInfo.softwareConfig.imagePrepulls[]` | `{image, nodeTarget}` | `nodeTarget` is `gpu` or `all` (default `all`) |
 | `nodeInfo.softwareConfig.imagePullSecretRef` | secret ref | optional |
+| `nodeInfo.softwareConfig.insecureRegistries[]` | string | optional; registries (`host[:port]`) reached over plain HTTP / untrusted TLS. `imagePrepulls` hosts are also marked insecure (see [§5.2](#52-nodeprovisionnetconfig--shared-cluster-settings)) |
 | `nodeInfo.softwareConfig.cnlabRuntime` | object | optional; sensible defaults if omitted |
 | `nodeInfo.softwareConfig.platformVariables[]` | `{key, value}` | optional; passed through to the GitOps platform stack |
 | `auth.sshPrivateKeySecretRef` / `auth.passwordSecretRef` | secret ref | exactly one; auto-detects key vs. password auth |
 | `vpnConfig.ip` | string | this node's VPN IP; preferred over `host` once set |
 | `vpnConfig.vpnServerPublicIP` / `vpnServerSSHPort` / `vpnServerSSHUsername` | string | VPN server SSH connection details |
 | `vpnConfig.vpnSshCredentialsRef` | secret ref | Secret with the VPN server's SSH credential |
+| `disableVPN` | bool | default `false`; run the whole cluster without WireGuard (see [§5.1](#51-remotecluster--createmanage-a-cluster-from-the-management-cluster)); set it on the control-plane, workers inherit it. `vpnConfig` is ignored when `true` |
 | `gitConfig.enable` | string | `"true"`/`"false"` — gates GitOps platform deployment |
 | `gitConfig.gitServer` / `gitUsername` / `upstreamPlatformRepo` / `packageRevision` | string | GitOps source details |
 
@@ -952,26 +1291,29 @@ metrics endpoint on the controller Deployment.
 
 | Field | Type | Notes |
 |---|---|---|
-| `provider` | string | `OnPrem` \| `AWS` (`GCP`/`Azure` are not implemented yet) |
+| `provider` | string | `OnPrem` \| `AWS` \| `GCP` (`Azure` is not implemented yet) |
+| `clusterName` | string | which `NodeProvisionNetConfig` (`spec.clusterName` equal) the node uses. Optional only while the namespace has exactly one NetConfig; required (no guessing) when it has several |
 | `role` | string | always `worker` in practice |
 | `hardwareType` | string | `gpu`/`cpu` (or empty) — filters which images get pre-pulled |
 | `nodeLabel` | string | drives AWS default instance-type resolution (`cpu`→`t3.xlarge`, `gpu`→`p3.2xlarge`) |
-| `region` | string | AWS region |
-| `instanceType` | string | overrides the `nodeLabel` lookup |
+| `region` | string | AWS region, or GCP region (optional when `gcpConfig.zone` is set) |
+| `instanceType` | string | overrides the `nodeLabel` lookup; the GCE machine type for GCP |
 | `hostname` / `ipAddress` | string | on-prem target; `ipAddress` takes priority if both set |
 | `sshPort` | int | default `22` |
 | `sshUsernameOverride` | string | |
 | `credentialsRef` | secret ref | key auto-detected if omitted |
+| `disableVPN` | bool | default `false`; join the node without WireGuard. Normally **inherited** from the cluster (`RemoteCluster` control-plane → `NodeProvisionNetConfig` → `NodeProvision`); setting `true` against a VPN cluster fails the provision. Set at creation; not changeable afterwards (see [§5.3](#53-nodeprovision--add-a-node-from-the-remote-cluster), [§7.5](#75-operational-notes)) |
 | `awsConfig` | object | `vpcId`, `subnetId`, `securityGroupIds[]`, `ami`, `keyPairName`, `iamInstanceProfile`, `tags{}`, `rootVolumeSizeGB` — all auto-resolved if omitted |
+| `gcpConfig` | object | `projectId`, `zone`, `network`, `subnetwork`, `sourceImage` / `imageFamily` / `imageProject`, `bootDiskSizeGB`, `bootDiskType`, `labels{}`, `networkTags[]`, `serviceAccountEmail`, `serviceAccountScopes[]`, `accelerator{type,count}`, `spot`, `disableExternalIP`, `firewallSourceRanges[]` — all optional, auto-resolved if omitted (see [§5.4](#54-nodeprovision-on-google-cloud-gcp)) |
 
 **Status:**
 
 | Field | Meaning |
 |---|---|
-| `phase` | See [§2.3](#23-nodeprovision-what-happens-phase-by-phase) |
+| `phase` | `Pending`, `Validating`, `Provisioning`, `CreatingInstance` and `WaitingForInstance` (AWS, GCP), `ConfiguringVPN` (skipped when the VPN is disabled), `Bootstrapping`, `Joining`, `RegisteringNode`, `VerifyingHealth`, `PrePullingImages`, `Ready`, `Failed`, `Deleting`; the order differs by provider — see [§2.3](#23-nodeprovision-what-happens-phase-by-phase) |
 | `message` | Human-readable status |
-| `instanceId` / `hostname` / `ipAddress` | Identity |
-| `publicIp` / `privateIp` | AWS-only |
+| `instanceId` / `hostname` / `ipAddress` | Identity (`instanceId` is the instance name on GCP) |
+| `publicIp` / `privateIp` | AWS and GCP (the instance's external / internal address) |
 | `vpnIp` | VPN IP allocated for this node |
 | `progress` | 0–100 |
 | `nodeName` | Kubernetes node name once registered |
@@ -984,15 +1326,17 @@ metrics endpoint on the controller Deployment.
 
 | Field | Type | Notes |
 |---|---|---|
-| `clusterName` | string | |
-| `vpnRange` | string | CIDR, e.g. `10.9.0.0/24` |
-| `vpnServerPublicConfig.publicIP` | string | |
+| `clusterName` | string | the cluster this config belongs to; selected by `NodeProvision.spec.clusterName`. Must be unique among the NetConfigs of a namespace when several clusters share it |
+| `disableVPN` | bool | default `false`; marks the whole cluster as running without WireGuard. Published by the control-plane `RemoteCluster`; inherited by every `NodeProvision`; `vpnRange`/`vpnServerPublicConfig` are then unused |
+| `vpnRange` | string | CIDR, e.g. `10.9.0.0/24` (only when `disableVPN` is `false`) |
+| `vpnServerPublicConfig.publicIP` | string | only used when `disableVPN` is `false` |
 | `vpnServerPublicConfig.sshPort` / `sshUsername` | string | defaults `22` / `ubuntu` |
 | `vpnServerPublicConfig.vpnPort` | string | default `51820` |
 | `vpnServerPublicConfig.vpnSshCredentialsRef` | secret ref | |
 | `softwareConfig.kubernetesVersion` | string | |
 | `softwareConfig.imagePrepulls[]` | `{image, nodeTarget}` | |
 | `softwareConfig.imagePullSecretRef` | secret ref | |
+| `softwareConfig.insecureRegistries[]` | string | registries (`host[:port]`) served over plain HTTP / untrusted TLS; merged with the `imagePrepulls` hosts (see [§5.2](#52-nodeprovisionnetconfig--shared-cluster-settings)) |
 | `softwareConfig.cnlabRuntime` | object | same shape/defaults as `RemoteCluster`'s |
 
 **Status:**
@@ -1005,7 +1349,7 @@ metrics endpoint on the controller Deployment.
 | `vpnPeers[]` | `{nodeName, publicKey, vpnIP}` |
 | `kubeconfig` | Base64 admin kubeconfig for this cluster |
 
-> **Not supported today** (shown in some sample files, but silently ignored):
+> **Not fields of this resource** (older examples showed them; the API server rejects them):
 > `softwareConfig.nvidiaDriverVersion`, `softwareConfig.nvidiaContainerToolkitVersion`,
 > `softwareConfig.k8sDevicePluginVersion`.
 
@@ -1032,7 +1376,12 @@ metrics endpoint on the controller Deployment.
 
 | Path | Contents |
 |---|---|
-| `config/samples/` | Example `RemoteCluster`/`NodeProvision`/`NodeProvisionNetConfig` resources — see [§6](#6-examples) |
+| `config/samples/` | Example `RemoteCluster`/`NodeProvision`/`NodeProvisionNetConfig` resources — see [§6](#6-examples) and the table below |
+| `config/samples/infra_v1_remotecluster_vpn.yaml` | Complete cluster **with** WireGuard: CPU control-plane, GPU worker, CPU worker, their Secrets, `insecureRegistries`, `imagePrepulls`, `cnlabRuntime` |
+| `config/samples/infra_v1_remotecluster_novpn.yaml` | Complete cluster **without** a VPN (`disableVPN: true`): a GPU control-plane that also runs GPU workloads, a GPU worker and a CPU worker |
+| `config/samples/infra_v1_remotecluster.yaml` | Minimal VPN-less control-plane (the quick-start sample) |
+| `config/samples/infra_v1_remotecluster_cnlab_runtime.yaml` | Fully annotated control-plane + worker with `platformVariables` and GitOps (contains example credentials — replace them) |
+| `config/samples/ml_v1alpha1_nodeprovision*.yaml` | `NodeProvision` samples for on-prem, AWS and GCP (set `spec.clusterName` when a namespace holds more than one cluster) |
 | `docs/wireguard-setup-bundle/WIREGUARD_SETUP.md` | WireGuard VPN server/client setup guide |
 | `README.md` | Top-level project overview |
 

@@ -35,10 +35,11 @@ spec:
 
       containers:
         - name: manager
-          # Replace <ORG> with your GitHub organisation / username.
-          # The workflow publishes to ghcr.io/<github.repository> (e.g. ghcr.io/vitu/remote-cluster-provisioner).
-          image: ghcr.io/<ORG>/remote-cluster-provisioner:latest
-          imagePullPolicy: Always
+          # Placeholder image name: the real repository and tag are set through the
+          # `images:` entry in kustomization.yaml (see the comment there). The
+          # workflow publishes to ghcr.io/<github.repository>.
+          image: ghcr.io/<ORG>/remote-cluster-provisioner
+          imagePullPolicy: IfNotPresent
           command: [/manager]
           args:
             - --leader-elect
@@ -85,20 +86,39 @@ spec:
               memory: 256Mi
 
           env:
-            # Inject namespace so the controller can scope leader-election leases.
+            # Informational: namespace of the controller pod (currently unused by the
+            # manager, which derives its namespace from the in-cluster service account).
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # OPTIONAL - SSH host key verification (off by default: without this
+            # variable the controller accepts any SSH host key and logs a warning).
+            # When set, verification FAILS CLOSED: every host the controller connects
+            # to (on-prem nodes, the VPN server, control planes) must be listed in
+            # the file BEFORE its resource is created, and only the key types listed
+            # for a host are negotiated. An unreadable file fails every connection.
+            # Create the file with `ssh-keyscan -t ed25519,ecdsa,rsa <host>` and:
+            #   kubectl -n remote-cluster-provisioner-system create configmap \
+            #     ssh-known-hosts --from-file=known_hosts=./known_hosts
+            # then uncomment this variable plus the volume/volumeMount below.
+            # - name: SSH_KNOWN_HOSTS_FILE
+            #   value: /etc/ssh-known-hosts/known_hosts
 
           # The distroless image has no /tmp; mount one for scratch space if needed.
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            # - name: ssh-known-hosts        # see SSH_KNOWN_HOSTS_FILE above
+            #   mountPath: /etc/ssh-known-hosts
+            #   readOnly: true
 
       volumes:
         - name: tmp
           emptyDir: {}
+        # - name: ssh-known-hosts        # see SSH_KNOWN_HOSTS_FILE above
+        #   configMap:
+        #     name: ssh-known-hosts
 
       # Keep the controller on control-plane nodes by preference, but allow any node.
       affinity:

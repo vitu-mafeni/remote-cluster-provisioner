@@ -2,55 +2,108 @@ package runtime
 
 import (
 	"fmt"
-	"strings"
+	"regexp"
+
+	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
+
+var (
+	registryRE   = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
+	repositoryRE = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$`)
+	versionTagRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._+-]{0,127}$`)
+	orasVersion  = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.]+)?$`)
+)
+
+// Validate checks (after defaults are applied) that every value interpolated
+// into install scripts has a strict, injection-free shape. The scripts also
+// shell-quote every value, so this is defence in depth that additionally turns
+// typos into a clear error instead of a broken pull.
+func (c Config) Validate() error {
+	c.ApplyDefaults()
+	if !registryRE.MatchString(c.Registry) {
+		return fmt.Errorf("runtime registry %q is not a valid registry host[:port]", c.Registry)
+	}
+	if !repositoryRE.MatchString(c.Repository) {
+		return fmt.Errorf("runtime repository %q is not a valid OCI repository name", c.Repository)
+	}
+	if !versionTagRE.MatchString(c.Version) {
+		return fmt.Errorf("runtime version %q is not a valid OCI tag", c.Version)
+	}
+	if !orasVersion.MatchString(c.OrasVersion) {
+		return fmt.Errorf("ORAS version %q is not a valid version", c.OrasVersion)
+	}
+	return nil
+}
 
 // InstallSteps returns an ordered list of shell commands for SSH-based
 // provisioners (each executed via sshhelper.Run in its own SSH session).
 //
-// Security: cfg.Token is embedded in the second step's command string.
-// SSH exec does not write to bash history; the token is not logged by the
-// caller because runPhases only logs phase names, not individual commands.
+// Security: cfg.Token is embedded (shell-quoted) in the second step's command
+// string. SSH exec does not write to bash history, and callers must never
+// include a step's command text in errors or logs (see sshhelper.StepError,
+// which reports only the step label and scrubbed output).
 func InstallSteps(cfg Config) []string {
 	cfg.ApplyDefaults()
 	return []string{
 		installOrasCmd(cfg),
 		installRuntimeCmd(cfg),
 		configureDropInsCmd(),
+		CNIPluginsInstallScript(),
 	}
 }
+
+// orasInstallSnippet returns bash that installs ORAS (idempotent) with the
+// release tarball verified against the release's published sha256 checksums
+// file. It fails closed: a missing/mismatching checksum aborts the install.
+// Expects ORAS_VER and ARCH to be set. Commands use sudo (a no-op wrapper on
+// cloud-init, which runs as root).
+const orasInstallSnippet = `INSTALLED=$(oras version 2>/dev/null | awk '/Version:/{print $2}' | head -1 || true)
+if [ "$INSTALLED" = "$ORAS_VER" ]; then
+  echo "[cnlab-runtime] ORAS $ORAS_VER already installed"
+else
+  ORAS_TMP=$(mktemp -d)
+  ORAS_TARBALL="oras_${ORAS_VER}_linux_${ARCH}.tar.gz"
+  ORAS_BASE="https://github.com/oras-project/oras/releases/download/v${ORAS_VER}"
+  curl -fsSL "${ORAS_BASE}/${ORAS_TARBALL}" -o "${ORAS_TMP}/${ORAS_TARBALL}"
+  curl -fsSL "${ORAS_BASE}/oras_${ORAS_VER}_checksums.txt" -o "${ORAS_TMP}/checksums.txt"
+  ( cd "$ORAS_TMP" && grep -F "  ${ORAS_TARBALL}" checksums.txt > expected.sha256 && [ -s expected.sha256 ] && sha256sum -c expected.sha256 ) || {
+    echo "[cnlab-runtime] ORAS tarball checksum verification FAILED" >&2
+    rm -rf "$ORAS_TMP"
+    exit 1
+  }
+  mkdir -p "${ORAS_TMP}/x"
+  tar -xzf "${ORAS_TMP}/${ORAS_TARBALL}" -C "${ORAS_TMP}/x"
+  sudo install -m 0755 "${ORAS_TMP}/x/oras" /usr/local/bin/oras
+  rm -rf "$ORAS_TMP"
+  echo "[cnlab-runtime] ORAS $ORAS_VER installed"
+fi
+oras version`
 
 // InstallScript returns a single bash block for embedding in a cloud-init
 // template. It references $CNLAB_REGISTRY_USER and $CNLAB_REGISTRY_TOKEN
 // which must be exported by the caller before this block runs.
 func InstallScript(cfg Config) string {
 	cfg.ApplyDefaults()
-	return fmt.Sprintf(`
+	cnlabInstall := fmt.Sprintf(`
 # -----------------------------------------------------------------------------
 # cnlab-runtime OCI artifact install
 # -----------------------------------------------------------------------------
-report "Installing cnlab-runtime %[2]s via ORAS"
-CNLAB_REF='%[1]s'
-CNLAB_VERSION='%[2]s'
-CNLAB_REGISTRY='%[3]s'
-CNLAB_ORAS_VER='%[4]s'
+CNLAB_REF=%[1]s
+CNLAB_VERSION=%[2]s
+CNLAB_REGISTRY=%[3]s
+CNLAB_ORAS_VER=%[4]s
+report "Installing cnlab-runtime ${CNLAB_VERSION} via ORAS"
 CNLAB_ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 case "$CNLAB_ARCH" in
   amd64|arm64) ;;
   *) echo "[cnlab-runtime] unsupported architecture: $CNLAB_ARCH" >&2; exit 1 ;;
 esac
 
-# Install ORAS (idempotent)
-CNLAB_ORAS_INSTALLED=$(oras version 2>/dev/null | awk '/Version:/{print $2}' | head -1 || true)
-if [ "$CNLAB_ORAS_INSTALLED" != "$CNLAB_ORAS_VER" ]; then
-  curl -fsSL "https://github.com/oras-project/oras/releases/download/v${CNLAB_ORAS_VER}/oras_${CNLAB_ORAS_VER}_linux_${CNLAB_ARCH}.tar.gz" -o /tmp/oras.tar.gz
-  sudo mkdir -p /tmp/oras-install
-  sudo tar -xzf /tmp/oras.tar.gz -C /tmp/oras-install
-  sudo install -m 0755 /tmp/oras-install/oras /usr/local/bin/oras
-  sudo rm -rf /tmp/oras.tar.gz /tmp/oras-install
-  report "ORAS $CNLAB_ORAS_VER installed"
-fi
-oras version
+# Install ORAS (idempotent, checksum-verified)
+ORAS_VER="$CNLAB_ORAS_VER"
+ARCH="$CNLAB_ARCH"
+%[5]s
+report "ORAS $CNLAB_ORAS_VER ready"
 
 # Idempotency: skip if already at the requested version AND crio binary is present.
 # Checking only the version is insufficient: dpkg --remove keeps config files
@@ -62,27 +115,37 @@ if echo "$CNLAB_HAVE" | grep -qF "$CNLAB_VERSION" && command -v crio >/dev/null 
 else
   # cloud-init runs without a user environment; oras needs $HOME for its config store.
   export HOME="${HOME:-/root}"
+  # Registry credentials live only in a private (0700) temp directory that is
+  # removed on every exit path (success, failure, signal) so the token never
+  # lingers in ~/.docker/config.json. The auth FILE is a path inside it that
+  # does not exist yet: oras creates it on login, and would reject an existing
+  # empty file ("invalid config format").
+  CNLAB_AUTH_DIR=$(mktemp -d)
+  trap 'rm -rf "$CNLAB_AUTH_DIR"' EXIT
+  CNLAB_AUTH_ARGS=(--registry-config "$CNLAB_AUTH_DIR/config.json")
   # Login only when credentials are provided; omit for public registries.
   if [ -n "${CNLAB_REGISTRY_TOKEN:-}" ]; then
-    printf '%%s' "$CNLAB_REGISTRY_TOKEN" | oras login "$CNLAB_REGISTRY" \
+    printf '%%s' "$CNLAB_REGISTRY_TOKEN" | oras login "$CNLAB_REGISTRY" "${CNLAB_AUTH_ARGS[@]}" \
       --username "$CNLAB_REGISTRY_USER" --password-stdin
   fi
-  rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
-  mkdir -p /tmp/cnlab-runtime
-  oras pull "$CNLAB_REF" -o /tmp/cnlab-runtime
-  if [ -n "${CNLAB_REGISTRY_TOKEN:-}" ]; then
-    oras logout "$CNLAB_REGISTRY" 2>/dev/null || true
-  fi
-  (cd /tmp/cnlab-runtime/artifact && sha256sum -c SHA256SUMS) || {
+  CNLAB_WORK="${TMPDIR:-/tmp}/cnlab-runtime"
+  rm -rf "$CNLAB_WORK"
+  mkdir -p "$CNLAB_WORK"
+  oras pull "${CNLAB_AUTH_ARGS[@]}" "$CNLAB_REF" -o "$CNLAB_WORK"
+  rm -rf "$CNLAB_AUTH_DIR"
+  trap - EXIT
+  (cd "$CNLAB_WORK/artifact" && sha256sum -c SHA256SUMS) || {
     echo "[cnlab-runtime] checksum verification FAILED" >&2
-    rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
+    rm -rf "$CNLAB_WORK"
     exit 1
   }
-  CNLAB_DEB=$(ls /tmp/cnlab-runtime/artifact/cnlab-runtime_*_${CNLAB_ARCH}.deb 2>/dev/null | head -1)
+  # "|| true": with pipefail a no-match ls would abort the script (set -e) before
+  # the friendly error below could be printed.
+  CNLAB_DEB=$(ls "$CNLAB_WORK"/artifact/cnlab-runtime_*_${CNLAB_ARCH}.deb 2>/dev/null | head -1 || true)
   if [ -z "$CNLAB_DEB" ]; then
     echo "[cnlab-runtime] no .deb found in pulled artifact" >&2
-    ls /tmp/cnlab-runtime/artifact/ >&2 || true
-    rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
+    ls "$CNLAB_WORK/artifact/" >&2 || true
+    rm -rf "$CNLAB_WORK"
     exit 1
   fi
   echo "[cnlab-runtime] installing $CNLAB_DEB"
@@ -90,57 +153,46 @@ else
   DEBIAN_FRONTEND=noninteractive apt-get install -f -y
   rm -f /var/cache/apt/archives/cnlab-runtime_*.deb
   cnlab-runtime version
-  rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
+  rm -rf "$CNLAB_WORK"
   report "cnlab-runtime $CNLAB_VERSION installed"
 fi
-`, cfg.ImageRef(), cfg.Version, cfg.Registry, cfg.OrasVersion)
+`, sshhelper.ShellQuote(cfg.ImageRef()), sshhelper.ShellQuote(cfg.Version),
+		sshhelper.ShellQuote(cfg.Registry), sshhelper.ShellQuote(cfg.OrasVersion), orasInstallSnippet)
+	return cnlabInstall + `
+# -----------------------------------------------------------------------------
+# Standard CNI plugins (portmap is required by flannel's conflist)
+# -----------------------------------------------------------------------------
+` + CNIPluginsInstallScript() + "\n"
 }
 
 // installOrasCmd installs or upgrades ORAS to cfg.OrasVersion.
 func installOrasCmd(cfg Config) string {
 	return fmt.Sprintf(`set -euo pipefail
-ORAS_VER='%s'
-INSTALLED=$(oras version 2>/dev/null | awk '/Version:/{print $2}' | head -1 || true)
-if [ "$INSTALLED" = "$ORAS_VER" ]; then
-  echo "[cnlab-runtime] ORAS $ORAS_VER already installed"
-else
-  ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-  curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VER}/oras_${ORAS_VER}_linux_${ARCH}.tar.gz" -o /tmp/oras.tar.gz
-  sudo mkdir -p /tmp/oras-install
-  sudo tar -xzf /tmp/oras.tar.gz -C /tmp/oras-install
-  sudo install -m 0755 /tmp/oras-install/oras /usr/local/bin/oras
-  sudo rm -rf /tmp/oras.tar.gz /tmp/oras-install
-  echo "[cnlab-runtime] ORAS $ORAS_VER installed"
-fi
-oras version`, cfg.OrasVersion)
+ORAS_VER=%s
+ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+%s`, sshhelper.ShellQuote(cfg.OrasVersion), orasInstallSnippet)
 }
 
 // installRuntimeCmd pulls the cnlab-runtime OCI artifact and installs the deb.
-// When cfg.Token is non-empty it is embedded in the command string for oras login
-// (acceptable; not logged by runPhases). When empty the pull is attempted without
-// authentication, suitable for public registries.
+// When cfg.Token is non-empty it is embedded (shell-quoted) in the command
+// string for oras login; callers must never surface the command text (see
+// InstallSteps). When empty the pull is attempted without authentication,
+// suitable for public registries. Credentials are kept in a private temp auth
+// directory removed on every exit path, never in ~/.docker/config.json.
 func installRuntimeCmd(cfg Config) string {
-	var loginBlock, logoutBlock string
+	var loginBlock string
 	if cfg.Token != "" {
-		// Use %q (Go double-quoted string with escape sequences) to produce a
-		// shell-safe string: double-quoted with backslash escaping of $, `, \, "
-		// so that a token or username containing single quotes, dollar signs, or
-		// backticks cannot break out of the string context and execute code.
 		loginBlock = fmt.Sprintf(
-			"sudo install -m 0600 /dev/null /tmp/.cnlab-reg\n"+
-				"printf '%%s' %s | sudo tee /tmp/.cnlab-reg >/dev/null\n"+
-				"CNLAB_TOKEN=$(sudo cat /tmp/.cnlab-reg)\n"+
-				"sudo rm -f /tmp/.cnlab-reg\n"+
-				"printf '%%s' \"$CNLAB_TOKEN\" | oras login \"$REGISTRY\" --username %s --password-stdin\n"+
+			"CNLAB_TOKEN=%s\n"+
+				"printf '%%s' \"$CNLAB_TOKEN\" | oras login \"$REGISTRY\" \"${AUTH_ARGS[@]}\" --username %s --password-stdin\n"+
 				"unset CNLAB_TOKEN",
-			shellQuote(cfg.Token), shellQuote(cfg.Username))
-		logoutBlock = `oras logout "$REGISTRY" 2>/dev/null || true`
+			sshhelper.ShellQuote(cfg.Token), sshhelper.ShellQuote(cfg.Username))
 	}
 
 	return fmt.Sprintf(`set -euo pipefail
-REF='%[1]s'
-VERSION='%[2]s'
-REGISTRY='%[3]s'
+REF=%[1]s
+VERSION=%[2]s
+REGISTRY=%[3]s
 ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 case "$ARCH" in
   amd64|arm64) ;;
@@ -151,21 +203,29 @@ if echo "$HAVE" | grep -qF "$VERSION"; then
   echo "[cnlab-runtime] version $VERSION already installed, skipping"
   exit 0
 fi
+# Private 0700 dir removed on every exit path; the auth FILE is a path inside it
+# that does not exist yet (oras creates it on login and rejects an existing
+# empty file with "invalid config format").
+AUTH_DIR=$(mktemp -d)
+trap 'rm -rf "$AUTH_DIR"' EXIT
+AUTH_ARGS=(--registry-config "$AUTH_DIR/config.json")
 %[4]s
-rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
-mkdir -p /tmp/cnlab-runtime
-oras pull "$REF" -o /tmp/cnlab-runtime
-%[5]s
-(cd /tmp/cnlab-runtime/artifact && sha256sum -c SHA256SUMS) || {
+WORK="${TMPDIR:-/tmp}/cnlab-runtime"
+rm -rf "$WORK"
+mkdir -p "$WORK"
+oras pull "${AUTH_ARGS[@]}" "$REF" -o "$WORK"
+rm -rf "$AUTH_DIR"
+(cd "$WORK/artifact" && sha256sum -c SHA256SUMS) || {
   echo "[cnlab-runtime] checksum verification FAILED" >&2
-  rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
+  rm -rf "$WORK"
   exit 1
 }
-DEB=$(ls /tmp/cnlab-runtime/artifact/cnlab-runtime_*_${ARCH}.deb 2>/dev/null | head -1)
+# "|| true": under set -e + pipefail a no-match ls would abort before the message.
+DEB=$(ls "$WORK"/artifact/cnlab-runtime_*_${ARCH}.deb 2>/dev/null | head -1 || true)
 if [ -z "$DEB" ]; then
   echo "[cnlab-runtime] no .deb found in pulled artifact" >&2
-  ls /tmp/cnlab-runtime/artifact/ >&2 || true
-  rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
+  ls "$WORK/artifact/" >&2 || true
+  rm -rf "$WORK"
   exit 1
 fi
 echo "[cnlab-runtime] installing $DEB"
@@ -173,9 +233,10 @@ sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite "$DEB" || true
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y
 sudo rm -f /var/cache/apt/archives/cnlab-runtime_*.deb
 cnlab-runtime version
-rm -rf /tmp/cnlab-runtime/artifact /tmp/cnlab-runtime
+rm -rf "$WORK"
 echo "[cnlab-runtime] version $VERSION installed"`,
-		cfg.ImageRef(), cfg.Version, cfg.Registry, loginBlock, logoutBlock)
+		sshhelper.ShellQuote(cfg.ImageRef()), sshhelper.ShellQuote(cfg.Version),
+		sshhelper.ShellQuote(cfg.Registry), loginBlock)
 }
 
 // configureDropInsCmd checks whether each CRI-O / CRIU config file already
@@ -249,22 +310,13 @@ fi
 
 # CRIU runtime configuration
 if [ ! -f /etc/criu/runc.conf ]; then
-  printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\n' \
+  printf 'tcp-close\nskip-in-flight\nlog-file /tmp/criu.log\nghost-limit 100M\nenable-external-masters\nexternal mnt[]\nirmap-scan-path /home/jovyan\nirmap-scan-path /usr\nirmap-scan-path /opt/conda\nirmap-scan-path /opt/remote-dev\nallow-uprobes\n' \
     | sudo tee /etc/criu/runc.conf > /dev/null
 fi
+# Pre-existing runc.conf (older provisioning): make sure allow-uprobes is set.
+grep -qx 'allow-uprobes' /etc/criu/runc.conf || echo 'allow-uprobes' | sudo tee -a /etc/criu/runc.conf > /dev/null
 if [ ! -f /etc/criu/default.conf ]; then
   sudo cp -f /etc/criu/runc.conf /etc/criu/default.conf
-fi`
-}
-
-// shellQuote wraps s in double quotes with backslash-escaping of characters
-// that are special inside a double-quoted bash string: \, $, `, and ".
-// This prevents token or username values that contain single quotes or other
-// shell metacharacters from escaping the string context and executing code.
-func shellQuote(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `$`, `\$`)
-	s = strings.ReplaceAll(s, "`", "\\`")
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return `"` + s + `"`
+fi
+grep -qx 'allow-uprobes' /etc/criu/default.conf || echo 'allow-uprobes' | sudo tee -a /etc/criu/default.conf > /dev/null`
 }

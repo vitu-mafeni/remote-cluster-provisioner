@@ -1,9 +1,33 @@
 #!/bin/bash
 set -e
 
+# cleanup-everything.dsh — remove Kubernetes, containerd, CNI, iptables and
+# kernel/sysctl config from THIS machine. DESTRUCTIVE.
+#
+# USAGE:
+#   ./cleanup-everything.dsh [--yes]
+#
+# Without --yes you must type this machine's hostname to confirm.
+ASSUME_YES=false
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y) ASSUME_YES=true ;;
+    -h|--help) sed -n '4,10p' "$0"; exit 0 ;;
+    *) echo "Unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
 echo "======================================="
 echo "   Kubernetes Full Cleanup Starting"
 echo "======================================="
+echo "This will remove kubeadm/kubelet/kubectl, containerd, CNI config, iptables"
+echo "rules and k8s kernel/sysctl config on $(hostname) (and $HOME/.kube)."
+if ! $ASSUME_YES; then
+  read -r -p "Type this machine's hostname ($(hostname)) to continue: " answer
+  if [[ "$answer" != "$(hostname)" ]]; then
+    echo "Aborted."; exit 1
+  fi
+fi
 
 # -----------------------------
 # Reset kubeadm (if installed)
@@ -63,6 +87,13 @@ sudo apt-get update
 # Clean iptables rules
 # -----------------------------
 echo "Flushing iptables..."
+# Reset the chain policies to ACCEPT first: flushing rules while a policy is
+# DROP (ufw/Docker) would lock out remote (SSH) access to this machine.
+for ipt in iptables ip6tables; do
+  for chain in INPUT FORWARD OUTPUT; do
+    sudo $ipt -P $chain ACCEPT 2>/dev/null || true
+  done
+done
 sudo iptables -F || true
 sudo iptables -t nat -F || true
 sudo iptables -t mangle -F || true

@@ -122,7 +122,7 @@
       <li><a href="#s5">5. Usage</a></li>
       <li><a href="#s6">6. Examples</a></li>
       <li><a href="#s7">7. Logs &amp; Troubleshooting</a></li>
-      <li><a href="#s8">8. Controller Lifecycle</a></li>
+      <li><a href="#s8">8. Controller Lifecycle / Reconciliation</a></li>
       <li><a href="#s9">9. Operations</a></li>
       <li><a href="#s10">10. Reference</a></li>
     </ol>
@@ -148,61 +148,64 @@
       </blockquote>
     </header>
 
-    <h2 id="s1">1. Overview</h2>
-
-    <h3>1.1 What the controllers are</h3>
-    <p><code>remote-cluster-provisioner</code> runs as a single controller Deployment that manages three
-    kinds of resources (CRDs), across two areas of responsibility:</p>
-
-    <div class="table-wrap"><table>
-      <thead><tr><th>Resource (Kind)</th><th>Where you create it</th><th>What it's for</th></tr></thead>
-      <tbody>
-        <tr><td><code>RemoteCluster</code></td><td><strong>Management cluster</strong></td><td>Bootstraps a brand-new remote cluster (control plane + workers) from bare hosts</td></tr>
-        <tr><td><code>NodeProvision</code></td><td><strong>Remote (workload) cluster</strong></td><td>Adds worker nodes to a cluster that already exists</td></tr>
-        <tr><td><code>NodeProvisionNetConfig</code></td><td><strong>Remote (workload) cluster</strong></td><td>Shared cluster-wide configuration (VPN, join command, registry credentials) that <code>NodeProvision</code> reads from</td></tr>
-      </tbody>
-    </table></div>
-
-    <p>The same controller image runs on both the management cluster and every remote cluster it
-    creates — which behavior you get is simply a matter of which of these resources you create on which
-    cluster.</p>
-
-    <p><code>NodeProvisionNetConfig</code> is <strong>not</strong> something you interact with much
-    directly: it's created and kept up to date automatically, and its only job is to hold shared
-    settings (VPN range, join command, registry credentials) that <code>NodeProvision</code> reads when
-    adding a node. You mainly touch it when you want to change a cluster-wide setting (e.g. rotate
-    registry credentials) without editing every node individually.</p>
-
-    <h3>1.2 What each controller does</h3>
-    <p><strong>Cluster bootstrap (<code>RemoteCluster</code>, applied on the management cluster)</strong>
-    — given SSH access to a bare Ubuntu 22.04 host and a <code>RemoteCluster</code> resource, it turns
-    that host into either:</p>
-    <ul>
-      <li>a fully working Kubernetes <strong>control-plane</strong> node (Kubernetes itself, container
-        runtime, networking, and a GitOps platform stack), or</li>
-      <li>a <strong>worker</strong> node joined to a control-plane you already created in the same
-        logical cluster.</li>
-    </ul>
-    <p>Once a cluster is up, it also keeps that cluster's shared configuration in sync (VPN settings,
-    software versions, registry credentials), rotates its join token automatically, and cleanly tears a
-    node back down (removes it from Kubernetes, from the VPN, and resets it) when you delete the
-    <code>RemoteCluster</code> resource.</p>
-
-    <p><strong>Cluster scale-out (<code>NodeProvision</code>, applied on the remote/workload cluster
-    itself)</strong> — given a <code>NodeProvision</code> resource, it adds <strong>one more worker
-    node</strong> to a cluster that a <code>RemoteCluster</code> has already bootstrapped, using
-    either:</p>
-    <ul>
-      <li><strong><code>OnPrem</code></strong> — an existing bare-metal/VM host you already have,
-        reached over SSH, or</li>
-      <li><strong><code>AWS</code></strong> — a brand-new EC2 instance it launches for you (it can pick a
-        sensible instance type, AMI, and network config automatically if you don't specify one).</li>
-    </ul>
-    <p>This one keeps working even if the management cluster becomes unreachable — it can add nodes to
-    its own cluster independently.</p>
-
-    <h3>1.3 How they interact with each other</h3>
-    <pre>Management cluster                          Remote (workload) cluster
+<h2 id="s1">1. Overview</h2>
+<h3 id="1-1-what-the-controllers-are">1.1 What the controllers are</h3>
+<p><code>remote-cluster-provisioner</code> runs as a single controller Deployment that manages three kinds of
+resources (CRDs), across two areas of responsibility:</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Resource (Kind)</th>
+<th>Where you create it</th>
+<th>What it's for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RemoteCluster</code></td>
+<td><strong>Management cluster</strong></td>
+<td>Bootstraps a brand-new remote cluster (control plane + workers) from bare hosts</td>
+</tr>
+<tr>
+<td><code>NodeProvision</code></td>
+<td><strong>Remote (workload) cluster</strong></td>
+<td>Adds worker nodes to a cluster that already exists</td>
+</tr>
+<tr>
+<td><code>NodeProvisionNetConfig</code></td>
+<td><strong>Remote (workload) cluster</strong></td>
+<td>Shared cluster-wide configuration (VPN, join command, registry credentials) that <code>NodeProvision</code> reads from</td>
+</tr>
+</tbody>
+</table></div>
+<p>The same controller image runs on both the management cluster and every remote cluster it
+creates — which behavior you get is simply a matter of which of these resources you create on
+which cluster.</p>
+<p><code>NodeProvisionNetConfig</code> is <strong>not</strong> something you interact with much directly: it's created and
+kept up to date automatically, and its only job is to hold shared settings (VPN range, join
+command, registry credentials) that <code>NodeProvision</code> reads when adding a node. You mainly touch it
+when you want to change a cluster-wide setting (e.g. rotate registry credentials) without editing
+every node individually.</p>
+<h3 id="1-2-what-each-controller-does">1.2 What each controller does</h3>
+<p><strong>Cluster bootstrap (<code>RemoteCluster</code>, applied on the management cluster)</strong> — given SSH access to a
+bare Ubuntu 22.04 host and a <code>RemoteCluster</code> resource, it turns that host into either:
+- a fully working Kubernetes <strong>control-plane</strong> node (Kubernetes itself, container runtime,
+  networking, and a GitOps platform stack), or
+- a <strong>worker</strong> node joined to a control-plane you already created in the same logical cluster.</p>
+<p>Once a cluster is up, it also keeps that cluster's shared configuration in sync (VPN settings,
+software versions, registry credentials), rotates its join token automatically, and cleanly tears
+a node back down (removes it from Kubernetes, from the VPN, and resets it) when you delete the
+<code>RemoteCluster</code> resource.</p>
+<p><strong>Cluster scale-out (<code>NodeProvision</code>, applied on the remote/workload cluster itself)</strong> — given a
+<code>NodeProvision</code> resource, it adds <strong>one more worker node</strong> to a cluster that a <code>RemoteCluster</code> has
+already bootstrapped, using either:
+- <strong><code>OnPrem</code></strong> — an existing bare-metal/VM host you already have, reached over SSH, or
+- <strong><code>AWS</code></strong> — a brand-new EC2 instance it launches for you (it can pick a sensible instance type,
+  AMI, and network config automatically if you don't specify one).</p>
+<p>This one keeps working even if the management cluster becomes unreachable — it can add nodes to
+its own cluster independently.</p>
+<h3 id="1-3-how-they-interact-with-each-other">1.3 How they interact with each other</h3>
+<pre><code>Management cluster                          Remote (workload) cluster
 ┌───────────────────────┐                    ┌──────────────────────────┐
 │ Cluster bootstrap      │── SSH: install ──▶│ Control-plane / worker    │
 │ (RemoteCluster)         │   Kubernetes,      │ nodes                    │
@@ -211,153 +214,194 @@
            ▼                                               ▼
    NodeProvisionNetConfig  ◀────────────────────  Cluster scale-out
    (join command, VPN,                            (NodeProvision)
-    registry credentials)                          reads shared config</pre>
-    <p>Cluster bootstrap is the only one of the two that talks to your GitOps platform (Nephio/Porch)
-    and the only one that does the very first Kubernetes install on a control-plane node. Cluster
-    scale-out never does that first install — it only ever adds a node to a cluster whose join
-    information is already available.</p>
+    registry credentials)                          reads shared config
+</code></pre>
+<p>Cluster bootstrap is the only one of the two that talks to your GitOps platform (Nephio/Porch) and
+the only one that does the very first Kubernetes install on a control-plane node. Cluster scale-out
+never does that first install — it only ever adds a node to a cluster whose join information is
+already available.</p>
+<h3 id="1-4-when-to-use-which">1.4 When to use which</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>You want to...</th>
+<th>Use this, applied here</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Stand up a brand-new cluster from bare hosts</td>
+<td><code>RemoteCluster</code>, <code>nodeInfo.nodeType: control-plane</code>, on the <strong>management cluster</strong></td>
+</tr>
+<tr>
+<td>Add a worker while you're still building out a new cluster</td>
+<td><code>RemoteCluster</code>, <code>nodeInfo.nodeType: worker</code>, on the <strong>management cluster</strong></td>
+</tr>
+<tr>
+<td>Add on-prem/bare-metal capacity to a cluster that's already running</td>
+<td><code>NodeProvision</code>, <code>provider: OnPrem</code>, on the <strong>remote cluster</strong></td>
+</tr>
+<tr>
+<td>Burst into the cloud with extra capacity</td>
+<td><code>NodeProvision</code>, <code>provider: AWS</code>, on the <strong>remote cluster</strong></td>
+</tr>
+<tr>
+<td>Rotate registry credentials, change the VPN range, or bump the Kubernetes version for future nodes</td>
+<td>Edit <code>NodeProvisionNetConfig</code> (or the parent <code>RemoteCluster</code>, which keeps it in sync)</td>
+</tr>
+</tbody>
+</table></div>
+<hr>
+<h2 id="s2">2. Architecture &amp; Diagrams</h2>
+<h3 id="2-1-overall-architecture">2.1 Overall architecture</h3>
+<figure class="diagram-wrap">
+<img src="diagrams/architecture.svg" alt="Overall architecture: the management cluster's bootstrap controller installs control-plane and worker nodes over SSH and writes shared config to the remote cluster; the remote cluster's scale-out controller reads that config to add more nodes and refreshes tokens against its own Kubernetes API; both controllers register VPN peers on the WireGuard server.">
+<figcaption>Both controllers install/join nodes over SSH, keep the remote cluster's shared config in sync, and manage VPN peers; only the bootstrap controller talks to the GitOps platform.</figcaption>
+</figure>
 
-    <h3>1.4 When to use which</h3>
-    <div class="table-wrap"><table>
-      <thead><tr><th>You want to...</th><th>Use this, applied here</th></tr></thead>
-      <tbody>
-        <tr><td>Stand up a brand-new cluster from bare hosts</td><td><code>RemoteCluster</code>, <code>nodeInfo.nodeType: control-plane</code>, on the <strong>management cluster</strong></td></tr>
-        <tr><td>Add a worker while you're still building out a new cluster</td><td><code>RemoteCluster</code>, <code>nodeInfo.nodeType: worker</code>, on the <strong>management cluster</strong></td></tr>
-        <tr><td>Add on-prem/bare-metal capacity to a cluster that's already running</td><td><code>NodeProvision</code>, <code>provider: OnPrem</code>, on the <strong>remote cluster</strong></td></tr>
-        <tr><td>Burst into the cloud with extra capacity</td><td><code>NodeProvision</code>, <code>provider: AWS</code>, on the <strong>remote cluster</strong></td></tr>
-        <tr><td>Rotate registry credentials, change the VPN range, or bump the Kubernetes version for future nodes</td><td>Edit <code>NodeProvisionNetConfig</code> (or the parent <code>RemoteCluster</code>, which keeps it in sync)</td></tr>
-      </tbody>
-    </table></div>
+<p>Numbered flow:</p>
+<ol>
+<li>Cluster bootstrap connects over SSH to install Kubernetes, the container runtime, networking
+   (over the WireGuard VPN), and — for control planes — a GitOps agent plus platform baseline.</li>
+<li>On success, it writes the cluster's shared configuration (join command, VPN range, software
+   versions, and — if configured — registry credentials) to that cluster's own
+   <code>NodeProvisionNetConfig</code>.</li>
+<li>Cluster scale-out, running on the remote cluster, reads that shared configuration whenever it
+   needs a join command, VPN server details, or registry credentials for a <strong>new</strong> node.</li>
+<li>Back on the management cluster, cluster bootstrap deploys your GitOps platform stack onto the
+   new cluster (only if you opted into that).</li>
+<li>Cluster scale-out provisions the new node — over SSH for on-prem hosts, or by launching an EC2
+   instance for AWS — and joins it using the cached join command.</li>
+<li>Once joined, cluster scale-out refreshes the cluster's own join token directly against its own
+   Kubernetes API (no dependency on the management cluster) and labels the new node so
+   GPU/CPU-specific workloads schedule onto it correctly.</li>
+</ol>
+<p>Both controllers register and remove WireGuard peers on the VPN server automatically as nodes are
+added and removed.</p>
+<h3 id="2-2-remotecluster-what-happens-phase-by-phase">2.2 <code>RemoteCluster</code>: what happens, phase by phase</h3>
+<figure class="diagram-wrap">
+<img src="diagrams/remotecluster-phases.svg" alt="RemoteCluster phase flow: a new resource starts Provisioning, moves to Ready on success or Failed on error; Failed retries up to 5 times before requiring manual attention; a Ready cluster receives routine upkeep and is cleaned up on deletion.">
+<figcaption>RemoteCluster moves Provisioning → Ready, retries up to 5 times on failure, and is cleaned up on deletion.</figcaption>
+</figure>
 
-    <h2 id="s2">2. Architecture &amp; Diagrams</h2>
+<h3 id="2-3-nodeprovision-what-happens-phase-by-phase">2.3 <code>NodeProvision</code>: what happens, phase by phase</h3>
+<figure class="diagram-wrap">
+<img src="diagrams/nodeprovision-phases.svg" alt="NodeProvision phase flow: a new resource is validated, then provisioned over SSH (on-prem) or via EC2 and cloud-init (AWS), joins the cluster, optionally pre-pulls images on GPU nodes, then becomes Ready; failures retry up to 5 times before requiring manual attention.">
+<figcaption>NodeProvision validates, provisions via SSH or EC2, joins the cluster, optionally pre-pulls GPU images, then becomes Ready.</figcaption>
+</figure>
 
-    <h3>2.1 Overall architecture</h3>
-    <figure class="diagram-wrap">
-    <img src="diagrams/architecture.svg" alt="Overall architecture: the management cluster's bootstrap controller installs control-plane and worker nodes over SSH and writes shared config to the remote cluster; the remote cluster's scale-out controller reads that config to add more nodes and refreshes tokens against its own Kubernetes API; both controllers register VPN peers on the WireGuard server.">
-    <figcaption>Both controllers install/join nodes over SSH, keep the remote cluster's shared config in sync, and manage VPN peers; only the bootstrap controller talks to the GitOps platform.</figcaption>
-    </figure>
-
-    <p>Numbered flow:</p>
-    <ol>
-      <li>Cluster bootstrap connects over SSH to install Kubernetes, the container runtime, networking
-        (over the WireGuard VPN), and — for control planes — a GitOps agent plus platform baseline.</li>
-      <li>On success, it writes the cluster's shared configuration (join command, VPN range, software
-        versions, and — if configured — registry credentials) to that cluster's own
-        <code>NodeProvisionNetConfig</code>.</li>
-      <li>Cluster scale-out, running on the remote cluster, reads that shared configuration whenever it
-        needs a join command, VPN server details, or registry credentials for a <strong>new</strong>
-        node.</li>
-      <li>Back on the management cluster, cluster bootstrap deploys your GitOps platform stack onto the
-        new cluster (only if you opted into that).</li>
-      <li>Cluster scale-out provisions the new node — over SSH for on-prem hosts, or by launching an EC2
-        instance for AWS — and joins it using the cached join command.</li>
-      <li>Once joined, cluster scale-out refreshes the cluster's own join token directly against its own
-        Kubernetes API (no dependency on the management cluster) and labels the new node so GPU/CPU-
-        specific workloads schedule onto it correctly.</li>
-    </ol>
-    <p>Both controllers register and remove WireGuard peers on the VPN server automatically as nodes are
-    added and removed.</p>
-
-    <h3 id="s2-2">2.2 <code>RemoteCluster</code>: what happens, phase by phase</h3>
-    <figure class="diagram-wrap">
-    <img src="diagrams/remotecluster-phases.svg" alt="RemoteCluster phase flow: a new resource starts Provisioning, moves to Ready on success or Failed on error; Failed retries up to 5 times before requiring manual attention; a Ready cluster receives routine upkeep and is cleaned up on deletion.">
-    <figcaption>RemoteCluster moves Provisioning → Ready, retries up to 5 times on failure, and is cleaned up on deletion.</figcaption>
-    </figure>
-
-    <h3 id="s2-3">2.3 <code>NodeProvision</code>: what happens, phase by phase</h3>
-    <figure class="diagram-wrap">
-    <img src="diagrams/nodeprovision-phases.svg" alt="NodeProvision phase flow: a new resource is validated, then provisioned over SSH (on-prem) or via EC2 and cloud-init (AWS), joins the cluster, optionally pre-pulls images on GPU nodes, then becomes Ready; failures retry up to 5 times before requiring manual attention.">
-    <figcaption>NodeProvision validates, provisions via SSH or EC2, joins the cluster, optionally pre-pulls GPU images, then becomes Ready.</figcaption>
-    </figure>
-
-    <h2 id="s3">3. Prerequisites</h2>
-
-    <h3>3.1 Cluster software and versions</h3>
-    <ul>
-      <li><strong>A running management-cluster Kubernetes API</strong> to install the CRDs and the
-        controller into.</li>
-      <li><strong>Target Kubernetes version for the clusters you're building</strong> — set per cluster
-        via <code>kubernetesVersion</code> (e.g. <code>v1.34.2</code>) in your
-        <code>RemoteCluster</code>/<code>NodeProvisionNetConfig</code> — this is entirely independent of
-        whatever Kubernetes version your management cluster runs.</li>
-      <li><strong>Nephio/Porch</strong>, on the management cluster, <strong>only if</strong> you turn on
-        <code>gitConfig.enable: "true"</code> to have the platform stack deployed via GitOps.</li>
-    </ul>
-
-    <h3>3.2 Environment/configuration</h3>
-    <ul>
-      <li><strong>SSH reachability</strong> — the controller must be able to reach every host you list (by
-        LAN IP or its VPN IP) on the SSH port you configure (default <code>22</code>). There's no
-        bastion/jump-host support; it connects directly.</li>
-      <li><strong>Passwordless <code>sudo</code></strong> for the SSH user on every host you
-        provision.</li>
-      <li><strong>Ubuntu 22.04 (Jammy)</strong> on every host that becomes a cluster node.</li>
-      <li><strong>A WireGuard VPN server</strong> reachable over SSH — see
-        <a href="wireguard-setup-bundle/WIREGUARD_SETUP.md">WIREGUARD_SETUP.md</a> if you need to stand
-        one up.</li>
-      <li><strong>GPU nodes</strong>: NVIDIA drivers must already be installed on the host beforehand —
-        this project does not install GPU drivers for you.</li>
-      <li><strong>AWS credentials</strong>, if you'll provision nodes with <code>provider: AWS</code> —
-        either an access key/secret in a Secret, or an IAM role attached to the controller's pod.</li>
-    </ul>
-
-    <h3>3.3 Permissions</h3>
-    <p>The controller needs a <code>ClusterRole</code> covering the <code>RemoteCluster</code>,
-    <code>NodeProvision</code>, and <code>NodeProvisionNetConfig</code> resources (including their
-    status), Kubernetes <code>Node</code> objects, <code>Secret</code>s and <code>ConfigMap</code>s
-    (including in <code>kube-system</code>/<code>kube-public</code>, for join-token management),
-    <code>Job</code>s (for GPU image pre-pulling), and — only if you enable GitOps deployment — the
-    Nephio/Porch resource types. All of this is already defined in the manifests you'll apply in
-    <a href="#s4">§4</a>; you don't need to hand-write any RBAC.</p>
-    <blockquote>
-      <p><strong>Security note:</strong> SSH connections from the controller do not verify host keys.
-      Make sure the network path to your nodes and VPN server (e.g. the VPN tunnel itself) is one you
-      trust.</p>
-    </blockquote>
-
-    <h2 id="s4">4. Installation</h2>
-    <blockquote>
-      <p>This guide assumes the controller container image is already built and pushed somewhere your
-      cluster can pull it from. If you don't have that yet, ask whoever manages your image builds for the
-      image reference before continuing.</p>
-    </blockquote>
-
-    <h3>4.1 Install the CRDs</h3>
-    <pre><code class="language-bash">make install</code></pre>
-    <p>This applies the three CRDs to your management cluster:</p>
-    <ul>
-      <li><code>RemoteCluster</code></li>
-      <li><code>NodeProvision</code></li>
-      <li><code>NodeProvisionNetConfig</code></li>
-    </ul>
-    <p>Verify:</p>
-    <pre><code class="language-bash">kubectl get crds | grep -E 'dcn.ssu.ac.kr'</code></pre>
-    <p>Expected output:</p>
-    <pre><code>nodeprovisionnetconfigs.ml.dcn.ssu.ac.kr   2026-01-01T00:00:00Z
+<p><code>status.phase</code> takes the values listed in <a href="#s102">§10.2</a> (<code>Pending</code>, <code>Validating</code>,
+<code>Provisioning</code>, <code>CreatingInstance</code>, <code>WaitingForInstance</code>, <code>ConfiguringVPN</code>, <code>Bootstrapping</code>,
+<code>Joining</code>, <code>RegisteringNode</code>, <code>VerifyingHealth</code>, <code>PrePullingImages</code>, <code>Ready</code>, <code>Failed</code>,
+<code>Deleting</code>); which ones you see depends on the provider. <code>ConfiguringVPN</code> is skipped when the VPN
+is disabled (<code>disableVPN: true</code>).</p>
+<hr>
+<h2 id="s3">3. Prerequisites</h2>
+<h3 id="3-1-cluster-software-and-versions">3.1 Cluster software and versions</h3>
+<ul>
+<li><strong>A running management-cluster Kubernetes API</strong> to install the CRDs and the controller into.</li>
+<li><strong>Target Kubernetes version for the clusters you're building</strong> — set per cluster via
+  <code>kubernetesVersion</code> (e.g. <code>v1.34.2</code>) in your <code>RemoteCluster</code>/<code>NodeProvisionNetConfig</code> — this is
+  entirely independent of whatever Kubernetes version your management cluster runs.</li>
+<li><strong>Nephio/Porch</strong>, on the management cluster, <strong>only if</strong> you turn on <code>gitConfig.enable: "true"</code>
+  to have the platform stack deployed via GitOps.</li>
+</ul>
+<h3 id="3-2-environment-configuration">3.2 Environment/configuration</h3>
+<ul>
+<li><strong>SSH reachability</strong> — the controller must be able to reach every host you list (by LAN IP or
+  its VPN IP) on the SSH port you configure (default <code>22</code>). There's no bastion/jump-host support;
+  it connects directly.</li>
+<li><strong>Passwordless <code>sudo</code></strong> for the SSH user on every host you provision.</li>
+<li><strong>Ubuntu 22.04 (Jammy)</strong> on every host that becomes a cluster node.</li>
+<li><strong>A WireGuard VPN server</strong> reachable over SSH — <strong>required only when <code>disableVPN</code> is <code>false</code></strong>
+  (the default); clusters created with <code>disableVPN: true</code> never contact a VPN server (see
+  <a href="#s51">§5.1</a>). See
+  <a href="wireguard-setup-bundle/WIREGUARD_SETUP.md">WIREGUARD_SETUP.md</a> if you need to stand one up.
+  Without a VPN, the nodes must be directly reachable from the controller and from each other.</li>
+<li><strong>GPU nodes</strong>: NVIDIA drivers must already be installed on the host beforehand — this project
+  does not install GPU drivers for you.</li>
+<li><strong>AWS credentials</strong>, if you'll provision nodes with <code>provider: AWS</code> — either an access key/secret
+  in a Secret, or an IAM role attached to the controller's pod.</li>
+</ul>
+<h3 id="3-3-permissions">3.3 Permissions</h3>
+<p>The controller needs a <code>ClusterRole</code> covering the <code>RemoteCluster</code>, <code>NodeProvision</code>, and
+<code>NodeProvisionNetConfig</code> resources (including their status), Kubernetes <code>Node</code> objects, <code>Secret</code>s
+(for join-token management, including in <code>kube-system</code>), read access (<code>get</code>) to the single
+<code>kube-public/cluster-info</code> <code>ConfigMap</code> through a namespaced <code>Role</code> in <code>kube-public</code> (no
+cluster-wide <code>ConfigMap</code> access is granted), <code>Job</code>s (for GPU image pre-pulling), and — only if you
+enable GitOps deployment — the Nephio/Porch resource types. All of this is already defined in the
+manifests you'll apply in <a href="#s4">§4</a>; you don't need to hand-write any RBAC.</p>
+<h4>SSH host key verification</h4>
+<p>By default the controller does <strong>not</strong> verify SSH host keys (it logs one warning), so make sure
+the network path to your nodes and VPN server (e.g. the VPN tunnel itself) is one you trust. To
+turn verification on, set the environment variable <strong><code>SSH_KNOWN_HOSTS_FILE</code></strong> on the controller
+container to the path of an OpenSSH <code>known_hosts</code> file (mount it from a ConfigMap or Secret; a
+commented example is in <code>deploy/deployment.yaml</code>). This is opt-in — defaults are unchanged. When it is set:</p>
+<ul>
+<li>the controller <strong>fails closed</strong>: a host that is not listed in the file is rejected, so every
+  node, on-prem host and VPN server must be <strong>pre-seeded</strong> in the file <em>before</em> the resource that
+  uses it is created (<code>ssh-keyscan -t ed25519,ecdsa,rsa &lt;host&gt;</code>; for a new AWS instance the host
+  key is not known in advance, so verification will reject it unless you have a way to
+  pre-seed it);</li>
+<li>only the host key types present in the file for a host are negotiated, so list the type the
+  host actually offers;</li>
+<li>if the file cannot be read or parsed, <strong>every</strong> SSH connection fails (there is no silent fallback
+  to "no verification");</li>
+<li>there is no trust-on-first-use cache: a reinstalled node presents a new host key and must be
+  re-seeded.</li>
+</ul>
+<hr>
+<h2 id="s4">4. Installation</h2>
+<blockquote>
+<p>This guide assumes the controller container image is already built and pushed somewhere your
+cluster can pull it from. If you don't have that yet, ask whoever manages your image builds for
+the image reference before continuing.</p>
+</blockquote>
+<h3 id="4-1-install-the-crds">4.1 Install the CRDs</h3>
+<pre><code class="language-bash">make install
+</code></pre>
+<p>This applies the three CRDs to your management cluster:</p>
+<ul>
+<li><code>RemoteCluster</code></li>
+<li><code>NodeProvision</code></li>
+<li><code>NodeProvisionNetConfig</code></li>
+</ul>
+<p>Verify:</p>
+<pre><code class="language-bash">kubectl get crds | grep -E 'dcn.ssu.ac.kr'
+</code></pre>
+<p>Expected output:</p>
+<pre><code>nodeprovisionnetconfigs.ml.dcn.ssu.ac.kr   2026-01-01T00:00:00Z
 nodeprovisions.ml.dcn.ssu.ac.kr            2026-01-01T00:00:00Z
-remoteclusters.infra.dcn.ssu.ac.kr         2026-01-01T00:00:00Z</code></pre>
-
-    <h3>4.2 Deploy the controller</h3>
-    <pre><code class="language-bash">make deploy IMG=&lt;registry&gt;/remote-cluster-provisioner:&lt;tag&gt;</code></pre>
-    <p>Point <code>IMG</code> at the pre-built image you were given. This creates:</p>
-    <ul>
-      <li>Namespace <strong><code>remote-cluster-provisioner-system</code></strong></li>
-      <li>The controller's service account and permissions</li>
-      <li><code>Deployment/remote-cluster-provisioner-controller-manager</code> (1 replica)</li>
-    </ul>
-    <p>The same steps (§4.1 and §4.2) are what you'll also run <strong>on every remote cluster</strong>
-    you create, before you start applying <code>NodeProvision</code> resources there.</p>
-
-    <h3>4.3 Apply your first resources</h3>
-    <pre><code class="language-bash"># On the management cluster — SSH credentials + a RemoteCluster
+remoteclusters.infra.dcn.ssu.ac.kr         2026-01-01T00:00:00Z
+</code></pre>
+<h3 id="4-2-deploy-the-controller">4.2 Deploy the controller</h3>
+<pre><code class="language-bash">make deploy IMG=&lt;registry&gt;/remote-cluster-provisioner:&lt;tag&gt;
+</code></pre>
+<p>Point <code>IMG</code> at the pre-built image you were given. This creates:</p>
+<ul>
+<li>Namespace <strong><code>remote-cluster-provisioner-system</code></strong></li>
+<li>The controller's service account and permissions</li>
+<li><code>Deployment/remote-cluster-provisioner-controller-manager</code> (1 replica)</li>
+</ul>
+<blockquote>
+<p>If you install from the static manifests in <code>deploy/</code> instead (<code>kubectl apply -k deploy/</code>, after
+setting the image as described in <code>deploy/kustomization.yaml</code>), the Deployment and service
+account are named <code>remote-cluster-provisioner</code> (no <code>-controller-manager</code> suffix) in the same
+namespace; substitute that name in the <code>deployment/...</code> commands used throughout this guide.
+RBAC there grants only <code>get</code> on <code>kube-public/cluster-info</code> for ConfigMaps (namespaced Role).</p>
+</blockquote>
+<p>The same steps (§4.1 and §4.2) are what you'll also run <strong>on every remote cluster</strong> you create,
+before you start applying <code>NodeProvision</code> resources there.</p>
+<h3 id="4-3-apply-your-first-resources">4.3 Apply your first resources</h3>
+<pre><code class="language-bash"># On the management cluster — SSH credentials + a RemoteCluster
 kubectl apply -f config/samples/infra_v1_remotecluster_gpu_worker.yaml
 
 # On the remote cluster, once it exists — add a node via NodeProvision
-kubectl apply -f config/samples/ml_v1alpha1_nodeprovision.yaml</code></pre>
-    <p>(See <a href="#s6">§6</a> for a full walk-through with expected output at each step.)</p>
-
-    <h3>4.4 Verify the installation</h3>
-    <pre><code class="language-bash"># Controller pod is Running
+kubectl apply -f config/samples/ml_v1alpha1_nodeprovision.yaml
+</code></pre>
+<p>(See <a href="#s6">§6</a> for a full walk-through with expected output at each step.)</p>
+<h3 id="4-4-verify-the-installation">4.4 Verify the installation</h3>
+<pre><code class="language-bash"># Controller pod is Running
 kubectl get pods -n remote-cluster-provisioner-system
 
 # Health/readiness endpoints (port-forward first)
@@ -368,20 +412,20 @@ curl -sf localhost:8083/readyz  &amp;&amp; echo OK
 
 # CRDs are established
 kubectl get crd remoteclusters.infra.dcn.ssu.ac.kr \
-  -o jsonpath='{.status.conditions[?(@.type=="Established")].status}'</code></pre>
-
-    <h2 id="s5">5. Usage</h2>
-
-    <h3>5.1 <code>RemoteCluster</code> — create/manage a cluster from the management cluster</h3>
-    <p>Full field reference is in <a href="#s10-1">§10.1</a>. Minimal control-plane example:</p>
-    <pre><code class="language-yaml">apiVersion: infra.dcn.ssu.ac.kr/v1
+  -o jsonpath='{.status.conditions[?(@.type==&quot;Established&quot;)].status}'
+</code></pre>
+<hr>
+<h2 id="s5">5. Usage</h2>
+<h3 id="5-1-remotecluster-create-manage-a-cluster-from-the-management-cluster">5.1 <code>RemoteCluster</code> — create/manage a cluster from the management cluster</h3>
+<p>Full field reference is in <a href="#s101">§10.1</a>. Minimal control-plane example:</p>
+<pre><code class="language-yaml">apiVersion: infra.dcn.ssu.ac.kr/v1
 kind: RemoteCluster
 metadata:
   name: ml-cluster-cp
 spec:
   clusterName: ml-cluster        # shared across every node in this logical cluster
   host: 192.168.3.234
-  port: "22"
+  port: &quot;22&quot;
   user: ubuntu
   nodeInfo:
     nodeType: control-plane       # or: worker
@@ -403,82 +447,150 @@ spec:
   vpnConfig:
     ip: 10.9.0.13
     vpnServerPublicIP: 13.215.206.108
-    vpnServerSSHPort: "22"
+    vpnServerSSHPort: &quot;22&quot;
     vpnServerSSHUsername: ubuntu
     vpnSshCredentialsRef:
       name: vpn-server-ssh-secret
       namespace: default
       key: id_rsa
   gitConfig:
-    enable: "true"                # omit/false to skip GitOps platform deployment entirely
-    gitServer: "http://192.168.3.99:31810"
-    gitUsername: "nephio"
-    upstreamPlatformRepo: "catalog-workloads-mlplatform"
-    packageRevision: "v1.0.0"</code></pre>
-    <p>Key fields to get right:</p>
-    <ul>
-      <li><strong><code>nodeInfo.nodeType</code></strong> — <code>control-plane</code> installs a
-        brand-new cluster on this host; <code>worker</code> joins this host to whichever
-        <code>RemoteCluster</code> in the same namespace has a matching <code>spec.clusterName</code> and
-        <code>nodeType: control-plane</code>. If that control-plane isn't <code>Ready</code> yet, the
-        worker just waits and checks again periodically.</li>
-      <li><strong><code>auth</code></strong> — exactly one of <code>sshPrivateKeySecretRef</code> or
-        <code>passwordSecretRef</code>. Key auto-detection: a secret value starting with
-        <code>-----BEGIN</code> is treated as a private key; anything else as a password.</li>
-      <li><strong><code>vpnConfig.ip</code></strong> — once set, the controller talks to the node over
-        its VPN IP instead of <code>spec.host</code>, which keeps working even after the node moves onto
-        a different network path.</li>
-      <li><strong><code>gitConfig.enable</code></strong> — a <strong>string</strong>
-        <code>"true"</code>/<code>"false"</code>, not a bare <code>true</code>/<code>false</code>. Only
-        when <code>"true"</code> does the platform stack get deployed via GitOps.</li>
-    </ul>
-
-    <h3>5.2 <code>NodeProvisionNetConfig</code> — shared cluster settings</h3>
-    <p>Normally created and kept up to date for you automatically (see <a href="#s8-1">§8.1</a>), but you
-    can also apply it directly on a remote cluster you're testing in isolation:</p>
-    <pre><code class="language-yaml">apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+    enable: &quot;true&quot;                # omit/false to skip GitOps platform deployment entirely
+    gitServer: &quot;http://192.168.3.99:31810&quot;
+    gitUsername: &quot;nephio&quot;
+    upstreamPlatformRepo: &quot;catalog-workloads-mlplatform&quot;
+    packageRevision: &quot;v1.0.0&quot;
+</code></pre>
+<p>Key fields to get right:</p>
+<ul>
+<li><strong><code>nodeInfo.nodeType</code></strong> — <code>control-plane</code> installs a brand-new cluster on this host;
+  <code>worker</code> joins this host to whichever <code>RemoteCluster</code> in the same namespace has a matching
+  <code>spec.clusterName</code> and <code>nodeType: control-plane</code>. If that control-plane isn't <code>Ready</code> yet, the
+  worker just waits and checks again periodically.</li>
+<li><strong><code>auth</code></strong> — exactly one of <code>sshPrivateKeySecretRef</code> or <code>passwordSecretRef</code>. Key auto-detection:
+  a secret value starting with <code>-----BEGIN</code> is treated as a private key; anything else as a
+  password.</li>
+<li><strong><code>vpnConfig.ip</code></strong> — once set, the controller talks to the node over its VPN IP instead of
+  <code>spec.host</code>, which keeps working even after the node moves onto a different network path.</li>
+<li><strong><code>disableVPN</code></strong> (default <code>false</code>) — run the <strong>whole cluster</strong> without WireGuard, when
+  <code>spec.host</code> is a public (or otherwise directly routable) IP that is fully reachable by the
+  controller and by the other nodes. Set it on the <strong>control-plane</strong>; it decides for the cluster:
+  the control-plane publishes it in the cluster's <code>NodeProvisionNetConfig</code>, and every worker
+  (<code>RemoteCluster</code> workers and <code>NodeProvision</code>s, on-prem and AWS) inherits it. A node that sets
+  <code>disableVPN: true</code> under a VPN control-plane is failed with a clear message, because a mixed
+  cluster cannot work. Inheritance flows control-plane <code>RemoteCluster</code> → <code>NodeProvisionNetConfig</code>
+  → <code>NodeProvision</code>/worker (see <a href="#s75">§7.5</a> for the resulting conditions).</li>
+<li><code>spec.host</code> must be an <strong>IP bound to a local interface on the node</strong> (a NATed public IP fails
+    early with a clear error); it becomes the kubelet node IP and, for the control-plane, the API
+    server advertise address, in place of the <code>wg0</code> address.</li>
+<li>Nothing VPN-related is touched: no VPN server contact, no VPN range/credentials published or
+    copied, no peer allocation or removal, no WireGuard install or teardown, no AWS security
+    group rule for UDP 51820. Instead of <code>--iface=wg0</code>, flannel is pinned <strong>per node to the
+    node's own address</strong> (<code>--iface=$(FLANNEL_NODE_IP)</code>, taken from the pod's <code>status.hostIP</code>, which
+    is the kubelet node IP), so the VXLAN endpoint is always the interface that carries the node
+    IP, even on multi-homed hosts. <code>vpnConfig</code> is ignored.</li>
+<li>Nodes must reach the address the control-plane advertises. Pod traffic (flannel VXLAN,
+    UDP 8473) then crosses the network unencrypted.</li>
+<li>Firewalling is yours to manage: the controller only opens what it needs itself (for AWS
+    nodes the default security group it creates gets <strong>SSH only</strong>). The kubelet port
+    (<strong>TCP 10250</strong>) and flannel VXLAN (<strong>UDP 8473</strong>) between the cluster's nodes must be allowed
+    by your own security group / firewall (and TCP 6443 to the control-plane for joins).</li>
+<li>Choose the mode when you create the cluster; switching an existing cluster is not supported.</li>
+<li><strong><code>gitConfig.enable</code></strong> — a <strong>string</strong> <code>"true"</code>/<code>"false"</code>, not a bare <code>true</code>/<code>false</code>. Only when
+  <code>"true"</code> does the platform stack get deployed via GitOps.</li>
+</ul>
+<h3 id="5-2-nodeprovisionnetconfig-shared-cluster-settings">5.2 <code>NodeProvisionNetConfig</code> — shared cluster settings</h3>
+<p>Normally created and kept up to date for you automatically (see <a href="#s81">§8.1</a>),
+but you can also apply it directly on a remote cluster you're testing in isolation:</p>
+<pre><code class="language-yaml">apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
 kind: NodeProvisionNetConfig
 metadata:
   name: my-cluster-netconfig
 spec:
   clusterName: my-cluster
-  vpnRange: "10.9.0.0/24"
+  disableVPN: false             # true = cluster without WireGuard; vpnRange/vpnServerPublicConfig are then unused
+  vpnRange: &quot;10.9.0.0/24&quot;
   vpnServerPublicConfig:
-    publicIP: "13.215.206.108"
-    sshPort: 22
+    publicIP: &quot;13.215.206.108&quot;
+    sshPort: &quot;22&quot;
     sshUsername: ubuntu
-    vpnPort: 51820
+    vpnPort: &quot;51820&quot;
     vpnSshCredentialsRef:
       name: vpn-server-secret
       namespace: default
       key: id_rsa
   softwareConfig:
-    kubernetesVersion: "v1.34.2"
+    kubernetesVersion: &quot;v1.34.2&quot;
+    insecureRegistries:         # optional; see &quot;Insecure (plain-HTTP) registries&quot; below
+      - harbor.example.com:30002
     cnlabRuntime:
-      registry: "ghcr.io"
-      repository: "vitu-mafeni/cnlab-runtime"
-      version: "1.0.0-beta"
-      orasVersion: "1.3.2"
+      registry: &quot;ghcr.io&quot;
+      repository: &quot;vitu-mafeni/cnlab-runtime&quot;
+      version: &quot;1.0.0-beta&quot;
+      orasVersion: &quot;1.3.2&quot;
       credentialsRef:
         name: cnlab-runtime-registry
-        namespace: default</code></pre>
-    <blockquote>
-      <p>Some sample files also show <code>softwareConfig.nvidiaDriverVersion</code>,
-      <code>nvidiaContainerToolkitVersion</code>, and <code>k8sDevicePluginVersion</code>.
-      <strong>These aren't supported fields</strong> today — don't rely on them. GPU driver/toolkit
-      versions aren't configurable through this resource; install them on the host yourself
-      beforehand.</p>
-    </blockquote>
-
-    <h3>5.3 <code>NodeProvision</code> — add a node from the remote cluster</h3>
-    <p><strong>On-prem</strong> (an existing host, reached over SSH):</p>
-    <pre><code class="language-yaml">apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+        namespace: default
+</code></pre>
+<p><strong>Which NetConfig does a <code>NodeProvision</code> use?</strong> <code>spec.clusterName</code> of the <code>NodeProvision</code> selects
+the <code>NodeProvisionNetConfig</code> whose <code>spec.clusterName</code> is equal (<code>RemoteCluster.spec.clusterName</code>
+is what the controller writes there). Provisioning fails with a clear error when none, or more
+than one, matches. For backward compatibility the field may be left empty <strong>only while the
+namespace holds exactly one <code>NodeProvisionNetConfig</code></strong>: that one is then used, as before. As soon
+as a namespace holds several (several clusters), a <code>NodeProvision</code> without <code>spec.clusterName</code>
+is failed (without consuming a retry) with an error asking you to set it — the controller never
+guesses, because a wrong pick would use another cluster's VPN range, VPN mode, pre-pull images
+and registry secret. A VPN peer is likewise never released from a guessed config when such a node
+is deleted: deletion keeps reporting the error until <code>spec.clusterName</code> is set.</p>
+<h4>Insecure (plain-HTTP) registries</h4>
+<p><code>softwareConfig.insecureRegistries</code> (also on <code>RemoteCluster.spec.nodeInfo.softwareConfig</code>, which
+syncs it here, including clearing it when removed) lists registries (<code>host</code> or <code>host:port</code>, e.g.
+<code>harbor.example.com:30002</code>) that are served over <strong>plain HTTP or with an untrusted certificate</strong>.
+Every node the operator provisions — on-prem control-plane/worker (<code>RemoteCluster</code>), on-prem,
+AWS and GCP <code>NodeProvision</code> — gets a <code>/etc/containers/registries.conf.d/50-insecure-&lt;host&gt;.conf</code>
+drop-in with <code>insecure = true</code>, written <strong>before</strong> CRI-O (re)starts. Use it for registries that
+other workloads pull from but that are not in <code>imagePrepulls</code>.</p>
+<ul>
+<li>Entries are bare <code>host</code> or <code>host:port</code> (port 1-65535): no <code>http://</code>, path, spaces, quotes or
+  shell characters; at most 32. An invalid entry is rejected by the CRD and, on the controller
+  side, fails the <code>RemoteCluster</code> (condition/message <code>InvalidInsecureRegistries</code>) or the
+  <code>NodeProvision</code> with a message naming the entry.</li>
+<li><strong>Backward compatibility:</strong> the registry host of every fully-qualified image in <code>imagePrepulls</code>
+  (e.g. <code>harbor.example.com:30002</code> from <code>harbor.example.com:30002/team/img:1</code>) is <strong>also</strong> marked
+  insecure, exactly as before. The effective list is the de-duplicated, sorted union of both.
+  There is no opt-out for the derived hosts.</li>
+<li><strong>Already-provisioned nodes</strong> are not touched, and CRI-O only reads <code>registries.conf.d</code> when it
+  starts. On each existing node run once (ideally after cordoning/draining it, since restarting
+  CRI-O restarts its containers):</li>
+</ul>
+<p><code>bash
+  sudo mkdir -p /etc/containers/registries.conf.d
+  sudo tee /etc/containers/registries.conf.d/50-insecure-harbor-example-com-30002.conf &gt;/dev/null &lt;&lt;'EOF'
+  [[registry]]
+  location = "harbor.example.com:30002"
+  insecure = true
+  EOF
+  sudo systemctl restart crio</code></p>
+<p>(the file name is only a label: <code>.</code> and <code>:</code> in the host are replaced by <code>-</code>).</p>
+<p><code>disableVPN</code> is normally set for you: the control-plane <code>RemoteCluster</code> publishes it here, and every
+<code>NodeProvision</code> reads it (see <a href="#s51">§5.1</a>
+and <a href="#s75">§7.5</a>). Only set it by hand on a NetConfig you manage yourself, and
+keep it consistent with the cluster's real mode.</p>
+<blockquote>
+<p>Older examples showed <code>softwareConfig.nvidiaDriverVersion</code>, <code>nvidiaContainerToolkitVersion</code>,
+and <code>k8sDevicePluginVersion</code>. <strong>These are not fields of this resource</strong> (the API server rejects
+them) — GPU driver/toolkit/device-plugin versions aren't configurable here; the controller does
+not install them for you.</p>
+</blockquote>
+<h3 id="5-3-nodeprovision-add-a-node-from-the-remote-cluster">5.3 <code>NodeProvision</code> — add a node from the remote cluster</h3>
+<p><strong>On-prem</strong> (an existing host, reached over SSH):</p>
+<pre><code class="language-yaml">apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
 kind: NodeProvision
 metadata:
   name: gpu-worker-01
   namespace: default
 spec:
   provider: OnPrem
+  clusterName: my-cluster        # which NodeProvisionNetConfig (spec.clusterName) to use; required when the namespace has several
   role: worker
   hardwareType: gpu              # controls which pre-pull images target this node
   nodeLabel: gpu
@@ -488,17 +600,19 @@ spec:
   credentialsRef:
     name: gpu-worker-01-ssh-secret
     namespace: default
-    key: id_rsa</code></pre>
-    <p><strong>AWS</strong> (a new EC2 instance — most fields auto-resolve):</p>
-    <pre><code class="language-yaml">apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+    key: id_rsa
+</code></pre>
+<p><strong>AWS</strong> (a new EC2 instance — most fields auto-resolve):</p>
+<pre><code class="language-yaml">apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
 kind: NodeProvision
 metadata:
   name: aws-node-001
   namespace: default
 spec:
   provider: AWS
+  clusterName: my-cluster        # which NodeProvisionNetConfig (spec.clusterName) to use; required when the namespace has several
   role: worker
-  nodeLabel: cpu                 # "cpu" → t3.xlarge | "gpu" → p3.2xlarge (auto-resolved)
+  nodeLabel: cpu                 # &quot;cpu&quot; → t3.xlarge | &quot;gpu&quot; → p3.2xlarge (auto-resolved)
   region: ap-northeast-2
   credentialsRef:
     name: aws-node-credentials
@@ -513,31 +627,172 @@ spec:
   #   keyPairName: my-keypair
   #   iamInstanceProfile: my-profile
   #   rootVolumeSizeGB: 100
-  #   tags: {environment: production}</code></pre>
-    <p>Important fields:</p>
-    <ul>
-      <li><strong><code>nodeLabel</code></strong> drives the AWS defaults — <code>"cpu"</code> →
-        <code>t3.xlarge</code>, <code>"gpu"</code> → <code>p3.2xlarge</code>. Set
-        <code>spec.awsConfig.instanceType</code> (or the top-level <code>spec.instanceType</code>) to pick
-        an exact instance type instead.</li>
-      <li><strong><code>hardwareType</code></strong> (separate from <code>nodeLabel</code>) controls which
-        pre-pull images target this node — only relevant for <code>gpu</code> nodes when your cluster
-        config lists images to pre-pull.</li>
-      <li><strong><code>role</code></strong> — always <code>worker</code> in practice; this resource only
-        ever joins nodes to an existing cluster, it never bootstraps a brand-new one (that's what
-        <code>RemoteCluster</code> is for).</li>
-      <li><strong><code>credentialsRef.key</code></strong> — if omitted, the controller tries a few common
-        key names automatically (<code>privateKey</code>, <code>id_rsa</code>, <code>ssh-privatekey</code>,
-        <code>password</code>, <code>key</code>).</li>
-    </ul>
-
-    <h2 id="s6">6. Examples</h2>
-
-    <h3>6.1 End-to-end: bootstrap a control plane, add a worker, scale with <code>NodeProvision</code></h3>
-
-    <p><strong>Step 1 — apply the SSH secret and control-plane <code>RemoteCluster</code></strong> (on the
-    management cluster):</p>
-    <pre><code class="language-yaml">kubectl apply -f - &lt;&lt;'EOF'
+  #   tags: {environment: production}
+</code></pre>
+<p>Important fields:</p>
+<ul>
+<li><strong><code>disableVPN</code></strong> (default <code>false</code>) joins the node without a WireGuard tunnel — no VPN server
+  connection, IP allocation, peer, WireGuard package or AWS security group rule. It is a property
+  of the whole cluster, so you normally don't set it here: it is inherited from the cluster's
+  <code>NodeProvisionNetConfig</code> (see <code>RemoteCluster.spec.disableVPN</code>), and setting it against a VPN
+  cluster fails the provision. Use it only when the node is directly reachable from the
+  controller and the control plane, <strong>and</strong> the control plane's API endpoint (the address in the
+  kubeadm join command, i.e. what the control plane advertises) is reachable from the node. The
+  node's own address becomes the kubelet node IP:</li>
+<li><strong>OnPrem</strong> — <code>spec.ipAddress</code>, which must be an IP actually bound to an interface on the
+    node (a NATed public IP fails early with a clear error).</li>
+<li><strong>AWS</strong> — the instance's <em>private</em> IP (a public EC2 IP is NATed and cannot be a kubelet node
+    IP), so the control plane must be able to route to it (same or peered VPC).</li>
+<li><strong>GCP</strong> — the instance's <em>internal</em> (VPC) IP, for the same reason; see <a href="#s54">§5.4</a>.</li>
+</ul>
+<p>Set it when you create the resource; changing it on an existing node is not supported.
+- <strong><code>nodeLabel</code></strong> drives the AWS defaults — <code>"cpu"</code> → <code>t3.xlarge</code>, <code>"gpu"</code> → <code>p3.2xlarge</code>. Set
+  <code>spec.awsConfig.instanceType</code> (or the top-level <code>spec.instanceType</code>) to pick an exact instance
+  type instead.
+- <strong><code>hardwareType</code></strong> (separate from <code>nodeLabel</code>) controls which pre-pull images target this node
+  — only relevant for <code>gpu</code> nodes when your cluster config lists images to pre-pull.
+- <strong><code>role</code></strong> — always <code>worker</code> in practice; this resource only ever joins nodes to an existing
+  cluster, it never bootstraps a brand-new one (that's what <code>RemoteCluster</code> is for).
+- <strong><code>credentialsRef.key</code></strong> — if omitted, the controller tries a few common key names
+  automatically (<code>privateKey</code>, <code>id_rsa</code>, <code>ssh-privatekey</code>, <code>password</code>, <code>key</code>).</p>
+<hr>
+<h3 id="5-4-nodeprovision-on-google-cloud-gcp">5.4 <code>NodeProvision</code> on Google Cloud (GCP)</h3>
+<p><code>provider: GCP</code> creates a Compute Engine (GCE) VM, bootstraps it with a startup script (the same
+bootstrap the AWS path renders into cloud-init: CRI-O, the cnlab-runtime, kubeadm packages,
+WireGuard when a VPN is used, and <code>kubeadm join</code> with a reachability wait and retries) and joins it
+to the cluster. The lifecycle mirrors AWS: <code>Validating</code> → (<code>ConfiguringVPN</code>) → <code>CreatingInstance</code> →
+<code>WaitingForInstance</code> → <code>Bootstrapping</code> → <code>RegisteringNode</code> → (<code>PrePullingImages</code>) → <code>Ready</code>.</p>
+<p><strong>Prerequisites</strong></p>
+<ul>
+<li>A GCP project with the <strong>Compute Engine API</strong> enabled (<code>gcloud services enable compute.googleapis.com</code>).</li>
+<li>A <strong>service account</strong> the controller uses, with a JSON key. It needs the permissions of
+  <code>roles/compute.instanceAdmin.v1</code> (instances, disks, images, zone/machine/accelerator lookups) and
+  <code>roles/compute.securityAdmin</code> (per-node firewall rules; optional, see "Firewall rules" below).
+  Attaching a service account to the VM (<code>gcpConfig.serviceAccountEmail</code>) additionally needs
+  <code>roles/iam.serviceAccountUser</code> on that account. On a Shared VPC add <code>roles/compute.networkUser</code> on
+  the subnetwork and let the controller create firewall rules in the host project.</li>
+<li>A VPC network. The default is the <code>default</code> network; if your project has no <code>default</code> network (or it
+  is custom-mode) set <code>gcpConfig.network</code> and <code>gcpConfig.subnetwork</code>.</li>
+<li><strong>Quota</strong> for the machine type (and GPUs) in the region.</li>
+<li>An organisation policy that <strong>enforces OS Login</strong> (<code>compute.requireOsLogin</code>) is not supported: the
+  controller logs in with an SSH key from instance metadata, which OS Login ignores.</li>
+</ul>
+<p><strong>Secret format</strong> — the service-account key JSON, under <code>credentials.json</code> (or <code>serviceAccountKey</code>;
+or any key named in <code>credentialsRef.key</code>). Only <code>"type": "service_account"</code> keys are accepted. The
+Secret must live in the NodeProvision's namespace. There is no MFA/STS equivalent: the Google client
+libraries renew OAuth2 tokens from the key themselves.</p>
+<pre><code class="language-bash">kubectl create secret generic gcp-node-credentials -n default \
+  --from-file=credentials.json=./sa-key.json
+</code></pre>
+<p><strong>Location</strong> — <code>spec.gcpConfig.zone</code> (e.g. <code>us-central1-a</code>) is authoritative. <code>spec.region</code> is
+optional and, when both are set, must be the zone's region. With only <code>region</code>, the controller picks
+the first <code>UP</code> zone of that region that offers the machine type (and GPU) and records it in
+<code>gcpConfig.zone</code>. The machine type is the top-level <code>spec.instanceType</code>
+(<code>nodeLabel: cpu</code> → <code>e2-standard-4</code>; <code>nodeLabel: gpu</code> → <code>n1-standard-8</code> + one <code>nvidia-tesla-t4</code>).
+Resolved defaults (project from the key, zone, network, boot image — latest Ubuntu 22.04 LTS from
+<code>ubuntu-os-cloud</code>) are patched into the spec on the first pass; values you set are never overwritten.</p>
+<p><strong>With a VPN</strong> (the default; the cluster runs WireGuard):</p>
+<pre><code class="language-yaml">apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: gcp-node-001            # must be a valid GCE instance name (it becomes the instance + node name)
+  namespace: default
+spec:
+  provider: GCP
+  role: worker
+  nodeLabel: cpu
+  region: us-central1           # or set gcpConfig.zone instead
+  credentialsRef:
+    name: gcp-node-credentials
+  # gcpConfig is optional — everything below is auto-populated when omitted:
+  # gcpConfig:
+  #   projectId: my-project
+  #   zone: us-central1-a
+  #   network: default
+  #   subnetwork: default
+  #   bootDiskSizeGB: 100
+  #   bootDiskType: pd-ssd
+  #   labels: {team: ml}
+  #   networkTags: [ml-nodes]
+  #   spot: false
+</code></pre>
+<p>The controller registers a WireGuard peer on the VPN server before the VM boots; the node reaches the
+control plane over <code>wg0</code> and its kubelet node IP is the tunnel IP.</p>
+<p><strong>Without a VPN</strong> (<code>disableVPN: true</code> on the control-plane <code>RemoteCluster</code>, inherited by the node):</p>
+<pre><code class="language-yaml">apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvision
+metadata:
+  name: gcp-node-002
+  namespace: default
+spec:
+  provider: GCP
+  role: worker
+  nodeLabel: gpu                # n1-standard-8 + 1x nvidia-tesla-t4
+  hardwareType: gpu
+  gcpConfig:
+    zone: europe-west4-a
+    firewallSourceRanges: [&quot;172.20.0.0/16&quot;]   # the control plane / controller (default: RFC1918)
+  credentialsRef:
+    name: gcp-node-credentials
+</code></pre>
+<p>No VPN server is contacted. The kubelet node IP is the VM's <strong>internal</strong> IP (read from the GCE
+metadata server), so the control plane must be able to route to it (same VPC, VPC peering, Cloud
+VPN/Interconnect), and the control plane's API endpoint must be reachable from the VM.</p>
+<p><strong>GPUs</strong> — N1: <code>gcpConfig.accelerator: {type: nvidia-tesla-t4, count: 1}</code>. A2/A3/G2 machine types
+(<code>a2-highgpu-1g</code>, <code>g2-standard-8</code>, …) include their GPUs: leave <code>accelerator</code> unset. GPU VMs use
+<code>onHostMaintenance: TERMINATE</code>. As on AWS, the bootstrap installs no NVIDIA software: the GPU Operator
+owns the driver, container toolkit and CDI (leave Secure Boot off, the default, so its driver loads).</p>
+<p><strong>Firewall rules</strong> — created per node, targeted at the node's own network tag, named
+<code>np-&lt;instance&gt;-&lt;wg|ssh|mgmt&gt;</code>, and deleted with the node:</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Rule</th>
+<th>Allows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>VPN</td>
+<td><code>wg</code></td>
+<td>UDP <code>vpnPort</code> (default 51820) <strong>from the VPN server's IP only</strong></td>
+</tr>
+<tr>
+<td>VPN</td>
+<td><code>ssh</code> (only if <code>firewallSourceRanges</code> is set)</td>
+<td>TCP 22 from those ranges — with a VPN, SSH travels inside the tunnel</td>
+</tr>
+<tr>
+<td>no VPN</td>
+<td><code>mgmt</code></td>
+<td>TCP 22, TCP 10250 (kubelet), UDP 8472 (flannel VXLAN) and ICMP from <code>firewallSourceRanges</code> (default RFC1918)</td>
+</tr>
+</tbody>
+</table></div>
+<p>If the service account may not create firewall rules the controller logs a warning and carries on
+(rules managed centrally); pre-create equivalent rules in that case.</p>
+<p><strong>What is created and deleted</strong> — the instance (boot disk auto-deleted), the firewall rules above, the
+VPN peer (VPN mode) and the <code>&lt;name&gt;-ssh-key</code> Secret (the generated private key; its public half is
+injected through the instance's <code>ssh-keys</code> metadata for user <code>ubuntu</code>, or <code>sshUsernameOverride</code>).
+<code>status.instanceId</code> is the GCE instance name. A relaunch after a controller crash adopts the existing
+instance (matched by name <strong>and</strong> the <code>nodeprovision-uid</code> label) instead of creating a second one; an
+instance of the same name that belongs to something else is never adopted or deleted.</p>
+<p><strong>Notes</strong></p>
+<ul>
+<li>The startup script (which embeds the registry token and, in VPN mode, the WireGuard private key) is
+  stored in instance metadata and is readable by anyone with <code>compute.instances.get</code> on the project —
+  the same exposure as EC2 user-data. Restrict that permission; the node needs no service account.</li>
+<li>Pods can reach the GCE metadata server unless you block <code>169.254.169.254</code> with a NetworkPolicy.</li>
+<li>Spot VMs (<code>spot: true</code>) are deleted when preempted; the NodeProvision then fails and retries.</li>
+<li><code>disableExternalIP: true</code> creates the VM without a public address; give it Cloud NAT for package
+  downloads (and, with a VPN, to reach the VPN server).</li>
+</ul>
+<hr>
+<h2 id="s6">6. Examples</h2>
+<h3 id="6-1-end-to-end-bootstrap-a-control-plane-add-a-worker-scale-with-nodeprovision">6.1 End-to-end: bootstrap a control plane, add a worker, scale with <code>NodeProvision</code></h3>
+<p><strong>Step 1 — apply the SSH secret and control-plane <code>RemoteCluster</code></strong> (on the management cluster):</p>
+<pre><code class="language-bash">kubectl apply -f - &lt;&lt;'EOF'
 apiVersion: v1
 kind: Secret
 metadata:
@@ -556,7 +811,7 @@ metadata:
 spec:
   clusterName: ml-cluster
   host: 192.168.3.234
-  port: "22"
+  port: &quot;22&quot;
   user: ubuntu
   nodeInfo:
     nodeType: control-plane
@@ -567,41 +822,43 @@ spec:
     sshPrivateKeySecretRef:
       name: cp-node-ssh-secret
       key: id_rsa
-EOF</code></pre>
-    <p><strong>Expect:</strong> <code>status.phase</code> moves <code>"" → Provisioning</code> immediately,
-    then stays <code>Provisioning</code> for roughly 5–15 minutes while the control plane is installed.
-    Watch it:</p>
-    <pre><code class="language-bash">kubectl get remotecluster ml-cluster-cp -w</code></pre>
-    <pre><code>NAME             PHASE          MESSAGE
+EOF
+</code></pre>
+<p><strong>Expect:</strong> <code>status.phase</code> moves <code>"" → Provisioning</code> immediately, then stays <code>Provisioning</code> for
+roughly 5–15 minutes while the control plane is installed. Watch it:</p>
+<pre><code class="language-bash">kubectl get remotecluster ml-cluster-cp -w
+</code></pre>
+<pre><code>NAME             PHASE          MESSAGE
 ml-cluster-cp    Provisioning   Provisioning in progress
-ml-cluster-cp    Ready          Provisioned</code></pre>
-
-    <p>Controller logs during this step (<code>kubectl logs -n remote-cluster-provisioner-system
-    deployment/remote-cluster-provisioner-controller-manager -f</code>) — an <strong>illustrative
-    transcript</strong> of what you'll typically see, for a cluster with <code>vpnConfig</code>
-    configured (as in the full samples under <code>config/samples/</code>). Exact timestamps and the
-    number of "in progress" lines will vary with how long the install actually takes on your
-    hardware:</p>
-    <pre><code>2026-09-08T10:15:03.412+0900   INFO    remotecluster   Starting provisioning node for cluster  {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster", "nodeType": "control-plane", "phase": ""}
-2026-09-08T10:15:03.498+0900   INFO    remotecluster   Control plane init goroutine started    {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster", "startPhase": 0}
-2026-09-08T10:15:33.501+0900   INFO    remotecluster   Control plane init in progress, requeueing      {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster"}
-2026-09-08T10:16:03.512+0900   INFO    remotecluster   Control plane init in progress, requeueing      {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster"}
+ml-cluster-cp    Ready          Provisioned
+</code></pre>
+<p>Controller logs during this step (<code>kubectl logs -n remote-cluster-provisioner-system
+deployment/remote-cluster-provisioner-controller-manager -f</code>) — an <strong>illustrative transcript</strong> of
+what you'll typically see, for a cluster with <code>vpnConfig</code> configured (as in the full samples under
+<code>config/samples/</code>). Exact timestamps and the number of "in progress" lines will vary with how long
+the install actually takes on your hardware:</p>
+<pre><code>2026-09-08T10:15:03.412+0900   INFO    remotecluster   Starting provisioning node for cluster  {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;, &quot;nodeType&quot;: &quot;control-plane&quot;, &quot;phase&quot;: &quot;&quot;}
+2026-09-08T10:15:03.498+0900   INFO    remotecluster   Control plane init goroutine started    {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;, &quot;startPhase&quot;: 0}
+2026-09-08T10:15:33.501+0900   INFO    remotecluster   Control plane init in progress, requeueing      {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;}
+2026-09-08T10:16:03.512+0900   INFO    remotecluster   Control plane init in progress, requeueing      {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;}
                                         ⋮  (repeats roughly every 30s while Kubernetes, the container runtime, networking, and ArgoCD are installed over SSH; typically 5-15 minutes)  ⋮
-2026-09-08T10:23:41.220+0900   INFO    remotecluster   Control plane init completed    {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster", "joinCommand": true}
-2026-09-08T10:23:42.005+0900   INFO    remotecluster   Kubeadm bootstrap token has never been explicitly refreshed; will refresh now  {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster"}
-2026-09-08T10:23:44.115+0900   INFO    remotecluster   Refreshed kubeadm bootstrap token       {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster"}
-2026-09-08T10:23:44.900+0900   INFO    remotecluster   Creating PackageVariants        {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster"}
-2026-09-08T10:23:45.760+0900   INFO    remotecluster   Core PackageVariants created — requeueing to allow platform sync before overlay step   {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster", "delay": "2m0s"}
-2026-09-08T10:25:46.003+0900   INFO    remotecluster   Creating PackageVariants        {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster"}
-2026-09-08T10:25:47.410+0900   INFO    remotecluster   PackageVariants created; cluster is fully ready        {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster"}
-2026-09-08T10:25:48.020+0900   INFO    remotecluster   Kubeadm bootstrap token still valid     {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster", "refreshedAt": "2026-09-08T10:23:44+09:00", "nextRefreshIn": "22h58m0s"}
-2026-09-08T10:25:48.021+0900   INFO    remotecluster   Cluster fully ready     {"cluster": "ml-cluster-cp", "clusterName": "ml-cluster", "nextTokenRefreshIn": "22h58m0s"}</code></pre>
-    <blockquote><p>A couple of lines appear more than once above — that's expected, not a duplicate or a
-    retry: the platform stack is deployed in two waves (core, then the rest), and each wave's completion
-    triggers its own follow-up check.</p></blockquote>
-
-    <p><strong>Step 2 — add a worker</strong> to the same <code>clusterName</code>:</p>
-    <pre><code class="language-yaml">kubectl apply -f - &lt;&lt;'EOF'
+2026-09-08T10:23:41.220+0900   INFO    remotecluster   Control plane init completed    {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;, &quot;joinCommand&quot;: true}
+2026-09-08T10:23:42.005+0900   INFO    remotecluster   Kubeadm bootstrap token has never been explicitly refreshed; will refresh now  {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;}
+2026-09-08T10:23:44.115+0900   INFO    remotecluster   Refreshed kubeadm bootstrap token       {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;}
+2026-09-08T10:23:44.900+0900   INFO    remotecluster   Creating PackageVariants        {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;}
+2026-09-08T10:23:45.760+0900   INFO    remotecluster   Core PackageVariants created — requeueing to allow platform sync before overlay step   {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;, &quot;delay&quot;: &quot;2m0s&quot;}
+2026-09-08T10:25:46.003+0900   INFO    remotecluster   Creating PackageVariants        {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;}
+2026-09-08T10:25:47.410+0900   INFO    remotecluster   PackageVariants created; cluster is fully ready        {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;}
+2026-09-08T10:25:48.020+0900   INFO    remotecluster   Kubeadm bootstrap token still valid     {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;, &quot;refreshedAt&quot;: &quot;2026-09-08T10:23:44+09:00&quot;, &quot;nextRefreshIn&quot;: &quot;22h58m0s&quot;}
+2026-09-08T10:25:48.021+0900   INFO    remotecluster   Cluster fully ready     {&quot;cluster&quot;: &quot;ml-cluster-cp&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;, &quot;nextTokenRefreshIn&quot;: &quot;22h58m0s&quot;}
+</code></pre>
+<blockquote>
+<p>A couple of lines appear more than once above — that's expected, not a duplicate or a retry: the
+platform stack is deployed in two waves (core, then the rest), and each wave's completion
+triggers its own follow-up check.</p>
+</blockquote>
+<p><strong>Step 2 — add a worker</strong> to the same <code>clusterName</code>:</p>
+<pre><code class="language-bash">kubectl apply -f - &lt;&lt;'EOF'
 apiVersion: v1
 kind: Secret
 metadata:
@@ -620,7 +877,7 @@ metadata:
 spec:
   clusterName: ml-cluster        # must match the control-plane's clusterName
   host: 192.168.3.235
-  port: "22"
+  port: &quot;22&quot;
   user: ubuntu
   nodeInfo:
     nodeType: worker
@@ -629,75 +886,78 @@ spec:
     sshPrivateKeySecretRef:
       name: worker-01-ssh-secret
       key: id_rsa
-EOF</code></pre>
-    <p><strong>Expect:</strong> once the control plane is confirmed <code>Ready</code>, this host is
-    joined to it. On success the resulting Kubernetes node is labeled so GPU-specific workloads (like
-    image pre-pull jobs) can schedule onto it.</p>
-
-    <p>Controller logs during this step — illustrative transcript, same caveats as Step 1. Note the gap:
-    joining a worker happens as one continuous step, so there's no repeated "in progress" line — the log
-    simply goes quiet for a few minutes between the first line and the last:</p>
-    <pre><code>2026-09-08T10:31:02.104+0900   INFO    remotecluster   Synced VPN server config from control-plane     {"cluster": "ml-cluster-worker-01", "clusterName": "ml-cluster", "cp": "ml-cluster-cp"}
+EOF
+</code></pre>
+<p><strong>Expect:</strong> once the control plane is confirmed <code>Ready</code>, this host is joined to it. On success the
+resulting Kubernetes node is labeled so GPU-specific workloads (like image pre-pull jobs) can
+schedule onto it.</p>
+<p>Controller logs during this step — illustrative transcript, same caveats as Step 1. Note the gap:
+joining a worker happens as one continuous step, so there's no repeated "in progress" line — the
+log simply goes quiet for a few minutes between the first line and the last:</p>
+<pre><code>2026-09-08T10:31:02.104+0900   INFO    remotecluster   Synced VPN server config from control-plane     {&quot;cluster&quot;: &quot;ml-cluster-worker-01&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;, &quot;cp&quot;: &quot;ml-cluster-cp&quot;}
                                         ⋮  (no further log lines while the join runs over SSH — typically a few minutes)  ⋮
-2026-09-08T10:34:18.760+0900   INFO    remotecluster   Worker node joined to cluster   {"cluster": "ml-cluster-worker-01", "clusterName": "ml-cluster"}
-2026-09-08T10:34:19.902+0900   INFO    remotecluster   Labeled worker node for DaemonSet targeting     {"cluster": "ml-cluster-worker-01", "node": "ml-cluster-worker-01", "hardwareType": "gpu"}</code></pre>
-
-    <p><strong>Step 3 — scale out with <code>NodeProvision</code></strong>, applied <strong>on the remote
-    cluster</strong> (<code>ml-cluster</code>) once it's up:</p>
-    <pre><code class="language-bash">kubectl --kubeconfig=ml-cluster.kubeconfig apply -f config/samples/ml_v1alpha1_nodeprovision.yaml</code></pre>
-    <p>That sample file applies, in order: the <code>NodeProvision</code> resource
-    (<code>provider: OnPrem</code>), its SSH Secret, a <code>NodeProvisionNetConfig</code> (harmless to
-    re-apply — it will already exist from Step 1/2), the registry credentials Secret, and the VPN server
-    SSH Secret.</p>
-    <pre><code class="language-bash">kubectl --kubeconfig=ml-cluster.kubeconfig get nodeprovision gpu-worker-01 -w</code></pre>
-    <pre><code>NAME            PHASE          MESSAGE
+2026-09-08T10:34:18.760+0900   INFO    remotecluster   Worker node joined to cluster   {&quot;cluster&quot;: &quot;ml-cluster-worker-01&quot;, &quot;clusterName&quot;: &quot;ml-cluster&quot;}
+2026-09-08T10:34:19.902+0900   INFO    remotecluster   Labeled worker node for DaemonSet targeting     {&quot;cluster&quot;: &quot;ml-cluster-worker-01&quot;, &quot;node&quot;: &quot;ml-cluster-worker-01&quot;, &quot;hardwareType&quot;: &quot;gpu&quot;}
+</code></pre>
+<p><strong>Step 3 — scale out with <code>NodeProvision</code></strong>, applied <strong>on the remote cluster</strong> (<code>ml-cluster</code>)
+once it's up:</p>
+<pre><code class="language-bash">kubectl --kubeconfig=ml-cluster.kubeconfig apply -f config/samples/ml_v1alpha1_nodeprovision.yaml
+</code></pre>
+<p>That sample file applies, in order: the <code>NodeProvision</code> resource (<code>provider: OnPrem</code>), its SSH
+Secret, a <code>NodeProvisionNetConfig</code> (harmless to re-apply — it will already exist from Step 1/2),
+the registry credentials Secret, and the VPN server SSH Secret.</p>
+<pre><code class="language-bash">kubectl --kubeconfig=ml-cluster.kubeconfig get nodeprovision gpu-worker-01 -w
+</code></pre>
+<pre><code>NAME            PHASE          MESSAGE
 gpu-worker-01   Pending
 gpu-worker-01   Provisioning   Validation successful
 gpu-worker-01   Bootstrapping  On-prem bootstrap goroutine started
 gpu-worker-01   RegisteringNode
 gpu-worker-01   Joining
-gpu-worker-01   Ready          Node reached Ready state</code></pre>
-
-    <p>Controller logs during this step — illustrative transcript, same caveats as Step 1, this time on
-    the <strong>remote cluster's</strong> controller:</p>
-    <pre><code>2026-09-08T11:02:10.301+0900   INFO    nodeprovision   Request received, starting provisioning         {"nodeprovision": "gpu-worker-01", "provider": "OnPrem"}
-2026-09-08T11:02:10.940+0900   INFO    nodeprovision   Validation successful   {"nodeprovision": "gpu-worker-01"}
-2026-09-08T11:02:11.205+0900   INFO    nodeprovision   On-prem bootstrap goroutine started     {"nodeprovision": "gpu-worker-01"}
+gpu-worker-01   Ready          Node reached Ready state
+</code></pre>
+<p>Controller logs during this step — illustrative transcript, same caveats as Step 1, this time on
+the <strong>remote cluster's</strong> controller:</p>
+<pre><code>2026-09-08T11:02:10.301+0900   INFO    nodeprovision   Request received, starting provisioning         {&quot;nodeprovision&quot;: &quot;gpu-worker-01&quot;, &quot;provider&quot;: &quot;OnPrem&quot;}
+2026-09-08T11:02:10.940+0900   INFO    nodeprovision   Validation successful   {&quot;nodeprovision&quot;: &quot;gpu-worker-01&quot;}
+2026-09-08T11:02:11.205+0900   INFO    nodeprovision   On-prem bootstrap goroutine started     {&quot;nodeprovision&quot;: &quot;gpu-worker-01&quot;}
                                         ⋮  (installing Kubernetes and the container runtime over SSH — typically several minutes)  ⋮
-2026-09-08T11:07:52.114+0900   INFO    nodeprovision   On-prem bootstrap completed     {"nodeprovision": "gpu-worker-01"}
-2026-09-08T11:07:52.560+0900   INFO    nodeprovision   On-prem node provisioned, waiting for cluster join      {"nodeprovision": "gpu-worker-01"}
-2026-09-08T11:08:22.601+0900   INFO    nodeprovision   Node not yet visible in cluster — waiting for kubelet to register      {"nodeprovision": "gpu-worker-01"}
-2026-09-08T11:08:52.744+0900   INFO    nodeprovision   Node registered with control plane      {"nodeprovision": "gpu-worker-01", "nodeName": "gpu-worker-01"}
-2026-09-08T11:08:53.310+0900   INFO    nodeprovision   Stamped ownership metadata on node      {"nodeprovision": "gpu-worker-01", "hardwareType": "gpu"}
-2026-09-08T11:08:53.815+0900   INFO    nodeprovision   Node reached Ready state        {"nodeprovision": "gpu-worker-01"}</code></pre>
-
-    <p>Confirm the node joined:</p>
-    <pre><code class="language-bash">kubectl --kubeconfig=ml-cluster.kubeconfig get nodes -l infra.dcn.ssu.ac.kr/worker=true</code></pre>
-
-    <h3>6.2 Example: rotating registry credentials</h3>
-    <pre><code class="language-bash">kubectl apply -f - &lt;&lt;'EOF'
+2026-09-08T11:07:52.114+0900   INFO    nodeprovision   On-prem bootstrap completed     {&quot;nodeprovision&quot;: &quot;gpu-worker-01&quot;}
+2026-09-08T11:07:52.560+0900   INFO    nodeprovision   On-prem node provisioned, waiting for cluster join      {&quot;nodeprovision&quot;: &quot;gpu-worker-01&quot;}
+2026-09-08T11:08:22.601+0900   INFO    nodeprovision   Node not yet visible in cluster — waiting for kubelet to register      {&quot;nodeprovision&quot;: &quot;gpu-worker-01&quot;}
+2026-09-08T11:08:52.744+0900   INFO    nodeprovision   Node registered with control plane      {&quot;nodeprovision&quot;: &quot;gpu-worker-01&quot;, &quot;nodeName&quot;: &quot;gpu-worker-01&quot;}
+2026-09-08T11:08:53.310+0900   INFO    nodeprovision   Stamped ownership metadata on node      {&quot;nodeprovision&quot;: &quot;gpu-worker-01&quot;, &quot;hardwareType&quot;: &quot;gpu&quot;}
+2026-09-08T11:08:53.815+0900   INFO    nodeprovision   Node reached Ready state        {&quot;nodeprovision&quot;: &quot;gpu-worker-01&quot;}
+</code></pre>
+<p>Confirm the node joined:</p>
+<pre><code class="language-bash">kubectl --kubeconfig=ml-cluster.kubeconfig get nodes -l infra.dcn.ssu.ac.kr/worker=true
+</code></pre>
+<h3 id="6-2-example-rotating-registry-credentials">6.2 Example: rotating registry credentials</h3>
+<pre><code class="language-bash">kubectl apply -f - &lt;&lt;'EOF'
 apiVersion: v1
 kind: Secret
 metadata:
   name: cnlab-runtime-registry
 type: Opaque
 stringData:
-  username: "your-github-username"
-  token: "ghp_newtoken..."
-EOF</code></pre>
-    <p>No restart needed. The change is picked up automatically — the management cluster pushes it out
-    to the remote cluster's shared config, and each node re-authenticates with the registry the next time
-    it checks.</p>
-    <p>Expected log line (management side):</p>
-    <pre><code>INFO  cnlab-runtime credentials changed — syncing to remote cluster</code></pre>
-    <p>Expected log line (remote side, per node):</p>
-    <pre><code>INFO  Runtime registry credentials changed — syncing to node via oras login
-INFO  Runtime registry credentials synced to node</code></pre>
-
-    <h2 id="s7">7. Logs &amp; Troubleshooting</h2>
-
-    <h3>7.1 Viewing/filtering controller logs</h3>
-    <pre><code class="language-bash"># Follow the controller (same command on both the management cluster
+  username: &quot;your-github-username&quot;
+  token: &quot;ghp_newtoken...&quot;
+EOF
+</code></pre>
+<p>No restart needed. The change is picked up automatically — the management cluster pushes it out
+to the remote cluster's shared config, and each node re-authenticates with the registry the next
+time it checks.</p>
+<p>Expected log line (management side):</p>
+<pre><code>INFO  cnlab-runtime credentials changed — syncing to remote cluster
+</code></pre>
+<p>Expected log line (remote side, per node):</p>
+<pre><code>INFO  Runtime registry credentials changed — syncing to node via oras login
+INFO  Runtime registry credentials synced to node
+</code></pre>
+<hr>
+<h2 id="s7">7. Logs &amp; Troubleshooting</h2>
+<h3 id="7-1-viewing-filtering-controller-logs">7.1 Viewing/filtering controller logs</h3>
+<pre><code class="language-bash"># Follow the controller (same command on both the management cluster
 # and every remote cluster — namespace is always
 # remote-cluster-provisioner-system)
 kubectl logs -n remote-cluster-provisioner-system \
@@ -709,38 +969,39 @@ kubectl logs -n remote-cluster-provisioner-system \
 
 # Filter for failures only
 kubectl logs -n remote-cluster-provisioner-system \
-  deployment/remote-cluster-provisioner-controller-manager | grep -i error</code></pre>
-    <p>By default, logs print in a human-readable console format (timestamp, level, a short logger name,
-    the message, then any extra details as key/value pairs) rather than JSON — that's fine to read
-    directly, or to pipe through <code>grep</code>/<code>jq</code>-style tools if your log format needs
-    adjusting for your log pipeline.</p>
-
-    <h3>7.2 Representative example logs</h3>
-    <blockquote><p>Labeled <strong>representative</strong> — these are typical messages you'll see, but
-    the exact surrounding details (cluster name, attempt numbers, timestamps) will vary per run.</p></blockquote>
-
-    <p><strong>Normal cluster provisioning:</strong></p>
-    <pre><code>INFO  Starting provisioning node for cluster            cluster=ml-cluster-cp clusterName=ml-cluster nodeType=control-plane
+  deployment/remote-cluster-provisioner-controller-manager | grep -i error
+</code></pre>
+<p>By default, logs print in a human-readable console format (timestamp, level, a short logger name,
+the message, then any extra details as key/value pairs) rather than JSON — that's fine to read
+directly, or to pipe through <code>grep</code>/<code>jq</code>-style tools if your log format needs adjusting for your
+log pipeline.</p>
+<h3 id="7-2-representative-example-logs">7.2 Representative example logs</h3>
+<blockquote>
+<p>Labeled <strong>representative</strong> — these are typical messages you'll see, but the exact surrounding
+details (cluster name, attempt numbers, timestamps) will vary per run.</p>
+</blockquote>
+<p><strong>Normal cluster provisioning:</strong></p>
+<pre><code>INFO  Starting provisioning node for cluster            cluster=ml-cluster-cp clusterName=ml-cluster nodeType=control-plane
 INFO  Control plane init goroutine started               startPhase=0
 INFO  Control plane init in progress, requeueing
 INFO  Control plane init completed                        joinCommand=true
-INFO  Cluster fully ready                                  nextTokenRefreshIn=23h0m0s</code></pre>
-
-    <p><strong>Join-token refresh (automatic, roughly every 23 hours):</strong></p>
-    <pre><code>INFO  Kubeadm bootstrap token due for refresh
+INFO  Cluster fully ready                                  nextTokenRefreshIn=23h0m0s
+</code></pre>
+<p><strong>Join-token refresh (automatic, roughly every 23 hours):</strong></p>
+<pre><code>INFO  Kubeadm bootstrap token due for refresh
 INFO  Refreshed kubeadm bootstrap token
-INFO  Kubeadm bootstrap token still valid                 refreshedAt=... nextRefreshIn=21h0m0s</code></pre>
-
-    <p><strong>Retry / terminal failure:</strong></p>
-    <pre><code>ERROR RemoteCluster provisioning failed — will retry       attempt=2 maxRetries=5
-ERROR RemoteCluster provisioning reached retry limit — no further retries   attempts=5 maxRetries=5</code></pre>
-
-    <p><strong>Registry credential sync:</strong></p>
-    <pre><code>INFO  cnlab-runtime credentials changed — syncing to remote cluster
-ERROR cnlab-runtime credential sync reached retry limit — no further retries</code></pre>
-
-    <p><strong>Normal on-prem node provisioning:</strong></p>
-    <pre><code>INFO  Request received, starting provisioning
+INFO  Kubeadm bootstrap token still valid                 refreshedAt=... nextRefreshIn=21h0m0s
+</code></pre>
+<p><strong>Retry / terminal failure:</strong></p>
+<pre><code>ERROR RemoteCluster provisioning failed — will retry       attempt=2 maxRetries=5
+ERROR RemoteCluster provisioning reached retry limit — no further retries   attempts=5 maxRetries=5
+</code></pre>
+<p><strong>Registry credential sync:</strong></p>
+<pre><code>INFO  cnlab-runtime credentials changed — syncing to remote cluster
+ERROR cnlab-runtime credential sync reached retry limit — no further retries
+</code></pre>
+<p><strong>Normal on-prem node provisioning:</strong></p>
+<pre><code>INFO  Request received, starting provisioning
 INFO  Validation successful
 INFO  On-prem bootstrap goroutine started
 INFO  On-prem bootstrap completed
@@ -748,10 +1009,10 @@ INFO  On-prem node provisioned, waiting for cluster join
 INFO  Node not yet visible in cluster — waiting for kubelet to register
 INFO  Node registered with control plane
 INFO  Stamped ownership metadata on node
-INFO  Node reached Ready state</code></pre>
-
-    <p><strong>AWS node provisioning:</strong></p>
-    <pre><code>INFO  AWS validation successful
+INFO  Node reached Ready state
+</code></pre>
+<p><strong>AWS node provisioning:</strong></p>
+<pre><code>INFO  AWS validation successful
 INFO  Resolved instance type from nodeLabel
 INFO  Resolved AMI
 INFO  Resolved network config
@@ -760,42 +1021,146 @@ INFO  Creating EC2 instance
 INFO  EC2 instance created
 INFO  EC2 instance created, waiting for it to become running
 INFO  EC2 instance running
-INFO  Executing cloud-init bootstrap</code></pre>
-
-    <p><strong>Stall / retry:</strong></p>
-    <pre><code>INFO  NodeProvision stalled without an InstanceID, failing for retry
+INFO  Executing cloud-init bootstrap
+</code></pre>
+<p><strong>Stall / retry:</strong></p>
+<pre><code>INFO  NodeProvision stalled without an InstanceID, failing for retry
 INFO  On-prem bootstrap stalled with no progress, failing for retry
 INFO  Node registration stalled, failing for retry
 INFO  NodeProvision in terminal Failed state — retry limit reached, manual intervention required
-INFO  Retrying NodeProvision after failure — releasing stale VPN IP and resetting phase</code></pre>
-
-    <p><strong>Deletion:</strong></p>
-    <pre><code>INFO  Deprovisioning RemoteCluster
+INFO  Retrying NodeProvision after failure — releasing stale VPN IP and resetting phase
+</code></pre>
+<p><strong>Deletion:</strong></p>
+<pre><code>INFO  Deprovisioning RemoteCluster
 INFO  Resetting node via SSH
 INFO  Node reset complete
 INFO  Removed WireGuard peer from VPN server
-INFO  RemoteCluster cleanup complete</code></pre>
-
-    <h3>7.3 Common errors &amp; how to resolve them</h3>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Symptom / log message</th><th>Likely cause</th><th>Resolution</th></tr></thead>
-      <tbody>
-        <tr><td><code>SSHConnectionFailed</code> in <code>status.message</code></td><td>Host unreachable, wrong credentials, or the VPN isn't up yet</td><td>Verify <code>spec.host</code>/<code>spec.vpnConfig.ip</code> is reachable; check the Secret's key name matches what you referenced</td></tr>
-        <tr><td><code>RemoteCluster provisioning reached retry limit — no further retries</code></td><td>5 consecutive failures</td><td>Fix the underlying issue (see <code>status.message</code>), then reset: <code>kubectl patch remotecluster &lt;name&gt; --subresource=status --type=merge -p '{"status":{"provisionRetryCount":0}}'</code></td></tr>
-        <tr><td><code>NodeProvision in terminal Failed state</code></td><td>5 consecutive failures on the remote side</td><td><code>kubectl patch nodeprovision &lt;name&gt; --subresource=status --type=merge -p '{"status":{"provisionRetryCount":0}}'</code></td></tr>
-        <tr><td><code>cnlab-runtime credential sync reached retry limit</code></td><td>VPN link between clusters may be down, or the credentials Secret is malformed</td><td>Check VPN connectivity; reset via <code>kubectl patch remotecluster &lt;name&gt; --subresource=status --type=merge -p '{"status":{"cnlabSyncRetryCount":0}}'</code></td></tr>
-        <tr><td>Node stuck in <code>Bootstrapping</code></td><td>Install is legitimately still running (5–15 min is normal), or it's genuinely hung</td><td><code>kubectl get nodeprovision &lt;name&gt; -o jsonpath='{.status.message}'</code>; SSH in and check <code>sudo fuser /var/lib/dpkg/lock-frontend</code> and <code>tail -50 /var/log/node-provision.log</code></td></tr>
-        <tr><td>Registry pull returns <code>unauthorized</code></td><td>Registry credentials missing/empty in the cluster's shared config</td><td>Apply the registry credentials Secret (or re-apply the sample, which includes it)</td></tr>
-        <tr><td>Networking plugins missing after cluster install</td><td>An install step was interrupted</td><td>Manually install the CNI plugins bundle (<code>v1.5.1</code>) to <code>/opt/cni/bin</code> on the affected node</td></tr>
-        <tr><td>GitOps platform resources not appearing / stuck</td><td>The platform hasn't synced the new cluster's repository yet, or a stale resource exists from a previous attempt</td><td>Check your Nephio/Porch resources; delete stale ones to force re-creation</td></tr>
-        <tr><td>Login page works after cluster is Ready, but auth fails</td><td>The identity provider's Service selector doesn't match its pod labels</td><td>Patch the Service's selector to match (see your platform's docs)</td></tr>
-        <tr><td>A <code>NodeProvision</code> never advances past <code>RegisteringNode</code></td><td>Node isn't visible yet — kubelet failed to register, or its VPN IP doesn't match any Node's address</td><td>SSH into the node, check the Kubernetes agent status, and check the VPN peer list on both the node and VPN server</td></tr>
-        <tr><td><code>not yet implemented</code> error for a GCP/Azure <code>provider</code></td><td>Only <code>AWS</code> and <code>OnPrem</code> are supported today</td><td>Use <code>AWS</code> or <code>OnPrem</code></td></tr>
-      </tbody>
-    </table></div>
-
-    <h3>7.4 Debugging / diagnostic commands</h3>
-    <pre><code class="language-bash"># Full status block for a RemoteCluster or NodeProvision
+INFO  RemoteCluster cleanup complete
+</code></pre>
+<h3 id="7-3-common-errors-how-to-resolve-them">7.3 Common errors &amp; how to resolve them</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Symptom / log message</th>
+<th>Likely cause</th>
+<th>Resolution</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SSHConnectionFailed</code> in <code>status.message</code></td>
+<td>Host unreachable, wrong credentials, or the VPN isn't up yet</td>
+<td>Verify <code>spec.host</code>/<code>spec.vpnConfig.ip</code> is reachable; check the Secret's key name matches what you referenced</td>
+</tr>
+<tr>
+<td><code>RemoteCluster provisioning reached retry limit — no further retries</code></td>
+<td>5 consecutive failures</td>
+<td>Fix the underlying issue (see <code>status.message</code>), then reset: <code>kubectl patch remotecluster &lt;name&gt; --subresource=status --type=merge -p '{"status":{"provisionRetryCount":0}}'</code></td>
+</tr>
+<tr>
+<td><code>NodeProvision in terminal Failed state</code></td>
+<td>5 consecutive failures on the remote side</td>
+<td><code>kubectl patch nodeprovision &lt;name&gt; --subresource=status --type=merge -p '{"status":{"provisionRetryCount":0}}'</code></td>
+</tr>
+<tr>
+<td><code>cnlab-runtime credential sync reached retry limit</code></td>
+<td>VPN link between clusters may be down, or the credentials Secret is malformed</td>
+<td>Check VPN connectivity; reset via <code>kubectl patch remotecluster &lt;name&gt; --subresource=status --type=merge -p '{"status":{"cnlabSyncRetryCount":0}}'</code></td>
+</tr>
+<tr>
+<td>Node stuck in <code>Bootstrapping</code></td>
+<td>Install is legitimately still running (5–15 min is normal), or it's genuinely hung</td>
+<td><code>kubectl get nodeprovision &lt;name&gt; -o jsonpath='{.status.message}'</code>; SSH in and check <code>sudo fuser /var/lib/dpkg/lock-frontend</code> and <code>tail -50 /var/log/node-provision.log</code></td>
+</tr>
+<tr>
+<td>Registry pull returns <code>unauthorized</code></td>
+<td>Registry credentials missing/empty in the cluster's shared config</td>
+<td>Apply the registry credentials Secret (or re-apply the sample, which includes it)</td>
+</tr>
+<tr>
+<td>Networking plugins missing after cluster install</td>
+<td>An install step was interrupted</td>
+<td>Manually install the CNI plugins bundle (<code>v1.5.1</code>) to <code>/opt/cni/bin</code> on the affected node</td>
+</tr>
+<tr>
+<td>GitOps platform resources not appearing / stuck</td>
+<td>The platform hasn't synced the new cluster's repository yet, or a stale resource exists from a previous attempt</td>
+<td>Check your Nephio/Porch resources; delete stale ones to force re-creation</td>
+</tr>
+<tr>
+<td>Login page works after cluster is Ready, but auth fails</td>
+<td>The identity provider's Service selector doesn't match its pod labels</td>
+<td>Patch the Service's selector to match (see your platform's docs)</td>
+</tr>
+<tr>
+<td>A <code>NodeProvision</code> never advances past <code>RegisteringNode</code></td>
+<td>Node isn't visible yet — kubelet failed to register, or its VPN IP doesn't match any Node's address</td>
+<td>SSH into the node, check the Kubernetes agent status, and check the VPN peer list on both the node and VPN server</td>
+</tr>
+<tr>
+<td><code>VPNModeMismatch</code> condition on a <code>RemoteCluster</code> worker (or a <code>NodeProvision</code> failed with "spec.disableVPN is set but ... runs with the VPN")</td>
+<td>The node's VPN mode differs from its cluster's</td>
+<td>See <a href="#s75">§7.5</a>: make the worker's <code>disableVPN</code> match the control-plane (usually just unset it)</td>
+</tr>
+<tr>
+<td><code>VPNModeChangeIgnored</code> condition</td>
+<td><code>spec.disableVPN</code> was edited after the node was provisioned</td>
+<td>Nothing breaks; the provisioned mode is kept. Revert the edit, or delete and re-create the node to change its mode</td>
+</tr>
+<tr>
+<td><code>WorkerFinalizeFailed</code> condition on a worker <code>RemoteCluster</code></td>
+<td>The worker joined, but recording its Ready status / IP on the control-plane failed (e.g. SSH to the control-plane)</td>
+<td>The controller retries automatically; fix SSH reachability to the control-plane (see <code>status.message</code>) and wait — no manual reset is needed</td>
+</tr>
+<tr>
+<td>SSH fails with a host key error, or <code>cannot load SSH_KNOWN_HOSTS_FILE</code></td>
+<td><code>SSH_KNOWN_HOSTS_FILE</code> is set and the host is not listed / the file is unreadable</td>
+<td>Add the host's key (of the type it offers) to the file, or fix the mount/path; see <a href="#s33">§3.3</a></td>
+</tr>
+<tr>
+<td><code>NodeProvision</code> failed with "namespace ... has N NodeProvisionNetConfigs ... does not set spec.clusterName" (or "N NodeProvisionNetConfigs ... have spec.clusterName ...")</td>
+<td>Several clusters share a namespace and the node does not say which one it joins (or two NetConfigs claim the same <code>clusterName</code>)</td>
+<td>Set <code>spec.clusterName</code> on the <code>NodeProvision</code> to the cluster's <code>clusterName</code>; make each <code>NodeProvisionNetConfig.spec.clusterName</code> unique (<a href="#s52">§5.2</a>). The retry budget is not consumed</td>
+</tr>
+<tr>
+<td><code>no NodeProvisionNetConfig with spec.clusterName "x"</code> in the controller log</td>
+<td>The <code>NodeProvision</code>'s <code>spec.clusterName</code> matches no NetConfig (typo, or the cluster's NetConfig is not synced yet)</td>
+<td>Fix the name, or wait for the <code>RemoteCluster</code> sync; the node requeues</td>
+</tr>
+<tr>
+<td><code>InvalidInsecureRegistries</code> / <code>insecureRegistries[i]: ... is not a valid registry host[:port]</code></td>
+<td>An <code>insecureRegistries</code> entry has a scheme, path, spaces, quotes, or a bad port</td>
+<td>Use bare <code>host</code> or <code>host:port</code> (<a href="#s52">§5.2</a>)</td>
+</tr>
+<tr>
+<td>Pull fails with <code>server gave HTTP response to HTTPS client</code> on a node</td>
+<td>The registry is plain HTTP but is not in <code>insecureRegistries</code> / <code>imagePrepulls</code>, or the node was provisioned before it was added, or CRI-O was not restarted</td>
+<td>Add it to <code>insecureRegistries</code>; on existing nodes apply the one-time drop-in + <code>systemctl restart crio</code> from <a href="#s52">§5.2</a></td>
+</tr>
+<tr>
+<td><code>not yet implemented</code> error for an Azure <code>provider</code></td>
+<td>Only <code>AWS</code>, <code>GCP</code> and <code>OnPrem</code> are supported today</td>
+<td>Use one of those</td>
+</tr>
+<tr>
+<td>GCP: <code>permission denied</code> / <code>GCP quota exceeded</code> / <code>no capacity</code> in <code>status.message</code></td>
+<td>The service account lacks a role or the Compute Engine API is off; the project quota for the machine type/GPU is used up; or the zone has no capacity</td>
+<td>Grant the roles in <a href="#s54">§5.4</a>, enable the API, raise the quota, or set another <code>gcpConfig.zone</code></td>
+</tr>
+<tr>
+<td>GCP: <code>instance ... belongs to something else</code> / name already in use</td>
+<td>An instance with the NodeProvision's name exists in the zone but was not created for it</td>
+<td>Rename the NodeProvision or delete the stray instance; the controller never adopts or deletes it</td>
+</tr>
+<tr>
+<td>GCP node stuck in <code>Bootstrapping</code>, or <code>Joining</code> never completes</td>
+<td>The startup script failed, or (no VPN) the control plane cannot route to the VM's internal IP</td>
+<td><code>gcloud compute instances get-serial-port-output &lt;name&gt; --zone &lt;zone&gt;</code> and <code>sudo journalctl -u google-startup-scripts</code>; the log is <code>/var/log/node-bootstrap.log</code></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="7-4-debugging-diagnostic-commands">7.4 Debugging / diagnostic commands</h3>
+<pre><code class="language-bash"># Full status block for a RemoteCluster or NodeProvision
 kubectl get remotecluster &lt;name&gt; -o yaml
 kubectl get nodeprovision &lt;name&gt; -o yaml
 
@@ -803,7 +1168,7 @@ kubectl get nodeprovision &lt;name&gt; -o yaml
 kubectl get remotecluster &lt;name&gt; -o jsonpath='{.status.conditions}' | jq
 
 # Check what a stuck on-prem NodeProvision is doing
-kubectl get nodeprovision &lt;name&gt; -o jsonpath='{.status.progress}{"\n"}{.status.message}'
+kubectl get nodeprovision &lt;name&gt; -o jsonpath='{.status.progress}{&quot;\n&quot;}{.status.message}'
 
 # Inspect the image pre-pull job (GPU nodes only)
 kubectl get jobs -l job-name=&lt;nodeprovision-name&gt;-prepull
@@ -812,246 +1177,652 @@ kubectl logs job/&lt;nodeprovision-name&gt;-prepull
 # On the remote control-plane host directly (bypasses the controller entirely)
 ssh ubuntu@&lt;cp-ip&gt; 'sudo tail -50 /var/log/node-provision.log'
 ssh ubuntu@&lt;cp-ip&gt; 'sudo crictl info'
-ssh ubuntu@&lt;cp-ip&gt; 'wg show wg0'</code></pre>
-
-    <h2 id="s8">8. Controller Lifecycle / Reconciliation</h2>
-
-    <h3 id="s8-1">8.1 <code>RemoteCluster</code> create/update/delete</h3>
-    <p><strong>Create:</strong> the resource moves to <code>Provisioning</code>. For a
-    <strong>control-plane</strong> node, Kubernetes, container runtime, networking, and (if enabled) the
-    GitOps agent are installed — this typically takes 5–15 minutes and can be watched via
-    <code>status.phase</code>/<code>status.message</code>. For a <strong>worker</strong>, it's joined to
-    the sibling <code>RemoteCluster</code> with the same <code>clusterName</code> — this requires that
-    control-plane to already be <code>Ready</code>. On success, the cluster's shared configuration
-    (<code>NodeProvisionNetConfig</code>) is created/updated, and the resource moves to <code>Ready</code>.
-    For a control-plane, this is followed by deploying the GitOps platform stack in two waves.</p>
-    <p><strong>Update:</strong> a <code>Ready</code> cluster is periodically re-checked to keep its join
-    token fresh (roughly every 23 hours) and to catch any configuration drift (VPN settings, software
-    versions, registry credentials) between the <code>RemoteCluster</code> resource and the cluster's
-    actual shared config. If a provisioning attempt is interrupted partway (e.g. a controller restart),
-    the next attempt resumes from where it left off rather than starting the entire install over.</p>
-    <p><strong>Delete:</strong> deleting a <code>RemoteCluster</code> cleanly tears the node back down —
-    it's drained and removed from the cluster (workers only), reset back to a bare host (Kubernetes,
-    container runtime, and networking uninstalled), and removed from the VPN. All of this cleanup is
-    best-effort: an unreachable or already-gone node never blocks the resource from being deleted.</p>
-
-    <h3 id="s8-2">8.2 <code>NodeProvision</code> create/update/delete</h3>
-    <p><strong>Create:</strong> the resource works through the phases shown in <a href="#s2-3">§2.3</a>.
-    For AWS, unset fields (instance type, AMI, networking, key pair) are automatically resolved for you.
-    Once the node is visible in the cluster, it's labeled so GPU/CPU-specific workloads schedule onto it
-    correctly.</p>
-    <p><strong>Update:</strong> a <code>Ready</code> node is periodically checked for registry-credential
-    drift and re-authenticates automatically if credentials changed. A <code>Failed</code> node below the
-    retry limit is automatically reset for a clean retry — you don't need to delete and recreate it.</p>
-    <p><strong>Delete:</strong> the node is removed from the cluster, its cloud instance is terminated
-    (AWS) or it's reset back to a bare host (on-prem), and it's removed from the VPN.</p>
-
-    <h3>8.3 Retries, failures, and recovery</h3>
-    <p>Every provisioning failure is counted. After <strong>5 consecutive failures</strong>, the resource
-    is left in a terminal <code>Failed</code> state and stops retrying automatically — this is
-    intentional, since repeated failures against the same host usually mean something needs a human to
-    look at (wrong credentials, host down, disk full, etc.). Once you've fixed the underlying issue, reset
-    the retry counter to resume — the exact <code>kubectl patch</code> command for each resource type is
-    in <a href="#s7-3">§7.3</a>.</p>
-    <p><code>RemoteCluster.status.conditions</code> keeps a full history, not just the latest state —
-    useful for seeing exactly what happened across the resource's lifetime, not only its current
-    status.</p>
-
-    <h2 id="s9">9. Operations</h2>
-
-    <h3>9.1 Health checks</h3>
-    <pre><code class="language-bash">kubectl get pods -n remote-cluster-provisioner-system
+ssh ubuntu@&lt;cp-ip&gt; 'wg show wg0'
+</code></pre>
+<h3 id="7-5-operational-notes">7.5 Operational notes</h3>
+<p><strong>VPN mode conditions (<code>RemoteCluster.status.conditions</code>)</strong></p>
+<ul>
+<li><strong><code>VPNModeMismatch</code></strong> — a worker's VPN mode disagrees with its control-plane's (the whole cluster
+  must use one mode). An <em>unprovisioned</em> worker that sets <code>disableVPN: true</code> under a VPN
+  control-plane is failed <strong>without consuming a retry</strong>; edit the worker to remove <code>disableVPN</code>
+  (or change the control-plane) and it proceeds. A worker that is <em>already provisioned</em> is left
+  untouched and re-checked every minute; re-provision the worker or the control-plane to make
+  them agree. A <code>NodeProvision</code> in the same situation is set to <code>Failed</code> with the explanation in
+  <code>status.message</code> (this one does count as a failure; reset <code>provisionRetryCount</code> after fixing the
+  spec, see <a href="#s73">§7.3</a>).</li>
+<li><strong><code>VPNModeChangeIgnored</code></strong> — <code>spec.disableVPN</code> was changed on a node that is already
+  provisioned. The mode the node was provisioned with (annotation
+  <code>infra.dcn.ssu.ac.kr/provisioned-vpn-mode</code>, <code>vpn</code> or <code>novpn</code>) is authoritative and is what
+  teardown uses; the edit is ignored. The condition clears when the spec matches again.</li>
+<li><strong><code>WorkerFinalizeFailed</code></strong> — the worker has joined, but the follow-up bookkeeping (Ready status
+  and its VPN/node IP entry on the control-plane) could not be completed. It is retried
+  automatically and the pending IP is remembered in an annotation, so nothing is lost; resolve
+  whatever the message says (typically SSH access to the control-plane).</li>
+</ul>
+<p><strong>SSH host keys</strong> — opt-in via <code>SSH_KNOWN_HOSTS_FILE</code>, fails closed for unlisted hosts; see
+<a href="#s33">§3.3</a>.</p>
+<p><strong>AWS nodes</strong></p>
+<ul>
+<li>Instances are launched with <strong>IMDSv2 required</strong> (<code>HttpTokens: required</code>); IMDSv1 requests are
+  rejected. The bootstrap script already uses IMDSv2 tokens; any other tooling on the node must too.</li>
+<li>The default IMDS hop limit (1) is kept, so the metadata service is <strong>unreachable from containers/pods</strong>
+  on those nodes; workloads that need instance credentials must use another mechanism.</li>
+<li>Every instance (and its root volume) is tagged <strong><code>ml.dcn.ssu.ac.kr/nodeprovision-uid</code></strong> with the
+  owning <code>NodeProvision</code>'s UID. The controller uses the tag to adopt or clean up an instance whose
+  ID never reached <code>status</code> (for example a crash right after launch); do not remove or edit it.
+  Launches are idempotent within one provisioning attempt (the EC2 client token combines the UID
+  with <code>status.provisionRetryCount</code>), so a repeated launch call does not create a second instance;
+  each retry after a failure terminates the old instance first and launches a fresh one.</li>
+</ul>
+<p><strong>Failure, retry and deletion behaviour</strong></p>
+<ul>
+<li><strong><code>NodeProvision</code> retries.</strong> Before each retry of a failed AWS node the controller removes the
+  joined Node, terminates the instance and releases its VPN peer, then clears the identity fields
+  in <code>status</code>; if termination fails it waits and retries rather than resetting. An on-prem node that
+  already registered in the cluster is left alone and provisioning resumes at the join step.</li>
+<li><strong>Terminal <code>Failed</code>.</strong> When <code>provisionRetryCount</code> reaches the limit, AWS resources are released once
+  (instance, Node, VPN peer; the status message gains <code>[resources released]</code>) so nothing keeps
+  billing. Patching <code>status.provisionRetryCount</code> to 0 starts a fresh attempt. An already-registered
+  on-prem node and its peer are deliberately not touched.</li>
+<li><strong><code>NodeProvision</code> deletion.</strong> The on-prem node reset runs once (annotation
+  <code>ml.dcn.ssu.ac.kr/node-reset-done</code>). A failing VPN peer cleanup keeps the finalizer and is retried
+  every 30 s; after 10 minutes it gives up loudly so an unreachable VPN server cannot block deletion.</li>
+<li><strong><code>RemoteCluster</code> deletion.</strong> Node drain/reset run once (annotation
+  <code>infra.dcn.ssu.ac.kr/delete-node-cleanup-done</code>). Only deleting the <strong>control-plane</strong> removes the
+  cluster's Porch repositories, Nephio tokens and PackageVariants; deleting a worker never does.</li>
+<li><strong>PackageVariants with several clusters.</strong> Existing names (for example <code>harbor-variant</code>) are kept for
+  the cluster that owns them. A second control-plane with a different <code>spec.clusterName</code> gets
+  <code>&lt;name&gt;-&lt;clusterName&gt;</code> variants in the same namespace instead of failing; two control-planes with
+  the <em>same</em> <code>clusterName</code> still share their objects.</li>
+<li><strong>Bootstrap token.</strong> The control-plane reschedules itself to refresh the kubeadm bootstrap token
+  before it expires; a token that is overdue is retried after one minute.</li>
+<li><strong>Redaction.</strong> Secrets are redacted from <code>status.message</code> and logs (tokens, private keys, and values
+  after <code>password</code>/<code>secret</code>/<code>token</code>/<code>key</code> style keys). Because the rule is deliberately broad, a
+  diagnostic such as <code>secret: &lt;word&gt;</code> may lose the word that follows it.</li>
+</ul>
+<p><strong>Controller image</strong> — the published image is <strong>no longer obfuscated</strong>. Obfuscation (garble)
+is opt-in at build time with <code>--build-arg OBFUSCATE=true</code> (or the <code>OBFUSCATE</code> repository variable
+for the publish workflow) and makes crash traces much harder to read.</p>
+<hr>
+<h2 id="s8">8. Controller Lifecycle / Reconciliation</h2>
+<h3 id="8-1-remotecluster-create-update-delete">8.1 <code>RemoteCluster</code> create/update/delete</h3>
+<p><strong>Create:</strong> the resource moves to <code>Provisioning</code>. For a <strong>control-plane</strong> node, Kubernetes,
+container runtime, networking, and (if enabled) the GitOps agent are installed — this typically
+takes 5–15 minutes and can be watched via <code>status.phase</code>/<code>status.message</code>. For a <strong>worker</strong>, it's
+joined to the sibling <code>RemoteCluster</code> with the same <code>clusterName</code> — this requires that
+control-plane to already be <code>Ready</code>. On success, the cluster's shared configuration
+(<code>NodeProvisionNetConfig</code>) is created/updated, and the resource moves to <code>Ready</code>. For a
+control-plane, this is followed by deploying the GitOps platform stack in two waves.</p>
+<p><strong>Update:</strong> a <code>Ready</code> cluster is periodically re-checked to keep its join token fresh (roughly
+every 23 hours) and to catch any configuration drift (VPN settings, software versions, registry
+credentials) between the <code>RemoteCluster</code> resource and the cluster's actual shared config. If a
+provisioning attempt is interrupted partway (e.g. a controller restart), the next attempt resumes
+from where it left off rather than starting the entire install over.</p>
+<p><strong>Delete:</strong> deleting a <code>RemoteCluster</code> cleanly tears the node back down — it's drained and removed
+from the cluster (workers only), reset back to a bare host (Kubernetes, container runtime, and
+networking uninstalled), and removed from the VPN. All of this cleanup is best-effort: an
+unreachable or already-gone node never blocks the resource from being deleted.</p>
+<h3 id="8-2-nodeprovision-create-update-delete">8.2 <code>NodeProvision</code> create/update/delete</h3>
+<p><strong>Create:</strong> the resource works through the phases shown in <a href="#s23">§2.3</a>.
+For AWS, unset fields (instance type, AMI, networking, key pair) are automatically resolved for
+you. Once the node is visible in the cluster, it's labeled so GPU/CPU-specific workloads schedule
+onto it correctly.</p>
+<p><strong>Update:</strong> a <code>Ready</code> node is periodically checked for registry-credential drift and
+re-authenticates automatically if credentials changed. A <code>Failed</code> node below the retry limit is
+automatically reset for a clean retry — you don't need to delete and recreate it.</p>
+<p><strong>Delete:</strong> the node is removed from the cluster, its cloud instance is terminated (AWS) or it's
+reset back to a bare host (on-prem), and it's removed from the VPN.</p>
+<h3 id="8-3-retries-failures-and-recovery">8.3 Retries, failures, and recovery</h3>
+<p>Every provisioning failure is counted. After <strong>5 consecutive failures</strong>, the resource is left in a
+terminal <code>Failed</code> state and stops retrying automatically — this is intentional, since repeated
+failures against the same host usually mean something needs a human to look at (wrong
+credentials, host down, disk full, etc.). Once you've fixed the underlying issue, reset the retry
+counter to resume — the exact <code>kubectl patch</code> command for each resource type is in
+<a href="#s73">§7.3</a>.</p>
+<p><code>RemoteCluster.status.conditions</code> keeps a full history, not just the latest state — useful for
+seeing exactly what happened across the resource's lifetime, not only its current status.</p>
+<hr>
+<h2 id="s9">9. Operations</h2>
+<h3 id="9-1-health-checks">9.1 Health checks</h3>
+<pre><code class="language-bash">kubectl get pods -n remote-cluster-provisioner-system
 kubectl describe pod -n remote-cluster-provisioner-system \
-  -l control-plane=controller-manager</code></pre>
-    <p>The liveness/readiness probes only confirm the controller process itself is alive — not that any
-    particular SSH/AWS/VPN operation is succeeding. For that, check the resource's own
-    <code>status</code>/<code>conditions</code> and logs (see <a href="#s7">§7</a>).</p>
-
-    <h3>9.2 Restart</h3>
-    <pre><code class="language-bash">kubectl rollout restart deployment/remote-cluster-provisioner-controller-manager \
-  -n remote-cluster-provisioner-system</code></pre>
-    <p>In-flight provisioning work resumes from where it left off after a restart rather than starting
-    over — see <a href="#s8-1">§8.1</a>/<a href="#s8-2">§8.2</a>.</p>
-
-    <h3>9.3 Upgrade</h3>
-    <pre><code class="language-bash">make deploy IMG=&lt;registry&gt;/remote-cluster-provisioner:&lt;new-tag&gt;</code></pre>
-    <p>Point <code>IMG</code> at whichever new pre-built image you've been given. If the new version adds
-    new CRD fields, re-run <code>make install</code> first so the CRDs are up to date before the new
-    controller version starts.</p>
-
-    <h3>9.4 Uninstall</h3>
-    <pre><code class="language-bash"># Remove the controller and its permissions/namespace
+  -l control-plane=controller-manager
+</code></pre>
+<p>The liveness/readiness probes only confirm the controller process itself is alive — not that any
+particular SSH/AWS/VPN operation is succeeding. For that, check the resource's own
+<code>status</code>/<code>conditions</code> and logs (see <a href="#s7">§7</a>).</p>
+<h3 id="9-2-restart">9.2 Restart</h3>
+<pre><code class="language-bash">kubectl rollout restart deployment/remote-cluster-provisioner-controller-manager \
+  -n remote-cluster-provisioner-system
+</code></pre>
+<p>In-flight provisioning work resumes from where it left off after a restart rather than starting
+over — see <a href="#s81">§8.1</a>/<a href="#s82">§8.2</a>.</p>
+<h3 id="9-3-upgrade">9.3 Upgrade</h3>
+<pre><code class="language-bash">make deploy IMG=&lt;registry&gt;/remote-cluster-provisioner:&lt;new-tag&gt;
+</code></pre>
+<p>Point <code>IMG</code> at whichever new pre-built image you've been given. If the new version adds new CRD
+fields, re-run <code>make install</code> first so the CRDs are up to date before the new controller version
+starts.</p>
+<h3 id="9-4-uninstall">9.4 Uninstall</h3>
+<pre><code class="language-bash"># Remove the controller and its permissions/namespace
 make undeploy
 
 # Remove the CRDs (only after — see the warning below)
-make uninstall</code></pre>
-    <blockquote>
-      <p><strong>Before removing anything</strong>, delete any live <code>RemoteCluster</code>/
-      <code>NodeProvision</code> resources first (<code>kubectl delete remotecluster --all</code>,
-      <code>kubectl delete nodeprovision --all</code>) and wait for them to finish deleting, so nodes get
-      reset and removed from the VPN properly. Removing the CRDs while resources still exist skips that
-      cleanup — you'd be left with nodes still joined to the cluster and still registered on the VPN.</p>
-    </blockquote>
-
-    <h3 id="s9-5">9.5 Inspecting status across your fleet</h3>
-    <pre><code class="language-bash"># All RemoteClusters and their current phase
+make uninstall
+</code></pre>
+<blockquote>
+<p><strong>Before removing anything</strong>, delete any live <code>RemoteCluster</code>/<code>NodeProvision</code> resources first
+(<code>kubectl delete remotecluster --all</code>, <code>kubectl delete nodeprovision --all</code>) and wait for them to
+finish deleting, so nodes get reset and removed from the VPN properly. Removing the CRDs while
+resources still exist skips that cleanup — you'd be left with nodes still joined to the cluster
+and still registered on the VPN.</p>
+</blockquote>
+<h3 id="9-5-inspecting-status-across-your-fleet">9.5 Inspecting status across your fleet</h3>
+<pre><code class="language-bash"># All RemoteClusters and their current phase
 kubectl get remotecluster -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,CLUSTER:.spec.clusterName
 
 # All NodeProvisions on a remote cluster
-kubectl get nodeprovision -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,PROVIDER:.spec.provider,IP:.status.ipAddress</code></pre>
-
-    <h3>9.6 Monitoring</h3>
-    <p>Day-to-day observability is status/condition- and log-driven (see <a href="#s7">§7</a> and
-    <a href="#s9-5">§9.5</a>) rather than dashboard-driven — there isn't a bundled dashboard today. If
-    your platform team wants Prometheus metrics, ask them to enable the metrics endpoint on the
-    controller Deployment.</p>
-
-    <h2 id="s10">10. Reference</h2>
-
-    <h3 id="s10-1">10.1 <code>RemoteCluster</code></h3>
-    <p><strong>Spec:</strong></p>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
-      <tbody>
-        <tr><td><code>clusterName</code></td><td>string</td><td>Shared across every node (control-plane + workers) of one logical cluster</td></tr>
-        <tr><td><code>host</code></td><td>string</td><td>LAN/public IP or hostname of the target node</td></tr>
-        <tr><td><code>port</code></td><td>string</td><td>SSH port (e.g. <code>"22"</code>)</td></tr>
-        <tr><td><code>user</code></td><td>string</td><td>SSH username</td></tr>
-        <tr><td><code>nodeInfo.nodeType</code></td><td>string</td><td><code>control-plane</code> | <code>worker</code></td></tr>
-        <tr><td><code>nodeInfo.hardwareType</code></td><td>string</td><td><code>cpu</code> | <code>gpu</code></td></tr>
-        <tr><td><code>nodeInfo.softwareConfig.kubernetesVersion</code></td><td>string</td><td>e.g. <code>v1.34.2</code></td></tr>
-        <tr><td><code>nodeInfo.softwareConfig.imagePrepulls[]</code></td><td><code>{image, nodeTarget}</code></td><td><code>nodeTarget</code> is <code>gpu</code> or <code>all</code> (default <code>all</code>)</td></tr>
-        <tr><td><code>nodeInfo.softwareConfig.imagePullSecretRef</code></td><td>secret ref</td><td>optional</td></tr>
-        <tr><td><code>nodeInfo.softwareConfig.cnlabRuntime</code></td><td>object</td><td>optional; sensible defaults if omitted</td></tr>
-        <tr><td><code>nodeInfo.softwareConfig.platformVariables[]</code></td><td><code>{key, value}</code></td><td>optional; passed through to the GitOps platform stack</td></tr>
-        <tr><td><code>auth.sshPrivateKeySecretRef</code> / <code>auth.passwordSecretRef</code></td><td>secret ref</td><td>exactly one; auto-detects key vs. password auth</td></tr>
-        <tr><td><code>vpnConfig.ip</code></td><td>string</td><td>this node's VPN IP; preferred over <code>host</code> once set</td></tr>
-        <tr><td><code>vpnConfig.vpnServerPublicIP</code> / <code>vpnServerSSHPort</code> / <code>vpnServerSSHUsername</code></td><td>string</td><td>VPN server SSH connection details</td></tr>
-        <tr><td><code>vpnConfig.vpnSshCredentialsRef</code></td><td>secret ref</td><td>Secret with the VPN server's SSH credential</td></tr>
-        <tr><td><code>gitConfig.enable</code></td><td>string</td><td><code>"true"</code>/<code>"false"</code> — gates GitOps platform deployment</td></tr>
-        <tr><td><code>gitConfig.gitServer</code> / <code>gitUsername</code> / <code>upstreamPlatformRepo</code> / <code>packageRevision</code></td><td>string</td><td>GitOps source details</td></tr>
-      </tbody>
-    </table></div>
-    <p><strong>Status:</strong></p>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
-      <tbody>
-        <tr><td><code>phase</code></td><td><code>Provisioning</code> → <code>Ready</code> → <code>Failed</code></td></tr>
-        <tr><td><code>message</code></td><td>Human-readable status, includes retry count on failure</td></tr>
-        <tr><td><code>conditions[]</code></td><td>Full history of status changes, most recent last</td></tr>
-        <tr><td><code>joinCommand</code></td><td>Cached join command, used when adding workers</td></tr>
-        <tr><td><code>provisionRetryCount</code></td><td>Consecutive provisioning failures; resets to 0 on <code>Ready</code></td></tr>
-        <tr><td><code>cnlabSyncRetryCount</code></td><td>Consecutive registry-credential sync failures</td></tr>
-      </tbody>
-    </table></div>
-
-    <h3>10.2 <code>NodeProvision</code></h3>
-    <p><strong>Spec:</strong></p>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
-      <tbody>
-        <tr><td><code>provider</code></td><td>string</td><td><code>OnPrem</code> | <code>AWS</code> (<code>GCP</code>/<code>Azure</code> are not implemented yet)</td></tr>
-        <tr><td><code>role</code></td><td>string</td><td>always <code>worker</code> in practice</td></tr>
-        <tr><td><code>hardwareType</code></td><td>string</td><td><code>gpu</code>/<code>cpu</code> (or empty) — filters which images get pre-pulled</td></tr>
-        <tr><td><code>nodeLabel</code></td><td>string</td><td>drives AWS default instance-type resolution (<code>cpu</code>→<code>t3.xlarge</code>, <code>gpu</code>→<code>p3.2xlarge</code>)</td></tr>
-        <tr><td><code>region</code></td><td>string</td><td>AWS region</td></tr>
-        <tr><td><code>instanceType</code></td><td>string</td><td>overrides the <code>nodeLabel</code> lookup</td></tr>
-        <tr><td><code>hostname</code> / <code>ipAddress</code></td><td>string</td><td>on-prem target; <code>ipAddress</code> takes priority if both set</td></tr>
-        <tr><td><code>sshPort</code></td><td>int</td><td>default <code>22</code></td></tr>
-        <tr><td><code>sshUsernameOverride</code></td><td>string</td><td></td></tr>
-        <tr><td><code>credentialsRef</code></td><td>secret ref</td><td>key auto-detected if omitted</td></tr>
-        <tr><td><code>awsConfig</code></td><td>object</td><td><code>vpcId</code>, <code>subnetId</code>, <code>securityGroupIds[]</code>, <code>ami</code>, <code>keyPairName</code>, <code>iamInstanceProfile</code>, <code>tags{}</code>, <code>rootVolumeSizeGB</code> — all auto-resolved if omitted</td></tr>
-      </tbody>
-    </table></div>
-    <p><strong>Status:</strong></p>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
-      <tbody>
-        <tr><td><code>phase</code></td><td>See <a href="#s2-3">§2.3</a></td></tr>
-        <tr><td><code>message</code></td><td>Human-readable status</td></tr>
-        <tr><td><code>instanceId</code> / <code>hostname</code> / <code>ipAddress</code></td><td>Identity</td></tr>
-        <tr><td><code>publicIp</code> / <code>privateIp</code></td><td>AWS-only</td></tr>
-        <tr><td><code>vpnIp</code></td><td>VPN IP allocated for this node</td></tr>
-        <tr><td><code>progress</code></td><td>0–100</td></tr>
-        <tr><td><code>nodeName</code></td><td>Kubernetes node name once registered</td></tr>
-        <tr><td><code>runtimeCredentialsHash</code></td><td>Fingerprint of last-synced registry credentials</td></tr>
-        <tr><td><code>provisionRetryCount</code></td><td>Consecutive failures; resets to 0 on <code>Ready</code></td></tr>
-      </tbody>
-    </table></div>
-
-    <h3>10.3 <code>NodeProvisionNetConfig</code></h3>
-    <p><strong>Spec:</strong></p>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
-      <tbody>
-        <tr><td><code>clusterName</code></td><td>string</td><td></td></tr>
-        <tr><td><code>vpnRange</code></td><td>string</td><td>CIDR, e.g. <code>10.9.0.0/24</code></td></tr>
-        <tr><td><code>vpnServerPublicConfig.publicIP</code></td><td>string</td><td></td></tr>
-        <tr><td><code>vpnServerPublicConfig.sshPort</code> / <code>sshUsername</code></td><td>string</td><td>defaults <code>22</code> / <code>ubuntu</code></td></tr>
-        <tr><td><code>vpnServerPublicConfig.vpnPort</code></td><td>string</td><td>default <code>51820</code></td></tr>
-        <tr><td><code>vpnServerPublicConfig.vpnSshCredentialsRef</code></td><td>secret ref</td><td></td></tr>
-        <tr><td><code>softwareConfig.kubernetesVersion</code></td><td>string</td><td></td></tr>
-        <tr><td><code>softwareConfig.imagePrepulls[]</code></td><td><code>{image, nodeTarget}</code></td><td></td></tr>
-        <tr><td><code>softwareConfig.imagePullSecretRef</code></td><td>secret ref</td><td></td></tr>
-        <tr><td><code>softwareConfig.cnlabRuntime</code></td><td>object</td><td>same shape/defaults as <code>RemoteCluster</code>'s</td></tr>
-      </tbody>
-    </table></div>
-    <p><strong>Status:</strong></p>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
-      <tbody>
-        <tr><td><code>usedIPAddresses[]</code></td><td>VPN IPs already allocated in this cluster</td></tr>
-        <tr><td><code>clusterJoinCommand</code></td><td>Join command for workers</td></tr>
-        <tr><td><code>joinTokenRefreshedAt</code></td><td>Last token refresh timestamp</td></tr>
-        <tr><td><code>vpnPeers[]</code></td><td><code>{nodeName, publicKey, vpnIP}</code></td></tr>
-        <tr><td><code>kubeconfig</code></td><td>Base64 admin kubeconfig for this cluster</td></tr>
-      </tbody>
-    </table></div>
-    <blockquote>
-      <p><strong>Not supported today</strong> (shown in some sample files, but silently ignored):
-      <code>softwareConfig.nvidiaDriverVersion</code>, <code>softwareConfig.nvidiaContainerToolkitVersion</code>,
-      <code>softwareConfig.k8sDevicePluginVersion</code>.</p>
-    </blockquote>
-
-    <h3>10.4 Common <code>kubectl</code> commands</h3>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Command</th><th>Effect</th></tr></thead>
-      <tbody>
-        <tr><td><code>kubectl get remotecluster -w</code></td><td>Watch a cluster's provisioning progress</td></tr>
-        <tr><td><code>kubectl get nodeprovision -w</code></td><td>Watch a node's provisioning progress</td></tr>
-        <tr><td><code>kubectl patch remotecluster &lt;name&gt; --subresource=status --type=merge -p '{"status":{"provisionRetryCount":0}}'</code></td><td>Reset a stuck <code>RemoteCluster</code> after fixing the underlying issue</td></tr>
-        <tr><td><code>kubectl patch remotecluster &lt;name&gt; --subresource=status --type=merge -p '{"status":{"cnlabSyncRetryCount":0}}'</code></td><td>Reset a stuck registry-credential sync</td></tr>
-        <tr><td><code>kubectl patch nodeprovision &lt;name&gt; --subresource=status --type=merge -p '{"status":{"provisionRetryCount":0}}'</code></td><td>Reset a stuck <code>NodeProvision</code></td></tr>
-        <tr><td><code>kubectl delete remotecluster &lt;name&gt;</code></td><td>Tear a node/cluster back down cleanly</td></tr>
-        <tr><td><code>kubectl delete nodeprovision &lt;name&gt;</code></td><td>Remove a node cleanly</td></tr>
-      </tbody>
-    </table></div>
-
-    <h3>10.5 Install/upgrade commands</h3>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Command</th><th>Effect</th></tr></thead>
-      <tbody>
-        <tr><td><code>make install</code> / <code>make uninstall</code></td><td>Apply/remove the CRDs</td></tr>
-        <tr><td><code>make deploy IMG=&lt;image&gt;</code> / <code>make undeploy</code></td><td>Apply/remove the controller (pointing at an already-built image)</td></tr>
-      </tbody>
-    </table></div>
-
-    <h3>10.6 Where to find example manifests</h3>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Path</th><th>Contents</th></tr></thead>
-      <tbody>
-        <tr><td><code>config/samples/</code></td><td>Example <code>RemoteCluster</code>/<code>NodeProvision</code>/<code>NodeProvisionNetConfig</code> resources — see <a href="#s6">§6</a></td></tr>
-        <tr><td><code>docs/wireguard-setup-bundle/WIREGUARD_SETUP.md</code></td><td>WireGuard VPN server/client setup guide</td></tr>
-        <tr><td><code>README.md</code></td><td>Top-level project overview</td></tr>
-      </tbody>
-    </table></div>
-
-    <h3>10.7 Useful links</h3>
-    <ul>
-      <li>Project README: <a href="../README.md">../README.md</a></li>
-      <li>WireGuard setup guide: <a href="wireguard-setup-bundle/WIREGUARD_SETUP.md">wireguard-setup-bundle/WIREGUARD_SETUP.md</a></li>
-      <li>Nephio/Porch documentation (for GitOps-based platform deployment): <a href="https://docs.nephio.org/" target="_blank" rel="noopener">https://docs.nephio.org/</a></li>
-    </ul>
+kubectl get nodeprovision -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,PROVIDER:.spec.provider,IP:.status.ipAddress
+</code></pre>
+<h3 id="9-6-monitoring">9.6 Monitoring</h3>
+<p>Day-to-day observability is status/condition- and log-driven (see <a href="#s7">§7</a>
+and <a href="#s95">§9.5</a>) rather than dashboard-driven — there isn't a
+bundled dashboard today. If your platform team wants Prometheus metrics, ask them to enable the
+metrics endpoint on the controller Deployment.</p>
+<hr>
+<h2 id="s10">10. Reference</h2>
+<h3 id="10-1-remotecluster">10.1 <code>RemoteCluster</code></h3>
+<p><strong>Spec:</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>clusterName</code></td>
+<td>string</td>
+<td>Shared across every node (control-plane + workers) of one logical cluster</td>
+</tr>
+<tr>
+<td><code>host</code></td>
+<td>string</td>
+<td>LAN/public IP or hostname of the target node</td>
+</tr>
+<tr>
+<td><code>port</code></td>
+<td>string</td>
+<td>SSH port (e.g. <code>"22"</code>)</td>
+</tr>
+<tr>
+<td><code>user</code></td>
+<td>string</td>
+<td>SSH username</td>
+</tr>
+<tr>
+<td><code>nodeInfo.nodeType</code></td>
+<td>string</td>
+<td><code>control-plane</code> | <code>worker</code></td>
+</tr>
+<tr>
+<td><code>nodeInfo.hardwareType</code></td>
+<td>string</td>
+<td><code>cpu</code> | <code>gpu</code></td>
+</tr>
+<tr>
+<td><code>nodeInfo.softwareConfig.kubernetesVersion</code></td>
+<td>string</td>
+<td>e.g. <code>v1.34.2</code></td>
+</tr>
+<tr>
+<td><code>nodeInfo.softwareConfig.imagePrepulls[]</code></td>
+<td><code>{image, nodeTarget}</code></td>
+<td><code>nodeTarget</code> is <code>gpu</code> or <code>all</code> (default <code>all</code>)</td>
+</tr>
+<tr>
+<td><code>nodeInfo.softwareConfig.imagePullSecretRef</code></td>
+<td>secret ref</td>
+<td>optional</td>
+</tr>
+<tr>
+<td><code>nodeInfo.softwareConfig.insecureRegistries[]</code></td>
+<td>string</td>
+<td>optional; registries (<code>host[:port]</code>) reached over plain HTTP / untrusted TLS. <code>imagePrepulls</code> hosts are also marked insecure (see <a href="#s52">§5.2</a>)</td>
+</tr>
+<tr>
+<td><code>nodeInfo.softwareConfig.cnlabRuntime</code></td>
+<td>object</td>
+<td>optional; sensible defaults if omitted</td>
+</tr>
+<tr>
+<td><code>nodeInfo.softwareConfig.platformVariables[]</code></td>
+<td><code>{key, value}</code></td>
+<td>optional; passed through to the GitOps platform stack</td>
+</tr>
+<tr>
+<td><code>auth.sshPrivateKeySecretRef</code> / <code>auth.passwordSecretRef</code></td>
+<td>secret ref</td>
+<td>exactly one; auto-detects key vs. password auth</td>
+</tr>
+<tr>
+<td><code>vpnConfig.ip</code></td>
+<td>string</td>
+<td>this node's VPN IP; preferred over <code>host</code> once set</td>
+</tr>
+<tr>
+<td><code>vpnConfig.vpnServerPublicIP</code> / <code>vpnServerSSHPort</code> / <code>vpnServerSSHUsername</code></td>
+<td>string</td>
+<td>VPN server SSH connection details</td>
+</tr>
+<tr>
+<td><code>vpnConfig.vpnSshCredentialsRef</code></td>
+<td>secret ref</td>
+<td>Secret with the VPN server's SSH credential</td>
+</tr>
+<tr>
+<td><code>disableVPN</code></td>
+<td>bool</td>
+<td>default <code>false</code>; run the whole cluster without WireGuard (see <a href="#s51">§5.1</a>); set it on the control-plane, workers inherit it. <code>vpnConfig</code> is ignored when <code>true</code></td>
+</tr>
+<tr>
+<td><code>gitConfig.enable</code></td>
+<td>string</td>
+<td><code>"true"</code>/<code>"false"</code> — gates GitOps platform deployment</td>
+</tr>
+<tr>
+<td><code>gitConfig.gitServer</code> / <code>gitUsername</code> / <code>upstreamPlatformRepo</code> / <code>packageRevision</code></td>
+<td>string</td>
+<td>GitOps source details</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Status:</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>phase</code></td>
+<td><code>Provisioning</code> → <code>Ready</code> → <code>Failed</code></td>
+</tr>
+<tr>
+<td><code>message</code></td>
+<td>Human-readable status, includes retry count on failure</td>
+</tr>
+<tr>
+<td><code>conditions[]</code></td>
+<td>Full history of status changes, most recent last</td>
+</tr>
+<tr>
+<td><code>joinCommand</code></td>
+<td>Cached join command, used when adding workers</td>
+</tr>
+<tr>
+<td><code>provisionRetryCount</code></td>
+<td>Consecutive provisioning failures; resets to 0 on <code>Ready</code></td>
+</tr>
+<tr>
+<td><code>cnlabSyncRetryCount</code></td>
+<td>Consecutive registry-credential sync failures</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="10-2-nodeprovision">10.2 <code>NodeProvision</code></h3>
+<p><strong>Spec:</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>provider</code></td>
+<td>string</td>
+<td><code>OnPrem</code> | <code>AWS</code> | <code>GCP</code> (<code>Azure</code> is not implemented yet)</td>
+</tr>
+<tr>
+<td><code>clusterName</code></td>
+<td>string</td>
+<td>which <code>NodeProvisionNetConfig</code> (<code>spec.clusterName</code> equal) the node uses. Optional only while the namespace has exactly one NetConfig; required (no guessing) when it has several</td>
+</tr>
+<tr>
+<td><code>role</code></td>
+<td>string</td>
+<td>always <code>worker</code> in practice</td>
+</tr>
+<tr>
+<td><code>hardwareType</code></td>
+<td>string</td>
+<td><code>gpu</code>/<code>cpu</code> (or empty) — filters which images get pre-pulled</td>
+</tr>
+<tr>
+<td><code>nodeLabel</code></td>
+<td>string</td>
+<td>drives AWS default instance-type resolution (<code>cpu</code>→<code>t3.xlarge</code>, <code>gpu</code>→<code>p3.2xlarge</code>)</td>
+</tr>
+<tr>
+<td><code>region</code></td>
+<td>string</td>
+<td>AWS region, or GCP region (optional when <code>gcpConfig.zone</code> is set)</td>
+</tr>
+<tr>
+<td><code>instanceType</code></td>
+<td>string</td>
+<td>overrides the <code>nodeLabel</code> lookup; the GCE machine type for GCP</td>
+</tr>
+<tr>
+<td><code>hostname</code> / <code>ipAddress</code></td>
+<td>string</td>
+<td>on-prem target; <code>ipAddress</code> takes priority if both set</td>
+</tr>
+<tr>
+<td><code>sshPort</code></td>
+<td>int</td>
+<td>default <code>22</code></td>
+</tr>
+<tr>
+<td><code>sshUsernameOverride</code></td>
+<td>string</td>
+<td></td>
+</tr>
+<tr>
+<td><code>credentialsRef</code></td>
+<td>secret ref</td>
+<td>key auto-detected if omitted</td>
+</tr>
+<tr>
+<td><code>disableVPN</code></td>
+<td>bool</td>
+<td>default <code>false</code>; join the node without WireGuard. Normally <strong>inherited</strong> from the cluster (<code>RemoteCluster</code> control-plane → <code>NodeProvisionNetConfig</code> → <code>NodeProvision</code>); setting <code>true</code> against a VPN cluster fails the provision. Set at creation; not changeable afterwards (see <a href="#s53">§5.3</a>, <a href="#s75">§7.5</a>)</td>
+</tr>
+<tr>
+<td><code>awsConfig</code></td>
+<td>object</td>
+<td><code>vpcId</code>, <code>subnetId</code>, <code>securityGroupIds[]</code>, <code>ami</code>, <code>keyPairName</code>, <code>iamInstanceProfile</code>, <code>tags{}</code>, <code>rootVolumeSizeGB</code> — all auto-resolved if omitted</td>
+</tr>
+<tr>
+<td><code>gcpConfig</code></td>
+<td>object</td>
+<td><code>projectId</code>, <code>zone</code>, <code>network</code>, <code>subnetwork</code>, <code>sourceImage</code> / <code>imageFamily</code> / <code>imageProject</code>, <code>bootDiskSizeGB</code>, <code>bootDiskType</code>, <code>labels{}</code>, <code>networkTags[]</code>, <code>serviceAccountEmail</code>, <code>serviceAccountScopes[]</code>, <code>accelerator{type,count}</code>, <code>spot</code>, <code>disableExternalIP</code>, <code>firewallSourceRanges[]</code> — all optional, auto-resolved if omitted (see <a href="#s54">§5.4</a>)</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Status:</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>phase</code></td>
+<td><code>Pending</code>, <code>Validating</code>, <code>Provisioning</code>, <code>CreatingInstance</code> and <code>WaitingForInstance</code> (AWS, GCP), <code>ConfiguringVPN</code> (skipped when the VPN is disabled), <code>Bootstrapping</code>, <code>Joining</code>, <code>RegisteringNode</code>, <code>VerifyingHealth</code>, <code>PrePullingImages</code>, <code>Ready</code>, <code>Failed</code>, <code>Deleting</code>; the order differs by provider — see <a href="#s23">§2.3</a></td>
+</tr>
+<tr>
+<td><code>message</code></td>
+<td>Human-readable status</td>
+</tr>
+<tr>
+<td><code>instanceId</code> / <code>hostname</code> / <code>ipAddress</code></td>
+<td>Identity (<code>instanceId</code> is the instance name on GCP)</td>
+</tr>
+<tr>
+<td><code>publicIp</code> / <code>privateIp</code></td>
+<td>AWS and GCP (the instance's external / internal address)</td>
+</tr>
+<tr>
+<td><code>vpnIp</code></td>
+<td>VPN IP allocated for this node</td>
+</tr>
+<tr>
+<td><code>progress</code></td>
+<td>0–100</td>
+</tr>
+<tr>
+<td><code>nodeName</code></td>
+<td>Kubernetes node name once registered</td>
+</tr>
+<tr>
+<td><code>runtimeCredentialsHash</code></td>
+<td>Fingerprint of last-synced registry credentials</td>
+</tr>
+<tr>
+<td><code>provisionRetryCount</code></td>
+<td>Consecutive failures; resets to 0 on <code>Ready</code></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="10-3-nodeprovisionnetconfig">10.3 <code>NodeProvisionNetConfig</code></h3>
+<p><strong>Spec:</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>clusterName</code></td>
+<td>string</td>
+<td>the cluster this config belongs to; selected by <code>NodeProvision.spec.clusterName</code>. Must be unique among the NetConfigs of a namespace when several clusters share it</td>
+</tr>
+<tr>
+<td><code>disableVPN</code></td>
+<td>bool</td>
+<td>default <code>false</code>; marks the whole cluster as running without WireGuard. Published by the control-plane <code>RemoteCluster</code>; inherited by every <code>NodeProvision</code>; <code>vpnRange</code>/<code>vpnServerPublicConfig</code> are then unused</td>
+</tr>
+<tr>
+<td><code>vpnRange</code></td>
+<td>string</td>
+<td>CIDR, e.g. <code>10.9.0.0/24</code> (only when <code>disableVPN</code> is <code>false</code>)</td>
+</tr>
+<tr>
+<td><code>vpnServerPublicConfig.publicIP</code></td>
+<td>string</td>
+<td>only used when <code>disableVPN</code> is <code>false</code></td>
+</tr>
+<tr>
+<td><code>vpnServerPublicConfig.sshPort</code> / <code>sshUsername</code></td>
+<td>string</td>
+<td>defaults <code>22</code> / <code>ubuntu</code></td>
+</tr>
+<tr>
+<td><code>vpnServerPublicConfig.vpnPort</code></td>
+<td>string</td>
+<td>default <code>51820</code></td>
+</tr>
+<tr>
+<td><code>vpnServerPublicConfig.vpnSshCredentialsRef</code></td>
+<td>secret ref</td>
+<td></td>
+</tr>
+<tr>
+<td><code>softwareConfig.kubernetesVersion</code></td>
+<td>string</td>
+<td></td>
+</tr>
+<tr>
+<td><code>softwareConfig.imagePrepulls[]</code></td>
+<td><code>{image, nodeTarget}</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>softwareConfig.imagePullSecretRef</code></td>
+<td>secret ref</td>
+<td></td>
+</tr>
+<tr>
+<td><code>softwareConfig.insecureRegistries[]</code></td>
+<td>string</td>
+<td>registries (<code>host[:port]</code>) served over plain HTTP / untrusted TLS; merged with the <code>imagePrepulls</code> hosts (see <a href="#s52">§5.2</a>)</td>
+</tr>
+<tr>
+<td><code>softwareConfig.cnlabRuntime</code></td>
+<td>object</td>
+<td>same shape/defaults as <code>RemoteCluster</code>'s</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Status:</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>usedIPAddresses[]</code></td>
+<td>VPN IPs already allocated in this cluster</td>
+</tr>
+<tr>
+<td><code>clusterJoinCommand</code></td>
+<td>Join command for workers</td>
+</tr>
+<tr>
+<td><code>joinTokenRefreshedAt</code></td>
+<td>Last token refresh timestamp</td>
+</tr>
+<tr>
+<td><code>vpnPeers[]</code></td>
+<td><code>{nodeName, publicKey, vpnIP}</code></td>
+</tr>
+<tr>
+<td><code>kubeconfig</code></td>
+<td>Base64 admin kubeconfig for this cluster</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p><strong>Not fields of this resource</strong> (older examples showed them; the API server rejects them):
+<code>softwareConfig.nvidiaDriverVersion</code>, <code>softwareConfig.nvidiaContainerToolkitVersion</code>,
+<code>softwareConfig.k8sDevicePluginVersion</code>.</p>
+</blockquote>
+<h3 id="10-4-common-kubectl-commands">10.4 Common <code>kubectl</code> commands</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>kubectl get remotecluster -w</code></td>
+<td>Watch a cluster's provisioning progress</td>
+</tr>
+<tr>
+<td><code>kubectl get nodeprovision -w</code></td>
+<td>Watch a node's provisioning progress</td>
+</tr>
+<tr>
+<td><code>kubectl patch remotecluster &lt;name&gt; --subresource=status --type=merge -p '{"status":{"provisionRetryCount":0}}'</code></td>
+<td>Reset a stuck <code>RemoteCluster</code> after fixing the underlying issue</td>
+</tr>
+<tr>
+<td><code>kubectl patch remotecluster &lt;name&gt; --subresource=status --type=merge -p '{"status":{"cnlabSyncRetryCount":0}}'</code></td>
+<td>Reset a stuck registry-credential sync</td>
+</tr>
+<tr>
+<td><code>kubectl patch nodeprovision &lt;name&gt; --subresource=status --type=merge -p '{"status":{"provisionRetryCount":0}}'</code></td>
+<td>Reset a stuck <code>NodeProvision</code></td>
+</tr>
+<tr>
+<td><code>kubectl delete remotecluster &lt;name&gt;</code></td>
+<td>Tear a node/cluster back down cleanly</td>
+</tr>
+<tr>
+<td><code>kubectl delete nodeprovision &lt;name&gt;</code></td>
+<td>Remove a node cleanly</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="10-5-install-upgrade-commands">10.5 Install/upgrade commands</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>make install</code> / <code>make uninstall</code></td>
+<td>Apply/remove the CRDs</td>
+</tr>
+<tr>
+<td><code>make deploy IMG=&lt;image&gt;</code> / <code>make undeploy</code></td>
+<td>Apply/remove the controller (pointing at an already-built image)</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="10-6-where-to-find-example-manifests">10.6 Where to find example manifests</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>config/samples/</code></td>
+<td>Example <code>RemoteCluster</code>/<code>NodeProvision</code>/<code>NodeProvisionNetConfig</code> resources — see <a href="#s6">§6</a> and the table below</td>
+</tr>
+<tr>
+<td><code>config/samples/infra_v1_remotecluster_vpn.yaml</code></td>
+<td>Complete cluster <strong>with</strong> WireGuard: CPU control-plane, GPU worker, CPU worker, their Secrets, <code>insecureRegistries</code>, <code>imagePrepulls</code>, <code>cnlabRuntime</code></td>
+</tr>
+<tr>
+<td><code>config/samples/infra_v1_remotecluster_novpn.yaml</code></td>
+<td>Complete cluster <strong>without</strong> a VPN (<code>disableVPN: true</code>): a GPU control-plane that also runs GPU workloads, a GPU worker and a CPU worker</td>
+</tr>
+<tr>
+<td><code>config/samples/infra_v1_remotecluster.yaml</code></td>
+<td>Minimal VPN-less control-plane (the quick-start sample)</td>
+</tr>
+<tr>
+<td><code>config/samples/infra_v1_remotecluster_cnlab_runtime.yaml</code></td>
+<td>Fully annotated control-plane + worker with <code>platformVariables</code> and GitOps (contains example credentials — replace them)</td>
+</tr>
+<tr>
+<td><code>config/samples/ml_v1alpha1_nodeprovision*.yaml</code></td>
+<td><code>NodeProvision</code> samples for on-prem, AWS and GCP (set <code>spec.clusterName</code> when a namespace holds more than one cluster)</td>
+</tr>
+<tr>
+<td><code>docs/wireguard-setup-bundle/WIREGUARD_SETUP.md</code></td>
+<td>WireGuard VPN server/client setup guide</td>
+</tr>
+<tr>
+<td><code>README.md</code></td>
+<td>Top-level project overview</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="10-7-useful-links">10.7 Useful links</h3>
+<ul>
+<li>Project README: <a href="../README.md"><code>../README.md</code></a></li>
+<li>WireGuard setup guide: <a href="wireguard-setup-bundle/WIREGUARD_SETUP.md"><code>wireguard-setup-bundle/WIREGUARD_SETUP.md</code></a></li>
+<li>Nephio/Porch documentation (for GitOps-based platform deployment): https://docs.nephio.org/</li>
+</ul>
+<hr>
+<p><em>This guide covers day-to-day use of the controllers — creating and managing clusters and nodes.
+It intentionally leaves out anything about building the controller image or its source code.</em></p>
 
     <footer class="doc-footer">
       <p>This guide covers day-to-day use of the controllers — creating and managing clusters and nodes.

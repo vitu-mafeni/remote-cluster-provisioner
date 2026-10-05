@@ -21,6 +21,7 @@ metadata:
   namespace: default
 spec:
   provider: AWS
+  clusterName: my-cluster   # selects the NodeProvisionNetConfig whose spec.clusterName matches (required when the namespace has several clusters)
   role: worker
   nodeLabel: cpu          # "cpu" → t3.xlarge  |  "gpu" → p3.2xlarge
   region: ap-northeast-2  # AMI + network resolved per-region automatically

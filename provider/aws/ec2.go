@@ -7,10 +7,14 @@
 package aws
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5" //nolint:gosec // EC2 reports imported-key fingerprints as MD5; used for comparison only
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -65,6 +69,19 @@ func newEC2Client(ctx context.Context, region string, creds AWSCredentials) (*ec
 		return nil, fmt.Errorf("loading AWS config: %w", err)
 	}
 	return ec2.NewFromConfig(cfg), nil
+}
+
+// ec2LaunchAPI is the slice of the EC2 client ProvisionEC2Node needs (an
+// interface so the launch workflow can be unit-tested with a fake).
+type ec2LaunchAPI interface {
+	ec2DescribeInstancesAPI
+	RunInstances(ctx context.Context, params *ec2.RunInstancesInput, optFns ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error)
+	CreateTags(ctx context.Context, params *ec2.CreateTagsInput, optFns ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error)
+}
+
+// newLaunchClient builds the EC2 client used by ProvisionEC2Node; tests replace it.
+var newLaunchClient = func(ctx context.Context, region string, creds AWSCredentials) (ec2LaunchAPI, error) {
+	return newEC2Client(ctx, region, creds)
 }
 
 // ResolveAWSCredentials extracts AWS static credentials from a secret.
@@ -137,18 +154,62 @@ type ProvisionResult struct {
 	PublicIP   string
 	VpnIP      string
 	PublicKey  string
+	// Adopted is true when ProvisionEC2Node found an instance already launched
+	// for this NodeProvision (by UID tag) and did NOT allocate a VPN peer or
+	// launch another one. VpnIP/PublicKey are then empty: the caller must
+	// recover the peer that was recorded for that instance (see the
+	// controller's adoption path).
+	Adopted bool
 }
 
-// ProvisionEC2Node performs the full AWS provisioning workflow:
+// ErrInstanceAlreadyLaunched is returned by ProvisionEC2Node when RunInstances
+// reports that an instance for this NodeProvision's client token already
+// exists with different parameters (IdempotentParameterMismatch), e.g. a launch
+// whose response was lost. Any VPN peer registered for the rejected attempt has
+// been released. The caller should requeue WITHOUT counting a failure: the next
+// reconcile finds and adopts the existing instance by its UID tag.
+var ErrInstanceAlreadyLaunched = errors.New("an EC2 instance for this NodeProvision was already launched; adopt it instead of launching another")
+
+// nodeProvisionUIDTag is the EC2 tag that ties an instance to the NodeProvision
+// that launched it (used for adoption/cleanup when status never recorded the
+// instance ID, see FindInstanceIDByNodeProvision).
+const nodeProvisionUIDTag = "ml.dcn.ssu.ac.kr/nodeprovision-uid"
+
+// ProvisionEC2Node performs the full AWS provisioning workflow (the VPN steps
+// are skipped when nodeProvision.Spec.DisableVPN is set, in which case
+// vpnServerClient may be nil):
+//
+//  0. Look for an existing non-terminated instance tagged with this
+//     NodeProvision's UID. If there is one, return it with Adopted=true and do
+//     NOTHING else: no VPN peer is allocated and nothing is launched (the
+//     controller recovers the peer that was recorded for that instance under
+//     this node's name).
 //  1. Allocate a VPN IP from the NodeProvisionNetConfig range.
 //  2. Generate a WireGuard keypair.
 //  3. Register the peer on the VPN server.
 //  4. Build a cloud-init script that installs packages, configures VPN, and joins the cluster.
 //  5. Launch the EC2 instance with that user-data.
 //
-// The function is safe to call multiple times for the same node because VPN
-// peer registration and IP allocation are idempotent (checked by the caller
-// via updateNetConfigStatus before calling this again).
+// Contract for callers:
+//   - Once the VPN peer is registered, every error return also carries a non-nil
+//     *ProvisionResult holding VpnIP/PublicKey so the caller can persist them and
+//     release the peer later. The user-data is rendered and validated BEFORE
+//     any peer is registered or RunInstances is called; invalid parameters fail
+//     the call without side effects.
+//   - The instance is tagged (instance, volume and Name) with the NodeProvision
+//     UID at launch, and RunInstances uses a ClientToken derived from the UID and
+//     Status.ProvisionRetryCount (see clientTokenForAttempt): a retry of the same
+//     attempt after a crash between RunInstances and the status write is
+//     idempotent, while a relaunch after a failed attempt (the instance was
+//     terminated) uses a fresh token instead of hitting
+//     IdempotentParameterMismatch.
+//   - If RunInstances still reports IdempotentParameterMismatch (an instance for
+//     the token exists but is not yet visible to DescribeInstances — EC2's
+//     eventual consistency), the peer registered for this attempt is released
+//     (onprem.UnregisterVPNPeer, best effort) and the returned error wraps
+//     ErrInstanceAlreadyLaunched with an EMPTY, non-nil result. The caller must
+//     requeue without counting a failure; the next reconcile adopts the
+//     instance (step 0).
 func ProvisionEC2Node(
 	ctx context.Context,
 	nodeProvision *mlv1alpha1.NodeProvision,
@@ -161,53 +222,9 @@ func ProvisionEC2Node(
 	name := nodeProvision.Name
 	log.Printf("[INFO] NodeProvision/%s: AWS validation successful", name)
 
-	if netNodeConfig.Spec.VPNRange == nil || *netNodeConfig.Spec.VPNRange == "" {
-		return nil, fmt.Errorf("NodeProvisionNetConfig has no vpnRange configured")
-	}
-	vpnRange := *netNodeConfig.Spec.VPNRange
+	noVPN := nodeProvision.Spec.DisableVPN
 
-	// ── Allocate VPN IP ────────────────────────────────────────────────────
-	// AllocateVPNIP cross-checks both the CR's UsedIPAddresses and the live
-	// WireGuard peer list on the server, so the chosen IP is guaranteed free
-	// in both sources even if they have drifted.
-	vpnIP, err := onprem.AllocateVPNIP(
-		vpnServerClient,
-		vpnRange,
-		netNodeConfig.Status.UsedIPAddresses,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("allocating VPN IP: %w", err)
-	}
-	log.Printf("[INFO] NodeProvision/%s: Assigned VPN IP %s", name, vpnIP)
-
-	// ── Generate WireGuard keypair ─────────────────────────────────────────
-	privateKey, publicKey, err := onprem.GenerateWireGuardKeyPair()
-	if err != nil {
-		return nil, fmt.Errorf("generating WireGuard keypair: %w", err)
-	}
-
-	// ── Build WireGuard client config ──────────────────────────────────────
-	wgConfig, err := onprem.BuildClientWGConfig(
-		vpnServerClient,
-		vpnIP,
-		vpnRange,
-		netNodeConfig.Spec.VPNServerPublicConfig.PublicIP,
-		parsePort(netNodeConfig.Spec.VPNServerPublicConfig.VPNPort, 51820),
-		privateKey,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("building WireGuard client config: %w", err)
-	}
-
-	// ── Register peer on VPN server ────────────────────────────────────────
-	// Must happen before the instance boots so the server is ready to accept
-	// the WireGuard handshake that cloud-init initiates.
-	if err := onprem.RegisterVPNPeer(vpnServerClient, publicKey, vpnIP); err != nil {
-		return nil, fmt.Errorf("registering VPN peer: %w", err)
-	}
-	log.Printf("[INFO] NodeProvision/%s: VPN peer registered (vpnIP=%s)", name, vpnIP)
-
-	// ── Parse Kubernetes version ───────────────────────────────────────────
+	// ── Parse + validate everything that needs no side effects first ───────
 	clean := strings.TrimPrefix(netNodeConfig.Spec.SoftwareConfig.KubernetesVersion, "v")
 	parts := strings.Split(clean, ".")
 	if len(parts) < 2 {
@@ -215,46 +232,110 @@ func ProvisionEC2Node(
 	}
 	crioVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
-	// ── Build cloud-init user-data ─────────────────────────────────────────
-	labels := []string{}
-	if nodeProvision.Spec.NodeLabel != "" {
-		labels = append(labels, fmt.Sprintf("hardware-type=%s", nodeProvision.Spec.NodeLabel))
+	params := buildCloudInitParams(nodeProvision, netNodeConfig.Status.ClusterJoinCommand, clean, crioVersion, runtimeCfg)
+	insecureHosts, err := onprem.InsecureRegistryHosts(netNodeConfig.Spec.SoftwareConfig)
+	if err != nil {
+		return nil, fmt.Errorf("NodeProvisionNetConfig softwareConfig.%w", err)
+	}
+	params.InsecureRegistries = insecureHosts
+	// Dry-run the render with placeholder VPN values so bad input is rejected
+	// before a VPN peer is allocated/registered.
+	dry := params
+	if !noVPN {
+		dry.WGConfig = "[Interface]\n"
+		dry.VpnIP = "10.0.0.1"
+	}
+	if _, err := BuildUserDataE(dry); err != nil {
+		return nil, fmt.Errorf("building cloud-init user-data: %w", err)
+	}
+	if !noVPN {
+		if netNodeConfig.Spec.VPNRange == nil || *netNodeConfig.Spec.VPNRange == "" {
+			return nil, fmt.Errorf("NodeProvisionNetConfig has no vpnRange configured")
+		}
+		if vpnServerClient == nil {
+			return nil, fmt.Errorf("VPN server connection is required unless spec.disableVPN is set")
+		}
 	}
 
-	userDataB64 := BuildUserData(CloudInitParams{
-		WGConfig:               wgConfig,
-		VpnIP:                  vpnIP,
-		JoinCommand:            netNodeConfig.Status.ClusterJoinCommand,
-		KubernetesVersion:      clean,
-		KubernetesMinorVersion: crioVersion,
-		NodeName:               name,
-		Labels:                 labels,
-		SSHUsername:            nodeProvision.Spec.SSHUsernameOverride,
-		IsGPUNode:              strings.EqualFold(nodeProvision.Spec.NodeLabel, "gpu"),
-		RuntimeRegistryUser:    runtimeCfg.Username,
-		RuntimeRegistryToken:   runtimeCfg.Token,
-		RuntimeRegistry:        runtimeCfg.Registry,
-		RuntimeRepository:      runtimeCfg.Repository,
-		RuntimeVersion:         runtimeCfg.Version,
-		RuntimeOrasVersion:     runtimeCfg.OrasVersion,
-	})
+	ec2Client, err := newLaunchClient(ctx, nodeProvision.Spec.Region, creds)
+	if err != nil {
+		return nil, fmt.Errorf("creating EC2 client: %w", err)
+	}
 
-	// ── Create EC2 instance ────────────────────────────────────────────────
+	// ── Adopt an instance a previous (crashed) attempt already launched ────
+	// This MUST come before any VPN peer is allocated: adopting needs no new
+	// peer, and registering one first would leak it.
+	existingID, err := findInstanceID(ctx, ec2Client, string(nodeProvision.UID))
+	if err != nil {
+		return nil, fmt.Errorf("checking for an existing instance: %w", err)
+	}
+	if existingID != "" {
+		log.Printf("[INFO] NodeProvision/%s: adopting existing EC2 instance %s (no VPN peer allocated)", name, existingID)
+		return &ProvisionResult{InstanceID: existingID, Adopted: true}, nil
+	}
+
+	var (
+		vpnIP     string
+		publicKey string
+	)
+	if noVPN {
+		// The node picks up its own private IP from instance metadata at boot;
+		// no VPN IP is allocated and no peer is registered.
+		log.Printf("[INFO] NodeProvision/%s: spec.disableVPN set — skipping VPN allocation", name)
+	} else {
+		vpnRange := *netNodeConfig.Spec.VPNRange
+
+		// ── Allocate VPN IP, generate keypair, register the peer ──────────────
+		// Runs under the process-wide VPN allocation lock (shared with the
+		// on-prem provisioner). AllocateVPNIP cross-checks both the CR's
+		// UsedIPAddresses and the live WireGuard peer list on the server.
+		// Registration must happen before the instance boots so the server is
+		// ready to accept the WireGuard handshake that cloud-init initiates.
+		peer, err := onprem.AllocateAndRegisterVPNPeer(
+			ctx,
+			vpnServerClient,
+			vpnRange,
+			netNodeConfig.Status.UsedIPAddresses,
+			netNodeConfig.Spec.VPNServerPublicConfig.PublicIP,
+			parsePort(netNodeConfig.Spec.VPNServerPublicConfig.VPNPort, 51820),
+		)
+		if err != nil {
+			return nil, err
+		}
+		vpnIP, publicKey = peer.IP, peer.PublicKey
+		params.WGConfig = peer.WGConfig
+		params.VpnIP = vpnIP
+		log.Printf("[INFO] NodeProvision/%s: VPN peer registered (vpnIP=%s)", name, vpnIP)
+	}
+
 	// vpnResult carries VPN allocation data so the caller can persist it even
 	// if EC2 launch fails — preventing orphaned peers on retry.
 	vpnResult := &ProvisionResult{VpnIP: vpnIP, PublicKey: publicKey}
 
-	ec2Client, err := newEC2Client(ctx, nodeProvision.Spec.Region, creds)
+	// ── Build cloud-init user-data (validated; fails before RunInstances) ──
+	userDataB64, err := BuildUserDataE(params)
 	if err != nil {
-		return vpnResult, fmt.Errorf("creating EC2 client: %w", err)
+		return vpnResult, fmt.Errorf("building cloud-init user-data: %w", err)
 	}
 
+	// ── Create EC2 instance ────────────────────────────────────────────────
 	log.Printf("[INFO] NodeProvision/%s: Creating EC2 instance (type=%s region=%s)",
 		name, nodeProvision.Spec.InstanceType, nodeProvision.Spec.Region)
 
 	input := buildRunInstancesInput(nodeProvision, userDataB64)
 	runOut, err := ec2Client.RunInstances(ctx, input)
 	if err != nil {
+		if isIdempotentParameterMismatch(err) {
+			// An instance for this ClientToken exists but DescribeInstances did not
+			// show it yet. The peer registered for THIS attempt will never be
+			// used: release it (best effort) and let the next reconcile adopt.
+			if publicKey != "" {
+				if rerr := onprem.UnregisterVPNPeer(vpnServerClient, publicKey); rerr != nil {
+					log.Printf("[WARN] NodeProvision/%s: could not release VPN peer %s after IdempotentParameterMismatch: %v", name, publicKey, rerr)
+				}
+			}
+			return &ProvisionResult{}, fmt.Errorf("%w: RunInstances: %v", ErrInstanceAlreadyLaunched, err)
+		}
 		return vpnResult, fmt.Errorf("launching EC2 instance: %w", err)
 	}
 	if len(runOut.Instances) == 0 {
@@ -262,18 +343,49 @@ func ProvisionEC2Node(
 	}
 
 	instanceID := awssdk.ToString(runOut.Instances[0].InstanceId)
+	vpnResult.InstanceID = instanceID
 	log.Printf("[INFO] NodeProvision/%s: EC2 instance %s created", name, instanceID)
 
-	// ── Tag instance ───────────────────────────────────────────────────────
+	// ── Apply user-supplied tags (best effort) ─────────────────────────────
+	// Controller tags were applied atomically at launch via TagSpecifications.
 	if err := tagInstance(ctx, ec2Client, instanceID, nodeProvision); err != nil {
 		log.Printf("[WARN] NodeProvision/%s: failed to tag instance: %v", name, err)
 	}
 
-	return &ProvisionResult{
-		InstanceID: instanceID,
-		VpnIP:      vpnIP,
-		PublicKey:  publicKey,
-	}, nil
+	return vpnResult, nil
+}
+
+// isIdempotentParameterMismatch reports whether err is EC2's
+// IdempotentParameterMismatch (same ClientToken, different launch parameters).
+func isIdempotentParameterMismatch(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "IdempotentParameterMismatch"
+}
+
+// buildCloudInitParams assembles the cloud-init parameters for a NodeProvision.
+// GPU-ness comes from the single shared rule IsGPUNode (hardwareType decides
+// when set, else nodeLabel containing "gpu").
+func buildCloudInitParams(np *mlv1alpha1.NodeProvision, joinCommand, kubernetesVersion, kubernetesMinor string, runtimeCfg pkgruntime.Config) CloudInitParams {
+	labels := []string{}
+	if np.Spec.NodeLabel != "" {
+		labels = append(labels, fmt.Sprintf("hardware-type=%s", np.Spec.NodeLabel))
+	}
+	return CloudInitParams{
+		NoVPN:                  np.Spec.DisableVPN,
+		JoinCommand:            joinCommand,
+		KubernetesVersion:      kubernetesVersion,
+		KubernetesMinorVersion: kubernetesMinor,
+		NodeName:               np.Name,
+		Labels:                 labels,
+		SSHUsername:            np.Spec.SSHUsernameOverride,
+		IsGPUNode:              IsGPUNode(np),
+		RuntimeRegistryUser:    runtimeCfg.Username,
+		RuntimeRegistryToken:   runtimeCfg.Token,
+		RuntimeRegistry:        runtimeCfg.Registry,
+		RuntimeRepository:      runtimeCfg.Repository,
+		RuntimeVersion:         runtimeCfg.Version,
+		RuntimeOrasVersion:     runtimeCfg.OrasVersion,
+	}
 }
 
 // WaitForInstanceRunning polls EC2 until the instance reaches the "running"
@@ -375,7 +487,10 @@ type NetworkConfig struct {
 // automatically creates default subnets and a default security group.
 // The returned NetworkConfig can then be used to populate AWSConfig fields
 // that the user left unset.
-func ResolveOrCreateNetworkConfig(ctx context.Context, region string, creds AWSCredentials) (*NetworkConfig, error) {
+//
+// includeWireGuard controls whether the default security group is opened for
+// WireGuard (UDP 51820); pass false for clusters that run without a VPN.
+func ResolveOrCreateNetworkConfig(ctx context.Context, region string, creds AWSCredentials, includeWireGuard bool) (*NetworkConfig, error) {
 	client, err := newEC2Client(ctx, region, creds)
 	if err != nil {
 		return nil, fmt.Errorf("creating EC2 client: %w", err)
@@ -396,7 +511,7 @@ func ResolveOrCreateNetworkConfig(ctx context.Context, region string, creds AWSC
 	log.Printf("[INFO] Network resolution: using subnet %s", subnetID)
 
 	// ── Security group ────────────────────────────────────────────────────────
-	sgID, err := resolveDefaultSecurityGroup(ctx, client, vpcID)
+	sgID, err := resolveDefaultSecurityGroup(ctx, client, vpcID, includeWireGuard)
 	if err != nil {
 		return nil, err
 	}
@@ -467,8 +582,9 @@ func resolveDefaultSubnet(ctx context.Context, client *ec2.Client, vpcID string)
 }
 
 // resolveDefaultSecurityGroup returns the ID of the VPC's default security group
-// and ensures it has inbound rules for SSH (TCP 22) and WireGuard (UDP 51820).
-func resolveDefaultSecurityGroup(ctx context.Context, client *ec2.Client, vpcID string) (string, error) {
+// and ensures it has inbound rules for SSH (TCP 22) and, when includeWireGuard
+// is set, WireGuard (UDP 51820).
+func resolveDefaultSecurityGroup(ctx context.Context, client *ec2.Client, vpcID string, includeWireGuard bool) (string, error) {
 	out, err := client.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
 		Filters: []types.Filter{
 			{Name: awssdk.String("vpc-id"), Values: []string{vpcID}},
@@ -483,27 +599,39 @@ func resolveDefaultSecurityGroup(ctx context.Context, client *ec2.Client, vpcID 
 	}
 	sgID := awssdk.ToString(out.SecurityGroups[0].GroupId)
 	sg := out.SecurityGroups[0]
-	if err := ensureNodeIngressRules(ctx, client, sgID, sg.IpPermissions); err != nil {
+	if err := ensureNodeIngressRules(ctx, client, sgID, sg.IpPermissions, includeWireGuard); err != nil {
 		log.Printf("[WARN] Security group %s: could not ensure ingress rules: %v", sgID, err)
 	}
 	return sgID, nil
 }
 
+// ingressRule is a single-port ingress rule the node security group needs.
+type ingressRule struct {
+	proto string
+	port  int32
+}
+
+// requiredIngressRules lists the ingress rules nodes need: SSH always,
+// WireGuard only when the cluster uses a VPN.
+func requiredIngressRules(includeWireGuard bool) []ingressRule {
+	rules := []ingressRule{{"tcp", 22}} // SSH
+	if includeWireGuard {
+		rules = append(rules, ingressRule{"udp", 51820}) // WireGuard
+	}
+	return rules
+}
+
 // ensureNodeIngressRules adds TCP 22 (SSH) and UDP 51820 (WireGuard) ingress rules
 // to the security group if they are not already present.  Existing rules are never
 // removed.  Duplicate-rule errors from AWS are silently ignored.
-func ensureNodeIngressRules(ctx context.Context, client *ec2.Client, sgID string, existing []types.IpPermission) error {
-	type ruleKey struct {
-		proto string
-		port  int32
-	}
-	present := make(map[ruleKey]bool)
+func ensureNodeIngressRules(ctx context.Context, client *ec2.Client, sgID string, existing []types.IpPermission, includeWireGuard bool) error {
+	present := make(map[ingressRule]bool)
 	for _, perm := range existing {
 		if perm.FromPort == nil || perm.ToPort == nil || perm.IpProtocol == nil {
 			continue
 		}
 		if *perm.FromPort == *perm.ToPort {
-			k := ruleKey{proto: *perm.IpProtocol, port: *perm.FromPort}
+			k := ingressRule{proto: *perm.IpProtocol, port: *perm.FromPort}
 			for _, r := range perm.IpRanges {
 				if awssdk.ToString(r.CidrIp) == "0.0.0.0/0" {
 					present[k] = true
@@ -513,11 +641,7 @@ func ensureNodeIngressRules(ctx context.Context, client *ec2.Client, sgID string
 	}
 
 	var toAdd []types.IpPermission
-	needed := []ruleKey{
-		{"tcp", 22},    // SSH
-		{"udp", 51820}, // WireGuard
-	}
-	for _, r := range needed {
+	for _, r := range requiredIngressRules(includeWireGuard) {
 		if !present[r] {
 			port := r.port
 			toAdd = append(toAdd, types.IpPermission{
@@ -542,7 +666,7 @@ func ensureNodeIngressRules(ctx context.Context, client *ec2.Client, sgID string
 		return fmt.Errorf("authorizing ingress on %s: %w", sgID, err)
 	}
 	for _, r := range toAdd {
-		log.Printf("[INFO] Security group %s: added %s/%d ingress from 0.0.0.0/0",
+		log.Printf("[WARN] Security group %s: added WORLD-OPEN ingress rule %s/%d from 0.0.0.0/0 (the VPC's default security group is shared; restrict it if this is not intended)",
 			sgID, awssdk.ToString(r.IpProtocol), awssdk.ToInt32(r.FromPort))
 	}
 	return nil
@@ -625,19 +749,27 @@ func ResolveOrCreateKeyPair(
 }
 
 // importKeyPair imports the public key into EC2 under keyPairName.
-// If a key pair with that name already exists it is first deleted so the
-// import is always up to date with the stored private key.
+// If a key pair with that name already exists and its material matches the
+// supplied public key nothing is done; if it differs it is deleted and
+// re-imported so the EC2 key pair always matches the stored private key.
 func importKeyPair(ctx context.Context, client *ec2.Client, keyPairName string, publicKeyMaterial []byte) error {
 	// Check whether the key pair already exists.
 	existing, err := client.DescribeKeyPairs(ctx, &ec2.DescribeKeyPairsInput{
-		KeyNames: []string{keyPairName},
+		KeyNames:         []string{keyPairName},
+		IncludePublicKey: awssdk.Bool(true),
 	})
 	if err != nil && !strings.Contains(err.Error(), "InvalidKeyPair.NotFound") {
 		return fmt.Errorf("describing key pair %q: %w", keyPairName, err)
 	}
 	if existing != nil && len(existing.KeyPairs) > 0 {
-		// Key pair exists — nothing to do; the public material is already there.
-		return nil
+		kp := existing.KeyPairs[0]
+		if keyPairMatches(kp.PublicKey, kp.KeyFingerprint, publicKeyMaterial) {
+			return nil // same public material already imported
+		}
+		log.Printf("[INFO] Key pair %q exists with different public key material; deleting and re-importing", keyPairName)
+		if _, derr := client.DeleteKeyPair(ctx, &ec2.DeleteKeyPairInput{KeyName: awssdk.String(keyPairName)}); derr != nil {
+			return fmt.Errorf("deleting stale key pair %q: %w", keyPairName, derr)
+		}
 	}
 
 	_, err = client.ImportKeyPair(ctx, &ec2.ImportKeyPairInput{
@@ -648,6 +780,54 @@ func importKeyPair(ctx context.Context, client *ec2.Client, keyPairName string, 
 		return fmt.Errorf("importing key pair %q: %w", keyPairName, err)
 	}
 	return nil
+}
+
+// keyPairMatches reports whether an existing EC2 key pair (described by its
+// public key text and/or fingerprint) carries the same public key as want
+// (OpenSSH authorized_keys format). When EC2 returns the public key it is
+// compared directly (key type + base64 body, ignoring the comment); otherwise
+// the fingerprint is compared against both fingerprint formats EC2 uses for
+// imported keys (MD5 of the DER SubjectPublicKeyInfo, or SHA256 of the SSH
+// wire format). Anything that cannot be positively matched counts as a
+// mismatch so the pair is re-imported.
+func keyPairMatches(existingPublicKey, existingFingerprint *string, want []byte) bool {
+	wantKey, _, _, _, err := ssh.ParseAuthorizedKey(want)
+	if err != nil {
+		return false
+	}
+	if pk := strings.TrimSpace(awssdk.ToString(existingPublicKey)); pk != "" {
+		if got, _, _, _, perr := ssh.ParseAuthorizedKey([]byte(pk)); perr == nil {
+			return bytes.Equal(got.Marshal(), wantKey.Marshal())
+		}
+	}
+	fp := strings.TrimSpace(awssdk.ToString(existingFingerprint))
+	if fp == "" {
+		return false
+	}
+	for _, cand := range publicKeyFingerprints(wantKey) {
+		if strings.EqualFold(cand, fp) {
+			return true
+		}
+	}
+	return false
+}
+
+// publicKeyFingerprints returns the fingerprints EC2 may report for an
+// imported copy of key.
+func publicKeyFingerprints(key ssh.PublicKey) []string {
+	var out []string
+	if ck, ok := key.(ssh.CryptoPublicKey); ok {
+		if der, err := x509.MarshalPKIXPublicKey(ck.CryptoPublicKey()); err == nil {
+			sum := md5.Sum(der)
+			parts := make([]string, len(sum))
+			for i, b := range sum {
+				parts[i] = fmt.Sprintf("%02x", b)
+			}
+			out = append(out, strings.Join(parts, ":"))
+		}
+	}
+	out = append(out, ssh.FingerprintSHA256(key))
+	return out
 }
 
 // generateRSAKeyPair creates a 4096-bit RSA key and returns
@@ -796,6 +976,28 @@ func buildRunInstancesInput(np *mlv1alpha1.NodeProvision, userDataB64 string) *e
 				AssociatePublicIpAddress: awssdk.Bool(true),
 			},
 		},
+		// IMDSv2 only: user-data carries the registry token and VPN private key,
+		// so it must not be readable through an SSRF-able IMDSv1 GET. The
+		// bootstrap script already uses IMDSv2 tokens. The default hop limit is
+		// kept, which also keeps pods from reaching the metadata service.
+		MetadataOptions: &types.InstanceMetadataOptionsRequest{
+			HttpTokens:   types.HttpTokensStateRequired,
+			HttpEndpoint: types.InstanceMetadataEndpointStateEnabled,
+		},
+	}
+
+	// Tag instance and root volume atomically at launch so the instance can be
+	// found by NodeProvision UID even if the controller crashes right after
+	// RunInstances, and make the launch idempotent: the same NodeProvision always
+	// sends the same ClientToken, so a retried call returns the original
+	// instance instead of launching a second one.
+	if uid := string(np.UID); uid != "" {
+		input.ClientToken = awssdk.String(clientTokenForAttempt(uid, np.Status.ProvisionRetryCount))
+		tags := controllerTags(np)
+		input.TagSpecifications = []types.TagSpecification{
+			{ResourceType: types.ResourceTypeInstance, Tags: tags},
+			{ResourceType: types.ResourceTypeVolume, Tags: tags},
+		}
 	}
 
 	if len(np.Spec.AWSConfig.SecurityGroupIDs) > 0 {
@@ -815,15 +1017,73 @@ func buildRunInstancesInput(np *mlv1alpha1.NodeProvision, userDataB64 string) *e
 	return input
 }
 
-func tagInstance(ctx context.Context, client *ec2.Client, instanceID string, np *mlv1alpha1.NodeProvision) error {
+// maxClientToken is EC2's ClientToken limit (ASCII characters).
+const maxClientToken = 64
+
+// clientTokenForAttempt derives the RunInstances ClientToken for one provisioning
+// ATTEMPT of a NodeProvision: "np-<uid>-<attempt>", where attempt is
+// Status.ProvisionRetryCount. It is deterministic within an attempt (a retried
+// call after a crash returns the original instance instead of launching a
+// second one) and different for every attempt: after a failed attempt the
+// instance is terminated and the relaunch carries new user-data, which with a
+// constant token would be rejected with IdempotentParameterMismatch (or return
+// the terminated instance). Overlong UIDs are shortened by hashing so the token
+// never exceeds 64 characters and the attempt suffix is always preserved.
+func clientTokenForAttempt(uid string, attempt int) string {
+	if attempt < 0 {
+		attempt = 0
+	}
+	suffix := "-" + strconv.Itoa(attempt)
+	base := "np-" + uid
+	if len(base)+len(suffix) > maxClientToken {
+		sum := sha256.Sum256([]byte(uid))
+		base = "np-" + hex.EncodeToString(sum[:])[:maxClientToken-len("np-")-len(suffix)]
+	}
+	return base + suffix
+}
+
+// controllerTags are the tags the controller itself owns; user tags may not
+// override them.
+func controllerTags(np *mlv1alpha1.NodeProvision) []types.Tag {
 	tags := []types.Tag{
 		{Key: awssdk.String("Name"), Value: awssdk.String(np.Name)},
 		{Key: awssdk.String("managed-by"), Value: awssdk.String("node-provision-controller")},
 		{Key: awssdk.String("node-provision-name"), Value: awssdk.String(np.Name)},
 		{Key: awssdk.String("node-provision-namespace"), Value: awssdk.String(np.Namespace)},
 	}
-	for k, v := range np.Spec.AWSConfig.Tags {
-		tags = append(tags, types.Tag{Key: awssdk.String(k), Value: awssdk.String(v)})
+	if np.UID != "" {
+		tags = append(tags, types.Tag{Key: awssdk.String(nodeProvisionUIDTag), Value: awssdk.String(string(np.UID))})
+	}
+	return tags
+}
+
+// sleepCtx waits for d or until ctx is cancelled, whichever comes first.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func tagInstance(ctx context.Context, client interface {
+	CreateTags(ctx context.Context, params *ec2.CreateTagsInput, optFns ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error)
+}, instanceID string, np *mlv1alpha1.NodeProvision) error {
+	tags := controllerTags(np)
+	reserved := map[string]bool{}
+	for _, t := range tags {
+		reserved[awssdk.ToString(t.Key)] = true
+	}
+	if np.Spec.AWSConfig != nil {
+		for k, v := range np.Spec.AWSConfig.Tags {
+			if reserved[k] {
+				continue // controller-owned tag; never let user tags override it
+			}
+			tags = append(tags, types.Tag{Key: awssdk.String(k), Value: awssdk.String(v)})
+		}
 	}
 
 	// Retry tagging with backoff because the instance may not yet be visible.
@@ -837,7 +1097,9 @@ func tagInstance(ctx context.Context, client *ec2.Client, instanceID string, np 
 			return nil
 		}
 		lastErr = err
-		time.Sleep(time.Duration(i+1) * 2 * time.Second)
+		if werr := sleepCtx(ctx, time.Duration(i+1)*2*time.Second); werr != nil {
+			return werr
+		}
 	}
 	return lastErr
 }
@@ -853,4 +1115,67 @@ func parsePort(s string, defaultPort int) int {
 		return defaultPort
 	}
 	return n
+}
+
+// FindInstanceIDByNodeProvision returns the ID of a non-terminated EC2
+// instance that was launched for this NodeProvision (matched by the
+// ml.dcn.ssu.ac.kr/nodeprovision-uid tag), or "" when there is none. It lets
+// the controller adopt or clean up an instance whose ID never made it into
+// status (crash between RunInstances and the status write).
+func FindInstanceIDByNodeProvision(ctx context.Context, nodeProvision *mlv1alpha1.NodeProvision, creds AWSCredentials) (string, error) {
+	uid := string(nodeProvision.UID)
+	if uid == "" {
+		return "", nil
+	}
+	client, err := newEC2Client(ctx, nodeProvision.Spec.Region, creds)
+	if err != nil {
+		return "", fmt.Errorf("creating EC2 client: %w", err)
+	}
+	return findInstanceID(ctx, client, uid)
+}
+
+// findInstanceID pages through DescribeInstances for a non-terminated instance
+// tagged with uid; when several match the oldest launch wins.
+func findInstanceID(ctx context.Context, client ec2DescribeInstancesAPI, uid string) (string, error) {
+	if uid == "" {
+		return "", nil
+	}
+	pager := ec2.NewDescribeInstancesPaginator(client, &ec2.DescribeInstancesInput{
+		Filters: []types.Filter{
+			{Name: awssdk.String("tag:" + nodeProvisionUIDTag), Values: []string{uid}},
+			{Name: awssdk.String("instance-state-name"), Values: []string{"pending", "running", "stopping", "stopped"}},
+		},
+	})
+	var (
+		bestID   string
+		bestTime time.Time
+	)
+	for pager.HasMorePages() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return "", fmt.Errorf("describing instances for NodeProvision uid %s: %w", uid, err)
+		}
+		for _, r := range page.Reservations {
+			for _, inst := range r.Instances {
+				id := awssdk.ToString(inst.InstanceId)
+				if id == "" {
+					continue
+				}
+				if inst.State != nil && (inst.State.Name == types.InstanceStateNameTerminated || inst.State.Name == types.InstanceStateNameShuttingDown) {
+					continue // belt and braces: the filter already excludes these
+				}
+				lt := awssdk.ToTime(inst.LaunchTime)
+				if bestID == "" || lt.Before(bestTime) {
+					bestID, bestTime = id, lt
+				}
+			}
+		}
+	}
+	return bestID, nil
+}
+
+// ec2DescribeInstancesAPI is the slice of the EC2 client findInstanceID needs
+// (an interface so it can be unit-tested with a fake).
+type ec2DescribeInstancesAPI interface {
+	DescribeInstances(ctx context.Context, params *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
 }

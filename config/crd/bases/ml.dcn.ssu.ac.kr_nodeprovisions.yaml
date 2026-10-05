@@ -77,6 +77,19 @@ spec:
                     description: VPC ID where the instance will be launched.
                     type: string
                 type: object
+              clusterName:
+                description: |-
+                  ClusterName names the cluster this node joins: the NodeProvisionNetConfig
+                  in the namespace whose spec.clusterName equals this value supplies the VPN
+                  range, VPN mode, image pre-pulls, registry secret and join command.
+                  Provisioning fails with a clear error when none or several match.
+
+                  Optional only for backward compatibility: when empty and the namespace
+                  holds exactly one NodeProvisionNetConfig, that one is used; when the
+                  namespace holds several, provisioning fails and asks for this field
+                  (the controller never guesses). Set it whenever a namespace serves more
+                  than one cluster.
+                type: string
               credentialsRef:
                 description: |-
                   NodeProvisionSpec defines the desired state of NodeProvision
@@ -91,6 +104,145 @@ spec:
                   name:
                     type: string
                   namespace:
+                    type: string
+                type: object
+              disableVPN:
+                description: |-
+                  DisableVPN provisions the node without a WireGuard tunnel: no VPN server
+                  connection, IP allocation, peer, WireGuard package/config or security
+                  group rule is made. Use it when the node is directly reachable by the
+                  controller and the control plane, and the control plane's API endpoint
+                  (the address in the kubeadm join command) is reachable from the node.
+
+                  The mode belongs to the whole cluster and is taken from the
+                  NodeProvisionNetConfig (spec.disableVPN, synced from the control-plane
+                  RemoteCluster): a node in a VPN-less cluster inherits true, and setting
+                  true against a VPN cluster fails the provision. Setting it here is only
+                  needed for a hand-authored NodeProvisionNetConfig.
+
+                  The node's own address is used as the kubelet node IP:
+                    - OnPrem: spec.ipAddress, which must be an IP bound to a local interface.
+                    - AWS: the instance's private IP (a public EC2 IP is NATed and cannot be
+                      a kubelet node IP), so the control plane must be able to route to it,
+                      e.g. same or peered VPC.
+                    - GCP: the instance's internal (VPC) IP, for the same reason; the
+                      per-node firewall rules admit the control plane / controller ranges
+                      (gcpConfig.firewallSourceRanges).
+                type: boolean
+              gcpConfig:
+                description: |-
+                  GCPConfig holds provider-specific parameters for Google Compute Engine
+                  provisioning (provider: GCP).
+                properties:
+                  accelerator:
+                    description: |-
+                      Accelerator attaches GPUs to an N1 instance (see GCPAccelerator). GPU
+                      instances always use onHostMaintenance=TERMINATE.
+                    properties:
+                      count:
+                        default: 1
+                        description: Count is the number of GPUs to attach (default
+                          1).
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      type:
+                        description: Type is the accelerator type name, e.g. "nvidia-tesla-t4",
+                          "nvidia-tesla-v100".
+                        minLength: 1
+                        type: string
+                    required:
+                    - type
+                    type: object
+                  bootDiskSizeGB:
+                    description: BootDiskSizeGB is the boot disk size in GB (default
+                      50).
+                    format: int32
+                    minimum: 10
+                    type: integer
+                  bootDiskType:
+                    description: |-
+                      BootDiskType is the persistent disk type, e.g. "pd-balanced" (default),
+                      "pd-ssd", "pd-standard" or a hyperdisk type required by newer machine series.
+                    type: string
+                  disableExternalIP:
+                    description: |-
+                      DisableExternalIP creates the instance without an external IP address. The
+                      node then needs Cloud NAT (or another egress path) for package downloads
+                      and, with a VPN, to reach the VPN server.
+                    type: boolean
+                  firewallSourceRanges:
+                    description: |-
+                      FirewallSourceRanges are the CIDRs allowed to reach the node through the
+                      per-node firewall rules (SSH, and kubelet/flannel without a VPN). Defaults
+                      to the RFC1918 private ranges: the controller and the control plane reach
+                      the node's internal address. With a VPN SSH travels inside the tunnel, so
+                      the SSH rule is created only when this is set.
+                    items:
+                      type: string
+                    type: array
+                  imageFamily:
+                    description: |-
+                      ImageFamily is the image family used when sourceImage is empty.
+                      Defaults to "ubuntu-2204-lts".
+                    type: string
+                  imageProject:
+                    description: |-
+                      ImageProject is the project that publishes imageFamily.
+                      Defaults to "ubuntu-os-cloud".
+                    type: string
+                  labels:
+                    additionalProperties:
+                      type: string
+                    description: Labels are extra GCE labels for the instance. Controller
+                      labels cannot be overridden.
+                    type: object
+                  network:
+                    description: Network is the VPC network name (or full resource
+                      URL). Defaults to "default".
+                    type: string
+                  networkTags:
+                    description: NetworkTags are extra network tags for the instance
+                      (firewall targeting).
+                    items:
+                      type: string
+                    type: array
+                  projectId:
+                    description: |-
+                      ProjectID is the GCP project to create the instance in. Defaults to the
+                      project_id of the service-account key in spec.credentialsRef.
+                    type: string
+                  serviceAccountEmail:
+                    description: |-
+                      ServiceAccountEmail attaches this service account to the instance. When
+                      empty no service account is attached (least privilege; the node does not need one).
+                    type: string
+                  serviceAccountScopes:
+                    description: |-
+                      ServiceAccountScopes are the OAuth scopes of the attached service account.
+                      Defaults to cloud-platform (access is then governed by IAM).
+                    items:
+                      type: string
+                    type: array
+                  sourceImage:
+                    description: |-
+                      SourceImage is the boot image: a full image URL
+                      ("projects/<p>/global/images/<name>") or a "projects/<p>/global/images/family/<f>"
+                      reference. When empty the latest image of imageFamily/imageProject is
+                      resolved and recorded here (default: latest Ubuntu 22.04 LTS, x86_64).
+                    type: string
+                  spot:
+                    description: Spot runs the instance as a Spot VM (can be preempted
+                      at any time).
+                    type: boolean
+                  subnetwork:
+                    description: |-
+                      Subnetwork is the subnetwork name (or full resource URL) in the instance's
+                      region. Required for custom-mode networks; optional for auto-mode ones.
+                    type: string
+                  zone:
+                    description: Zone is the compute zone, e.g. "us-central1-a" (see
+                      the type comment).
                     type: string
                 type: object
               hardwareType:
@@ -131,8 +283,9 @@ spec:
                 description: Assigned hostname.
                 type: string
               instanceId:
-                description: Provider-generated instance ID (e.g. i-xxxxxxxxxxxxxxxxx
-                  for AWS).
+                description: |-
+                  Provider-generated instance ID (e.g. i-xxxxxxxxxxxxxxxxx for AWS; the
+                  instance name for GCP, which is unique within the zone).
                 type: string
               ipAddress:
                 description: IPAddress is the VPN (WireGuard) IP assigned to the node.

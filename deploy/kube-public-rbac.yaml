@@ -1,0 +1,40 @@
+# Namespaced read access to the kube-public/cluster-info ConfigMap, which the
+# NodeProvision controller reads (through the uncached API reader) to build the
+# kubeadm join command. This replaces a cluster-wide configmaps grant: the
+# controller reads no other ConfigMap, so `get` on this single object in this
+# single namespace is all it needs.
+#
+# NOTE: kustomization.yaml sets `namespace:` for the whole deployment, which
+# would move these two objects into the controller namespace. The `replacements:`
+# entry there pins both back to kube-public using the `pinned-namespace`
+# annotation below - keep the annotation and metadata.namespace in sync.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: remote-cluster-provisioner-cluster-info-reader
+  namespace: kube-public
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [cluster-info]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: remote-cluster-provisioner-cluster-info-reader
+  namespace: kube-public
+  annotations:
+    infra.dcn.ssu.ac.kr/pinned-namespace: kube-public
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: remote-cluster-provisioner-cluster-info-reader
+subjects:
+  - kind: ServiceAccount
+    name: remote-cluster-provisioner
+    namespace: remote-cluster-provisioner-system

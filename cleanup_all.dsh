@@ -1,11 +1,56 @@
 #!/bin/bash
+#
+# cleanup_all.dsh — delete a worker node from Kubernetes (run against the control plane)
+# and wipe kubeadm/CRI-O/CNI state on that worker over SSH. DESTRUCTIVE.
+#
+# USAGE:
+#   ./cleanup_all.dsh [--yes] <k8s-node-name> <ssh-target>
+#   WORKER_NODE_NAME=<k8s-node-name> WORKER_SSH=<user@host> ./cleanup_all.dsh [--yes]
+#
+# Example:
+#   ./cleanup_all.dsh my-gpu-node ubuntu@192.0.2.10
+#
+# Without --yes the script prints what it will do and asks you to type BOTH the
+# node name and the SSH target to confirm (so a mistyped or mismatched host is
+# never wiped by accident). --yes skips both prompts: only use it from automation
+# that has already verified the node name / SSH target pair.
 set -e
 
+ASSUME_YES=false
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y) ASSUME_YES=true ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+
+WORKER_NODE_NAME="${POSITIONAL[0]:-${WORKER_NODE_NAME:-}}"
+WORKER_SSH="${POSITIONAL[1]:-${WORKER_SSH:-}}"
+if [[ -z "$WORKER_NODE_NAME" || -z "$WORKER_SSH" ]]; then
+  echo "Usage: $0 [--yes] <k8s-node-name> <ssh-target>   (or set WORKER_NODE_NAME and WORKER_SSH)" >&2
+  exit 2
+fi
+
 echo "====== Full Cluster Cleanup ======"
+echo "This will:"
+echo "  1. kubectl delete node '$WORKER_NODE_NAME' (current kubectl context: $(kubectl config current-context 2>/dev/null || echo unknown))"
+echo "  2. SSH to '$WORKER_SSH' and remove kubeadm, CRI-O, CNI, iptables state and packages there"
+if ! $ASSUME_YES; then
+  read -r -p "Type the node name ('$WORKER_NODE_NAME') to continue: " answer
+  if [[ "$answer" != "$WORKER_NODE_NAME" ]]; then
+    echo "Aborted."; exit 1
+  fi
+  read -r -p "Type the SSH target ('$WORKER_SSH') to confirm the host to wipe: " answer
+  if [[ "$answer" != "$WORKER_SSH" ]]; then
+    echo "Aborted."; exit 1
+  fi
+fi
 
 # On control plane, delete the worker node from K8s
 echo "Deleting worker node from Kubernetes..."
-kubectl delete node dcn-gpu-0 --ignore-not-found=true || true
+kubectl delete node "$WORKER_NODE_NAME" --ignore-not-found=true || true
 sleep 10
 
 # Give it time to finalize deletion
@@ -14,7 +59,7 @@ sleep 30
 
 # SSH to worker and clean up
 echo "Cleaning up worker node..."
-ssh ubuntu@192.168.30.87 << 'WORKER_CLEANUP'
+ssh "$WORKER_SSH" << 'WORKER_CLEANUP'
   echo "Running cleanup on worker node..."
   
   sudo fuser -k 6443/tcp 2>/dev/null || true
@@ -67,9 +112,15 @@ ssh ubuntu@192.168.30.87 << 'WORKER_CLEANUP'
   # Remove kubernetes directories
   sudo rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd
 
-  # Remove iptables rules
-  sudo iptables -F || true
-  sudo iptables -X || true
+  # Remove iptables rules. Reset the chain policies to ACCEPT first: flushing
+  # rules while a policy is DROP (ufw/Docker) would lock out SSH.
+  for ipt in iptables ip6tables; do
+    for chain in INPUT FORWARD OUTPUT; do
+      sudo $ipt -P $chain ACCEPT 2>/dev/null || true
+    done
+    sudo $ipt -F 2>/dev/null || true
+    sudo $ipt -X 2>/dev/null || true
+  done
 
   # Remove old files and configs
   sudo rm -f /etc/containers/auth.json
@@ -101,4 +152,4 @@ echo ""
 echo "====== Cleanup Complete ======"
 echo "To re-provision:"
 echo "1. Make sure controller has latest code: 'cd /home/ubuntu/remote-cluster-provisioner && make run'"
-echo "2. Create NodeProvision CR to provision dcn-gpu-0 again"
+echo "2. Create a NodeProvision CR to provision $WORKER_NODE_NAME again"

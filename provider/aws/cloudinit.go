@@ -9,7 +9,10 @@ import (
 	"strings"
 	"text/template"
 
+	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
+	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
+	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
 
 // CloudInitParams contains the values required to bootstrap an EC2 Kubernetes worker.
@@ -18,8 +21,12 @@ import (
 // driver, container toolkit, CRI-O NVIDIA integration, CDI and device plugin after
 // the node joins the cluster.
 type CloudInitParams struct {
-	WGConfig               string
-	VpnIP                  string
+	WGConfig string
+	VpnIP    string
+	// NoVPN skips WireGuard entirely. WGConfig and VpnIP are ignored and the
+	// kubelet node IP is the instance's private IP, read from instance
+	// metadata at boot.
+	NoVPN                  bool
 	JoinCommand            string
 	KubernetesVersion      string
 	KubernetesMinorVersion string
@@ -39,11 +46,72 @@ type CloudInitParams struct {
 	RuntimeRepository    string
 	RuntimeVersion       string
 	RuntimeOrasVersion   string
+
+	// InsecureRegistries are the registry hosts (host or host:port) CRI-O must
+	// treat as insecure (plain HTTP / untrusted TLS). Callers pass the already
+	// merged list (explicit softwareConfig.insecureRegistries plus hosts derived
+	// from imagePrepulls — see onprem.InsecureRegistryHosts); each entry is
+	// validated here and written as a registries.conf.d drop-in BEFORE CRI-O is
+	// (re)started, since CRI-O only reads that directory at start. Empty adds
+	// nothing and leaves the rendered script unchanged.
+	InsecureRegistries []string
+
+	// The two fields below let another cloud (see provider/gcp) reuse this
+	// cloud-neutral bootstrap script. Both default to the AWS behaviour when
+	// empty, so the rendered AWS output is unchanged.
+	//
+	// NodeIPScript replaces, in NoVPN mode only, the bash snippet that reads the
+	// instance's private IP from the cloud's metadata service. It must set
+	// NODE_IP (non-empty) or `exit 1`, and use the report helper. Trusted,
+	// controller-authored text: never fill it from user input.
+	NodeIPScript string
+	// ProviderLabel is the value of the ml.dcn.ssu.ac.kr/provider kubelet label
+	// stamped on GPU nodes at registration (default "AWS"); it must equal what the
+	// NodeProvision controller stamps (Spec.Provider).
+	ProviderLabel string
 }
 
 const (
 	crioSocket = "/var/run/crio/crio.sock"
 )
+
+// defaultNodeIPScript is the EC2 (IMDSv2) lookup of the private IPv4 used as the
+// kubelet node IP when no VPN is in use. Kept byte-for-byte identical to the
+// text that used to live inline in bootstrapTemplate.
+const defaultNodeIPScript = `IMDS=http://169.254.169.254/latest
+IMDS_TOKEN="$(curl -fsS -m 5 -X PUT "${IMDS}/api/token" -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)"
+NODE_IP=""
+for i in $(seq 1 30); do
+  NODE_IP="$(curl -fsS -m 5 ${IMDS_TOKEN:+-H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}"} "${IMDS}/meta-data/local-ipv4" 2>/dev/null || true)"
+  [[ -n "$NODE_IP" ]] && break
+  sleep 2
+done
+[[ -n "$NODE_IP" ]] || { report "Could not read the private IP from instance metadata"; exit 1; }
+report "Node IP is ${NODE_IP}"
+`
+
+// BuildCloudInitParams is the exported form of buildCloudInitParams (the same
+// NodeProvision -> bootstrap parameter mapping, including the shared GPU rule),
+// for clouds that reuse the bootstrap script.
+func BuildCloudInitParams(np *mlv1alpha1.NodeProvision, joinCommand, kubernetesVersion, kubernetesMinor string, runtimeCfg pkgruntime.Config) CloudInitParams {
+	return buildCloudInitParams(np, joinCommand, kubernetesVersion, kubernetesMinor, runtimeCfg)
+}
+
+// RenderBootstrapScript validates p and returns the raw (not compressed, not
+// base64) bootstrap script. BuildUserDataE wraps the same script for EC2
+// user-data; other clouds that take a plain-text startup script (GCE's
+// startup-script metadata) use this form. Invalid parameters are an error and
+// the caller must not launch an instance.
+func RenderBootstrapScript(p CloudInitParams) (string, error) {
+	if err := validateParams(p); err != nil {
+		return "", fmt.Errorf("invalid cloud-init parameters: %w", err)
+	}
+	script, err := renderBootstrapScript(p)
+	if err != nil {
+		return "", fmt.Errorf("failed to render cloud-init: %w", err)
+	}
+	return script, nil
+}
 
 var (
 	versionRE = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
@@ -53,30 +121,43 @@ var (
 	userRE    = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 )
 
-// BuildUserData renders the bootstrap script, gzip-compresses it and returns
-// standard-base64 encoded user-data suitable for EC2.
-//
-// Invalid input is rendered as an explicit shell failure rather than silently
-// generating a potentially dangerous bootstrap script. Existing callers use a
-// string-returning API, so the function cannot return validation errors.
-func BuildUserData(p CloudInitParams) string {
+// BuildUserDataE renders the bootstrap script, gzip-compresses it and returns
+// standard-base64 encoded user-data suitable for EC2. Invalid parameters or a
+// render failure are returned as an error; callers must not launch an instance
+// in that case.
+func BuildUserDataE(p CloudInitParams) (string, error) {
 	if err := validateParams(p); err != nil {
-		return encodeScript(fmt.Sprintf("#!/bin/bash\necho %q >&2\nexit 2\n", "invalid cloud-init parameters: "+err.Error()))
+		return "", fmt.Errorf("invalid cloud-init parameters: %w", err)
 	}
 
 	script, err := renderBootstrapScript(p)
 	if err != nil {
-		return encodeScript(fmt.Sprintf("#!/bin/bash\necho %q >&2\nexit 2\n", "failed to render cloud-init: "+err.Error()))
+		return "", fmt.Errorf("failed to render cloud-init: %w", err)
 	}
-	return encodeScript(script)
+	return encodeScript(script), nil
+}
+
+// BuildUserData is the legacy string-returning form of BuildUserDataE. On
+// invalid input it returns user-data that explicitly fails (exit 2) instead of a
+// potentially dangerous bootstrap script. New code should use BuildUserDataE and
+// refuse to launch on error: launching with this script yields a running but
+// never-bootstrapping instance.
+func BuildUserData(p CloudInitParams) string {
+	out, err := BuildUserDataE(p)
+	if err != nil {
+		return encodeScript(fmt.Sprintf("#!/bin/bash\necho %q >&2\nexit 2\n", err.Error()))
+	}
+	return out
 }
 
 func validateParams(p CloudInitParams) error {
-	if strings.TrimSpace(p.WGConfig) == "" {
-		return fmt.Errorf("WGConfig must not be empty")
-	}
-	if !ipRE.MatchString(strings.TrimSpace(p.VpnIP)) {
-		return fmt.Errorf("VpnIP contains invalid characters")
+	if !p.NoVPN {
+		if strings.TrimSpace(p.WGConfig) == "" {
+			return fmt.Errorf("WGConfig must not be empty")
+		}
+		if !ipRE.MatchString(strings.TrimSpace(p.VpnIP)) {
+			return fmt.Errorf("VpnIP contains invalid characters")
+		}
 	}
 	if !versionRE.MatchString(strings.TrimPrefix(strings.TrimSpace(p.KubernetesVersion), "v")) {
 		return fmt.Errorf("KubernetesVersion must be a full semantic version such as 1.35.0")
@@ -96,6 +177,21 @@ func validateParams(p CloudInitParams) error {
 	}
 	if p.SSHUsername != "" && !userRE.MatchString(p.SSHUsername) {
 		return fmt.Errorf("SSHUsername is not a valid Linux username")
+	}
+	// The join command is executed with `bash -c` on the node: only plain
+	// `kubeadm join <args>` is acceptable.
+	if err := kubeadm.ValidateJoinCommand(join); err != nil {
+		return fmt.Errorf("JoinCommand: %w", err)
+	}
+	if err := pkgruntime.ValidateInsecureRegistries(p.InsecureRegistries); err != nil {
+		return err
+	}
+	rc := pkgruntime.Config{
+		Registry: p.RuntimeRegistry, Repository: p.RuntimeRepository,
+		Version: p.RuntimeVersion, OrasVersion: p.RuntimeOrasVersion,
+	}
+	if err := rc.Validate(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -119,6 +215,7 @@ func encodeScript(script string) string {
 type templateData struct {
 	WGConfigB64          string
 	VpnIP                string
+	NoVPN                bool
 	JoinCommand          string
 	JoinCommandB64       string
 	KubernetesVersion    string
@@ -131,6 +228,11 @@ type templateData struct {
 	CRIOSocket           string
 	RuntimeCredentials   string // bash export block; Token value must never be logged
 	RuntimeInstallScript string // rendered by pkgruntime.InstallScript
+	NodeJoinedFunc       string // bash function node_already_joined (kubeadm.NodeAlreadyJoinedFunc)
+	NodeIPScript         string // NoVPN node-IP lookup; trusted controller text, see CloudInitParams.NodeIPScript
+	// InsecureRegistriesScript is the registries.conf.d drop-in writer
+	// (pkgruntime.InsecureRegistriesScript, run as root); empty when none.
+	InsecureRegistriesScript string
 }
 
 func kubeletNodeLabels(p CloudInitParams) string {
@@ -140,7 +242,24 @@ func kubeletNodeLabels(p CloudInitParams) string {
 	// These are the same GPU identity labels applied authoritatively by the
 	// kubeadm control-plane reconciler after the worker joins. Setting them at
 	// registration time avoids a window where the GPU worker is unclassified.
-	return "hardware-type=gpu,gpu=on,ml.dcn.ssu.ac.kr/provider=OnPrem"
+	// The provider value matches what the NodeProvision controller stamps
+	// (nodeProvisionProviderLabel = Spec.Provider, i.e. "AWS" for this path).
+	provider := p.ProviderLabel
+	if provider == "" {
+		provider = "AWS"
+	}
+	return "hardware-type=gpu,gpu=on,ml.dcn.ssu.ac.kr/provider=" + provider
+}
+
+// nodeIPScript returns the NoVPN node-IP lookup: the caller's, else the EC2 one.
+func nodeIPScript(p CloudInitParams) string {
+	if p.NodeIPScript != "" {
+		if !strings.HasSuffix(p.NodeIPScript, "\n") {
+			return p.NodeIPScript + "\n"
+		}
+		return p.NodeIPScript
+	}
+	return defaultNodeIPScript
 }
 
 func renderBootstrapScript(p CloudInitParams) (string, error) {
@@ -159,15 +278,16 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 	}
 	runtimeCfg.ApplyDefaults()
 
-	// Build the credentials block. Values are single-quoted; GitHub usernames and
-	// PATs contain only alphanumeric/dash/underscore chars so no escaping is needed.
+	// Build the credentials block. Values are shell-quoted (embedded single
+	// quotes are escaped), so no username/token can break out of the string.
 	// Token is embedded in user-data but never logged per security constraints.
-	runtimeCreds := "export CNLAB_REGISTRY_USER='" + runtimeCfg.Username + "'\n" +
-		"export CNLAB_REGISTRY_TOKEN='" + runtimeCfg.Token + "'"
+	runtimeCreds := "export CNLAB_REGISTRY_USER=" + sshhelper.ShellQuote(runtimeCfg.Username) + "\n" +
+		"export CNLAB_REGISTRY_TOKEN=" + sshhelper.ShellQuote(runtimeCfg.Token)
 
 	d := templateData{
 		WGConfigB64:          base64.StdEncoding.EncodeToString([]byte(p.WGConfig)),
 		VpnIP:                p.VpnIP,
+		NoVPN:                p.NoVPN,
 		JoinCommand:          p.JoinCommand,
 		JoinCommandB64:       base64.StdEncoding.EncodeToString([]byte(p.JoinCommand)),
 		KubernetesVersion:    strings.TrimPrefix(p.KubernetesVersion, "v"),
@@ -180,6 +300,10 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 		CRIOSocket:           crioSocket,
 		RuntimeCredentials:   runtimeCreds,
 		RuntimeInstallScript: pkgruntime.InstallScript(runtimeCfg),
+		NodeJoinedFunc:       kubeadm.NodeAlreadyJoinedFunc,
+		NodeIPScript:         nodeIPScript(p),
+
+		InsecureRegistriesScript: pkgruntime.InsecureRegistriesScript(p.InsecureRegistries, false),
 	}
 
 	var out bytes.Buffer
@@ -241,7 +365,7 @@ fi
 K8S_VERSION="{{.KubernetesVersion}}"
 K8S_MINOR="{{.KubernetesMinor}}"
 CRIO_SOCKET="{{.CRIOSocket}}"
-NODE_IP="{{.VpnIP}}"
+NODE_IP="{{.VpnIP}}" # empty with NoVPN; resolved from instance metadata below
 NODE_NAME="{{.NodeName}}"
 
 report "Bootstrap started"
@@ -370,9 +494,10 @@ wait_for_apt
 dpkg --configure -a
 apt_update
 apt_install ca-certificates curl gnupg apt-transport-https lsof jq \
-  wireguard iproute2 socat conntrack
+  {{if not .NoVPN}}wireguard {{end}}iproute2 socat conntrack
 
-report "Configuring WireGuard"
+{{if .NoVPN}}report "VPN disabled; using the instance private IP as the node IP"
+{{.NodeIPScript}}{{else}}report "Configuring WireGuard"
 mkdir -p /etc/wireguard
 printf '%s' '{{.WGConfigB64}}' | base64 -d > /etc/wireguard/wg0.conf
 chmod 0600 /etc/wireguard/wg0.conf
@@ -394,7 +519,7 @@ ip -4 addr show wg0 | grep -Eq 'inet[[:space:]]+'"$NODE_IP"'([/[:space:]]|$)' ||
   exit 1
 }
 report "WireGuard is ready on ${NODE_IP}"
-
+{{end}}
 # -----------------------------------------------------------------------------
 # cnlab-runtime OCI artifact install (ORAS-based, replaces all source builds)
 # -----------------------------------------------------------------------------
@@ -420,7 +545,10 @@ rm -rf /run/crio /var/run/crio
 
 mkdir -p /run/crio /var/run/crio /var/lib/crio /var/lib/containers/storage
 mkdir -p /etc/crio/crio.conf.d /etc/containers /etc/cni/net.d /opt/cni/bin /etc/criu
-
+{{if .InsecureRegistriesScript}}
+# Registries served over plain HTTP / untrusted TLS (softwareConfig.insecureRegistries
+# plus imagePrepulls hosts). Must be on disk before CRI-O (re)starts below.
+{{.InsecureRegistriesScript}}{{end}}
 if [ ! -f /etc/crictl.yaml ]; then
   cat > /etc/crictl.yaml <<CRICTL
 runtime-endpoint: unix://${CRIO_SOCKET}
@@ -499,11 +627,15 @@ irmap-scan-path /home/jovyan
 irmap-scan-path /usr
 irmap-scan-path /opt/conda
 irmap-scan-path /opt/remote-dev
+allow-uprobes
 CRIUCONF
 fi
+# Pre-existing runc.conf (older provisioning): make sure allow-uprobes is set.
+grep -qx 'allow-uprobes' /etc/criu/runc.conf || echo 'allow-uprobes' >> /etc/criu/runc.conf
 if [ ! -f /etc/criu/default.conf ]; then
   cp -f /etc/criu/runc.conf /etc/criu/default.conf
 fi
+grep -qx 'allow-uprobes' /etc/criu/default.conf || echo 'allow-uprobes' >> /etc/criu/default.conf
 
 systemctl daemon-reload
 systemctl enable crio
@@ -553,6 +685,8 @@ crictl info >/dev/null
 # kubeadm join
 # -----------------------------------------------------------------------------
 report "Joining cluster"
+# BEGIN kubeadm join
+{{.NodeJoinedFunc}}
 JOIN_CMD="$(printf '%s' '{{.JoinCommandB64}}' | base64 -d)"
 
 # kubeadm's own preflight check for the cluster-info ConfigMap uses a short
@@ -562,29 +696,47 @@ JOIN_CMD="$(printf '%s' '{{.JoinCommandB64}}' | base64 -d)"
 # ... context deadline exceeded". Wait for the control-plane API server to
 # actually answer over the tunnel before spending a kubeadm attempt on it.
 API_ENDPOINT="$(awk '{for(i=1;i<=NF;i++) if ($i=="join") {print $(i+1); exit}}' <<< "$JOIN_CMD")"
-if [[ -n "$API_ENDPOINT" ]]; then
-  report "Waiting for control-plane API server ${API_ENDPOINT} to become reachable over the VPN tunnel..."
-  for i in $(seq 1 60); do
-    curl -sk --connect-timeout 3 --max-time 5 "https://${API_ENDPOINT}/healthz" -o /dev/null && { report "Control-plane API server reachable"; break; }
-    sleep 5
+
+# Resuming (cloud-init re-run after a reboot or a failure after the join) must not
+# wipe a node that is already healthily joined: skip the join entirely.
+if node_already_joined "$API_ENDPOINT"; then
+  report "Node is already joined to the cluster (kubelet healthy, API server reachable); skipping kubeadm join"
+else
+  if [[ -n "$API_ENDPOINT" ]]; then
+    report "Waiting for control-plane API server ${API_ENDPOINT} to become reachable{{if not .NoVPN}} over the VPN tunnel{{end}}..."
+    for i in $(seq 1 60); do
+      curl -sk --connect-timeout 3 --max-time 5 "https://${API_ENDPOINT}/healthz" -o /dev/null && { report "Control-plane API server reachable"; break; }
+      sleep 5
+    done
+  fi
+
+  # Join command is generated by the control plane. It is intentionally executed
+  # only after CRI-O is proven healthy. --cri-socket prevents kubeadm from probing
+  # an unintended container runtime.
+  for attempt in 1 2 3 4 5; do
+    if bash -c "$JOIN_CMD --cri-socket=unix://${CRIO_SOCKET}"; then
+      report "Cluster join succeeded"
+      break
+    fi
+    # kubeadm can report an error after the kubelet already registered; a
+    # healthily joined node must never be reset.
+    if node_already_joined "$API_ENDPOINT"; then
+      report "kubeadm join reported an error but the node is healthily joined; not resetting"
+      break
+    fi
+    if [[ "$attempt" == "5" ]]; then
+      report "ERROR: kubeadm join failed after 5 attempts"
+      exit 1
+    fi
+    # A failed join can leave partial state (kubelet config, certs, static pod
+    # manifests) that fails the next attempt's preflight: reset first (only
+    # reached when the node is NOT healthily joined).
+    kubeadm reset --force --cri-socket="unix://${CRIO_SOCKET}" >/dev/null 2>&1 || true
+    sleep $((attempt * 15))
+    restart_crio_and_wait
   done
 fi
-
-# Join command is generated by the control plane. It is intentionally executed
-# only after CRI-O is proven healthy. --cri-socket prevents kubeadm from probing
-# an unintended container runtime.
-for attempt in 1 2 3 4 5; do
-  if bash -c "$JOIN_CMD --cri-socket=unix://${CRIO_SOCKET}"; then
-    report "Cluster join succeeded"
-    break
-  fi
-  if [[ "$attempt" == "5" ]]; then
-    report "ERROR: kubeadm join failed after 5 attempts"
-    exit 1
-  fi
-  sleep $((attempt * 15))
-  restart_crio_and_wait
-done
+# END kubeadm join
 
 # kubeadm should have created kubelet configuration. Do not blindly restart it
 # until CRI-O is healthy; the systemd dependency also enforces the relationship.
