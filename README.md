@@ -425,6 +425,34 @@ ERROR  provisioning failed — retry limit reached, no further retries  attempts
 
 ---
 
+## cnlab-runtime Build per Node OS
+
+`cnlab-runtime` is published once per OS target: `<version>-ubuntu22` (Ubuntu 22.04
+and newer) and `<version>-ubuntu20` (Ubuntu 20.04). Two ways to choose:
+
+- **One OS for the whole cluster:** set the full tag, e.g. `version: "1.0.2-ubuntu22"`.
+  Used exactly as given.
+- **Mixed OS (or let each node decide):** set the base version and `osVariant: auto`.
+  Each node reads its own `/etc/os-release` and installs the matching build:
+
+  ```yaml
+  cnlabRuntime:
+    version: "1.0.2"      # base version, no -ubuntuNN suffix
+    osVariant: auto
+  ```
+
+  | Node OS | Tag pulled |
+  |---|---|
+  | Ubuntu 20.04 (20.x, 21.x) | `1.0.2-ubuntu20` |
+  | Ubuntu 22.04 and newer | `1.0.2-ubuntu22` |
+  | Ubuntu older than 20.04, or not Ubuntu | install fails before contacting the registry |
+
+  `osVariant: auto` requires an explicit `version` without an OS suffix; it works
+  for SSH-provisioned nodes and for AWS/GCP cloud-init nodes alike. It applies to
+  both `RemoteCluster` and `NodeProvisionNetConfig` (`softwareConfig.cnlabRuntime`).
+
+---
+
 ## cnlab-runtime Credential Sync
 
 The `cnlab-runtime` OCI artifact is pulled during node bootstrapping. When credentials are added or rotated:

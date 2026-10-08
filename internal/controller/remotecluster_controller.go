@@ -1286,6 +1286,9 @@ func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig( //nolin
 			if cr.OrasVersion != "" {
 				cnlabRuntimeYAML += fmt.Sprintf("      orasVersion: %s\n", yamlQuote(cr.OrasVersion))
 			}
+			if cr.OSVariant != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      osVariant: %s\n", yamlQuote(cr.OSVariant))
+			}
 			if cr.CredentialsRef.Name != "" {
 				cnlabRuntimeYAML += fmt.Sprintf("      credentialsRef:\n        name: %s\n        namespace: %s\n",
 					yamlQuote(cr.CredentialsRef.Name),
@@ -3428,6 +3431,7 @@ func (r *RemoteClusterReconciler) resolveCnlabRuntimeConfig(
 		cfg.Repository = cr.Repository
 		cfg.Version = cr.Version
 		cfg.OrasVersion = cr.OrasVersion
+		cfg.OSVariant = cr.OSVariant
 
 		ref := cr.CredentialsRef
 		if ref.Name != "" {
@@ -3525,6 +3529,11 @@ func (r *RemoteClusterReconciler) syncCnlabCredentialsToRemote(ctx context.Conte
         namespace: %s
 `, yamlQuote(runtimeCfg.Registry), yamlQuote(runtimeCfg.Repository), yamlQuote(runtimeCfg.Version), yamlQuote(runtimeCfg.OrasVersion),
 		yamlQuote(secretName), yamlQuote(ns))
+	if runtimeCfg.OSVariant != "" {
+		// Keep the per-node OS selection on the remote cluster, otherwise its
+		// nodes would request the bare base version, which is not a published tag.
+		cnlabRuntimeYAML += fmt.Sprintf("      osVariant: %s\n", yamlQuote(runtimeCfg.OSVariant))
+	}
 
 	netConfigName := cluster.Spec.ClusterName + "-netconfig"
 	patchCmd := fmt.Sprintf(`

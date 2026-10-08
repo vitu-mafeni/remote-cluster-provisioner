@@ -384,6 +384,7 @@ func buildCloudInitParams(np *mlv1alpha1.NodeProvision, joinCommand, kubernetesV
 		RuntimeRegistry:        runtimeCfg.Registry,
 		RuntimeRepository:      runtimeCfg.Repository,
 		RuntimeVersion:         runtimeCfg.Version,
+		RuntimeOSVariant:       runtimeCfg.OSVariant,
 		RuntimeOrasVersion:     runtimeCfg.OrasVersion,
 	}
 }

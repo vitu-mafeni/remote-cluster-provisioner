@@ -2784,6 +2784,7 @@ func (r *NodeProvisionReconciler) resolveCnlabRuntimeConfig(
 		cfg.Repository = cr.Repository
 		cfg.Version = cr.Version
 		cfg.OrasVersion = cr.OrasVersion
+		cfg.OSVariant = cr.OSVariant
 
 		ref := cr.CredentialsRef
 		if ref.Name != "" {

@@ -3,6 +3,7 @@ package runtime
 import (
 	"fmt"
 	"regexp"
+	"strings"
 
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
 )
@@ -11,6 +12,7 @@ var (
 	registryRE   = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
 	repositoryRE = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$`)
 	versionTagRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._+-]{0,127}$`)
+	osSuffixRE   = regexp.MustCompile(`-ubuntu[0-9]+$`)
 	orasVersion  = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.]+)?$`)
 )
 
@@ -19,6 +21,20 @@ var (
 // shell-quote every value, so this is defence in depth that additionally turns
 // typos into a clear error instead of a broken pull.
 func (c Config) Validate() error {
+	switch c.OSVariant {
+	case "", OSVariantAuto:
+	default:
+		return fmt.Errorf("runtime osVariant %q is not supported (use %q or leave empty)", c.OSVariant, OSVariantAuto)
+	}
+	if c.OSVariant == OSVariantAuto {
+		// The default version predates per-OS variants, so it has no -ubuntuNN tag.
+		if c.Version == "" {
+			return fmt.Errorf("runtime osVariant %q requires an explicit base version (e.g. 1.0.2)", OSVariantAuto)
+		}
+		if osSuffixRE.MatchString(c.Version) {
+			return fmt.Errorf("runtime version %q already has an OS suffix; with osVariant %q give the base version only", c.Version, OSVariantAuto)
+		}
+	}
 	c.ApplyDefaults()
 	if !registryRE.MatchString(c.Registry) {
 		return fmt.Errorf("runtime registry %q is not a valid registry host[:port]", c.Registry)
@@ -92,6 +108,7 @@ CNLAB_REF=%[1]s
 CNLAB_VERSION=%[2]s
 CNLAB_REGISTRY=%[3]s
 CNLAB_ORAS_VER=%[4]s
+%[6]s
 report "Installing cnlab-runtime ${CNLAB_VERSION} via ORAS"
 CNLAB_ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 case "$CNLAB_ARCH" in
@@ -157,7 +174,8 @@ else
   report "cnlab-runtime $CNLAB_VERSION installed"
 fi
 `, sshhelper.ShellQuote(cfg.ImageRef()), sshhelper.ShellQuote(cfg.Version),
-		sshhelper.ShellQuote(cfg.Registry), sshhelper.ShellQuote(cfg.OrasVersion), orasInstallSnippet)
+		sshhelper.ShellQuote(cfg.Registry), sshhelper.ShellQuote(cfg.OrasVersion), orasInstallSnippet,
+		osVariantSnippet(cfg, "CNLAB_VERSION", "CNLAB_REF"))
 	return cnlabInstall + `
 # -----------------------------------------------------------------------------
 # Standard CNI plugins (portmap is required by flannel's conflist)
@@ -193,6 +211,7 @@ func installRuntimeCmd(cfg Config) string {
 REF=%[1]s
 VERSION=%[2]s
 REGISTRY=%[3]s
+%[5]s
 ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 case "$ARCH" in
   amd64|arm64) ;;
@@ -236,7 +255,42 @@ cnlab-runtime version
 rm -rf "$WORK"
 echo "[cnlab-runtime] version $VERSION installed"`,
 		sshhelper.ShellQuote(cfg.ImageRef()), sshhelper.ShellQuote(cfg.Version),
-		sshhelper.ShellQuote(cfg.Registry), loginBlock)
+		sshhelper.ShellQuote(cfg.Registry), loginBlock, osVariantSnippet(cfg, "VERSION", "REF"))
+}
+
+// osVariantSnippet returns bash that resolves the per-OS artifact variant on the
+// node when cfg.OSVariant is OSVariantAuto (empty otherwise, so scripts for
+// explicit versions are unchanged). It appends -ubuntu20 / -ubuntu22 to
+// versionVar and rewrites the tag of refVar to match, so everything after it
+// (the "already installed" check and the oras pull) uses the resolved tag.
+//
+// Ubuntu 20.x/21.x get the ubuntu20 build and 22.x and newer the ubuntu22
+// build (the 22.04 build is the one for 22.04 and up). Anything else fails
+// before touching the registry. The os-release path can be overridden through
+// CNLAB_OS_RELEASE_FILE, which the tests use.
+func osVariantSnippet(cfg Config, versionVar, refVar string) string {
+	if cfg.OSVariant != OSVariantAuto {
+		return ""
+	}
+	return strings.NewReplacer("@VERSION@", versionVar, "@REF@", refVar).Replace(`# Pick the runtime variant that matches this node's OS (osVariant: auto).
+CNLAB_OSR="${CNLAB_OS_RELEASE_FILE:-/etc/os-release}"
+CNLAB_OS_ID=$(. "$CNLAB_OSR" 2>/dev/null && printf '%s' "${ID:-}" || true)
+CNLAB_OS_VID=$(. "$CNLAB_OSR" 2>/dev/null && printf '%s' "${VERSION_ID:-}" || true)
+CNLAB_OS_MAJOR="${CNLAB_OS_VID%%.*}"
+if [ "$CNLAB_OS_ID" != "ubuntu" ] || ! [[ "$CNLAB_OS_MAJOR" =~ ^[0-9]+$ ]]; then
+  echo "[cnlab-runtime] osVariant auto needs Ubuntu; found ID='${CNLAB_OS_ID}' VERSION_ID='${CNLAB_OS_VID}'" >&2
+  exit 1
+elif [ "$CNLAB_OS_MAJOR" -ge 22 ]; then
+  CNLAB_OS_TAG=ubuntu22
+elif [ "$CNLAB_OS_MAJOR" -ge 20 ]; then
+  CNLAB_OS_TAG=ubuntu20
+else
+  echo "[cnlab-runtime] Ubuntu ${CNLAB_OS_VID} is not supported (Ubuntu 20.04 or newer required)" >&2
+  exit 1
+fi
+@VERSION@="${@VERSION@}-${CNLAB_OS_TAG}"
+@REF@="${@REF@%:*}:${@VERSION@}"
+echo "[cnlab-runtime] node is Ubuntu ${CNLAB_OS_VID}: using runtime ${@VERSION@}"`)
 }
 
 // configureDropInsCmd checks whether each CRI-O / CRIU config file already

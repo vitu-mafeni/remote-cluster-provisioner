@@ -80,7 +80,10 @@ spec:
 
       # cnlabRuntime is optional; defaults apply when omitted.
       # cnlabRuntime:
-      #   version: "1.0.2-beta"
+      #   version: "1.0.2-ubuntu22"   # full tag: same build on every node
+      #   # Mixed Ubuntu 20.04 / 22.04+ nodes: base version + per-node auto-selection
+      #   # version: "1.0.2"
+      #   # osVariant: auto
       #   credentialsRef:
       #     name: ml-novpn-cnlab-runtime-registry
       #     namespace: default

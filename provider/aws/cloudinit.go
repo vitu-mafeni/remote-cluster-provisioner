@@ -45,6 +45,7 @@ type CloudInitParams struct {
 	RuntimeRegistry      string
 	RuntimeRepository    string
 	RuntimeVersion       string
+	RuntimeOSVariant     string // "" or pkgruntime.OSVariantAuto
 	RuntimeOrasVersion   string
 
 	// InsecureRegistries are the registry hosts (host or host:port) CRI-O must
@@ -189,6 +190,7 @@ func validateParams(p CloudInitParams) error {
 	rc := pkgruntime.Config{
 		Registry: p.RuntimeRegistry, Repository: p.RuntimeRepository,
 		Version: p.RuntimeVersion, OrasVersion: p.RuntimeOrasVersion,
+		OSVariant: p.RuntimeOSVariant,
 	}
 	if err := rc.Validate(); err != nil {
 		return err
@@ -272,6 +274,7 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 		Registry:    p.RuntimeRegistry,
 		Repository:  p.RuntimeRepository,
 		Version:     p.RuntimeVersion,
+		OSVariant:   p.RuntimeOSVariant,
 		OrasVersion: p.RuntimeOrasVersion,
 		Username:    p.RuntimeRegistryUser,
 		Token:       p.RuntimeRegistryToken,

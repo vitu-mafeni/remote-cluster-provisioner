@@ -161,6 +161,15 @@ type CnlabRuntimeConfig struct {
 	// OrasVersion is the ORAS CLI version to install. Default: "1.3.2"
 	// +optional
 	OrasVersion string `json:"orasVersion,omitempty"`
+	// OSVariant selects how the artifact tag is chosen. Empty (default): Version
+	// is used exactly as given. "auto": Version is the base version (e.g.
+	// "1.0.2") and each node picks its own build from /etc/os-release, installing
+	// "<Version>-ubuntu20" on Ubuntu 20.x/21.x and "<Version>-ubuntu22" on
+	// Ubuntu 22.x and newer. Use it for clusters that mix OS releases; it
+	// requires an explicit Version without an OS suffix.
+	// +kubebuilder:validation:Enum=auto
+	// +optional
+	OSVariant string `json:"osVariant,omitempty"`
 	// CredentialsRef references a Secret with "username" and "token" keys
 	// for authenticating to the OCI registry. Follows the same pattern as
 	// VPNSSHCredentialsRef — set Name to enable secret lookup.
