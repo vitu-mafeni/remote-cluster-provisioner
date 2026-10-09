@@ -25,7 +25,13 @@ func newGuardEnv(t *testing.T, extraEnv ...string) *guardEnv {
 	j := newJoinEnv(t)
 	// Node-name resolution on the "control plane" (same fake host): kubectl is
 	// only asked to list nodes, jq turns that into "<name>\t<ip>".
-	j.Write("jq", "#!/bin/bash\nprintf 'worker-1\\t127.0.0.1\\n'\n")
+	j.Write("jq", "#!/bin/bash\nprintf 'worker-1\\t192.0.2.10\\n'\n")
+	j.Write("ip", `#!/bin/bash
+case "$*" in
+  "-4 route get 1.1.1.1") echo "1.1.1.1 dev eth0 src 192.0.2.10" ;;
+  "-o addr show") echo "2: eth0 inet 192.0.2.10/24 scope global eth0" ;;
+esac
+`)
 	env := append([]string{
 		"PATH=" + j.Dir + ":" + envPath(),
 		"FAKE_LOG=" + j.LogDir,
@@ -86,7 +92,7 @@ func guardTestCluster() (*infrav1.RemoteCluster, *infrav1.RemoteCluster) {
 	worker := &infrav1.RemoteCluster{Spec: infrav1.RemoteClusterSpec{
 		ClusterName: "c1",
 		Host:        "127.0.0.1",
-		DisableVPN:  true, // node IP = spec.host, no wg0 needed
+		DisableVPN:  true, // node IP comes from the local route, no wg0 needed
 		NodeInfo:    infrav1.NodeInfo{NodeType: "worker", HardwareType: "cpu"},
 	}}
 	cp := &infrav1.RemoteCluster{Spec: infrav1.RemoteClusterSpec{
@@ -112,7 +118,7 @@ func TestJoinWorkerNode_HealthyJoinedNodeIsNeverReset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("JoinWorkerNode: %v", err)
 	}
-	if nodeIP != "127.0.0.1" {
+	if nodeIP != "192.0.2.10" {
 		t.Errorf("node IP = %q", nodeIP)
 	}
 	if calls := g.Log("kubeadm.calls"); calls != "" {

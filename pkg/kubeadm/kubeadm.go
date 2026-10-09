@@ -1060,7 +1060,7 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 		return err, ""
 	}
 
-	// Resolve the node name by matching the worker's VPN IP in the node address table.
+	// Resolve the node name by matching the worker's node IP in the node address table.
 	// kubelet takes a few seconds to register after kubeadm join; retry for up to 90 s.
 	var rawNodeOutput string
 	nodeName := ""
@@ -1085,7 +1085,7 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 		time.Sleep(2 * time.Second)
 	}
 	if nodeName == "" {
-		return fmt.Errorf("failed to resolve node name for host %s vpn ip: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput), ""
+		return fmt.Errorf("failed to resolve node name for host %s node IP: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput), ""
 	}
 
 	var labelAndTaintCmd string
@@ -1109,8 +1109,7 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 }
 
 // ResolveNodeIP returns the IP the node should register with Kubernetes: the
-// wg0 address when a VPN is in use, otherwise cluster.Spec.Host (which must
-// then be an IP bound to a local interface on the node).
+// wg0 address when a VPN is in use, otherwise the primary local IPv4 address.
 func ResolveNodeIP(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (string, error) {
 	if !cluster.Spec.DisableVPN {
 		return GetTunIP(client)
@@ -1118,9 +1117,6 @@ func ResolveNodeIP(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (st
 	ip, err := GetPrimaryIP(client)
 	if err != nil {
 		return "", err
-	}
-	if net.ParseIP(ip) == nil {
-		return "", fmt.Errorf("spec.disableVPN requires spec.host to be an IP address, got %q", cluster.Spec.Host)
 	}
 	if err := VerifyLocalIP(client, ip); err != nil {
 		return "", err
@@ -1147,7 +1143,10 @@ func GetPrimaryIP(client *sshhelper.Client) (string, error) {
 	if err != nil {
 		return "", sshhelper.StepError("reading the primary host IP", err, output)
 	}
+	return parsePrimaryIP(output)
+}
 
+func parsePrimaryIP(output string) (string, error) {
 	// Example output:
 	// 1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.100 uid 1000
 	fields := strings.Fields(strings.TrimSpace(output))

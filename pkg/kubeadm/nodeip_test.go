@@ -3,18 +3,47 @@ package kubeadm
 import (
 	"strings"
 	"testing"
-
-	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 )
 
-func TestResolveNodeIP_DisableVPNRequiresIPHost(t *testing.T) {
-	for _, host := range []string{"node.example.com", "", "10.0.0"} {
-		c := &infrav1.RemoteCluster{Spec: infrav1.RemoteClusterSpec{DisableVPN: true, Host: host}}
-		// nil client: validation must fail before any SSH command runs.
-		_, err := ResolveNodeIP(nil, c)
-		if err == nil || !strings.Contains(err.Error(), "spec.host") {
-			t.Errorf("host %q: expected spec.host validation error, got %v", host, err)
-		}
+func TestParsePrimaryIP(t *testing.T) {
+	tests := []struct {
+		name    string
+		output  string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:   "route source IPv4",
+			output: "1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.100 uid 1000",
+			want:   "192.168.1.100",
+		},
+		{
+			name:    "missing source",
+			output:  "1.1.1.1 via 192.168.1.1 dev eth0",
+			wantErr: true,
+		},
+		{
+			name:    "invalid source",
+			output:  "1.1.1.1 dev eth0 src not-an-ip",
+			wantErr: true,
+		},
+		{
+			name:    "IPv6 source",
+			output:  "1.1.1.1 dev eth0 src 2001:db8::1",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parsePrimaryIP(tt.output)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parsePrimaryIP() error = %v, wantErr %t", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("parsePrimaryIP() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
