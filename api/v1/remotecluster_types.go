@@ -32,12 +32,13 @@ type RemoteClusterSpec struct {
 
 	// foo is an example field of RemoteCluster. Edit remotecluster_types.go to remove/update
 	// +optional
-	ClusterName string    `json:"clusterName"` // this has to be unique for each cluster, and will be used as the cluster name when provisioning, and also will be used as the parent cluster
-	Host        string    `json:"host"`
-	VPNConfig   VPNConfig `json:"vpnConfig,omitempty"`
-	Port        string    `json:"port"`
-	User        string    `json:"user"`
-	NodeInfo    NodeInfo  `json:"nodeInfo,omitempty"`
+	ClusterName    string    `json:"clusterName"` // this has to be unique for each cluster, and will be used as the cluster name when provisioning, and also will be used as the parent cluster
+	Host           string    `json:"host"`
+	LocalPrimaryIP string    `json:"localPrimaryIP,omitempty"` // the primary IP of the local node that is used to connect to the remote cluster, this is used for VPN connection
+	VPNConfig      VPNConfig `json:"vpnConfig,omitempty"`
+	Port           string    `json:"port"`
+	User           string    `json:"user"`
+	NodeInfo       NodeInfo  `json:"nodeInfo,omitempty"`
 
 	Auth      RemoteClusterAuth `json:"auth"`
 	GitConfig GitConfig         `json:"gitConfig,omitempty"`

@@ -1115,9 +1115,9 @@ func ResolveNodeIP(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (st
 	if !cluster.Spec.DisableVPN {
 		return GetTunIP(client)
 	}
-	ip := strings.TrimSpace(cluster.Spec.Host)
+	ip := strings.TrimSpace(cluster.Spec.LocalPrimaryIP)
 	if net.ParseIP(ip) == nil {
-		return "", fmt.Errorf("spec.disableVPN requires spec.host to be an IP address, got %q", cluster.Spec.Host)
+		return "", fmt.Errorf("spec.disableVPN requires spec.localPrimaryIP to be an IP address, got %q", cluster.Spec.LocalPrimaryIP)
 	}
 	if err := VerifyLocalIP(client, ip); err != nil {
 		return "", err

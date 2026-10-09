@@ -109,6 +109,8 @@ spec:
                 type: object
               host:
                 type: string
+              localPrimaryIP:
+                type: string
               nodeInfo:
                 properties:
                   hardwareType:
