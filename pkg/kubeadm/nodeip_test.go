@@ -9,11 +9,11 @@ import (
 
 func TestResolveNodeIP_DisableVPNRequiresIPHost(t *testing.T) {
 	for _, host := range []string{"node.example.com", "", "10.0.0"} {
-		c := &infrav1.RemoteCluster{Spec: infrav1.RemoteClusterSpec{DisableVPN: true, Host: host}}
+		c := &infrav1.RemoteCluster{Spec: infrav1.RemoteClusterSpec{DisableVPN: true, LocalPrimaryIP: host}}
 		// nil client: validation must fail before any SSH command runs.
 		_, err := ResolveNodeIP(nil, c)
-		if err == nil || !strings.Contains(err.Error(), "spec.host") {
-			t.Errorf("host %q: expected spec.host validation error, got %v", host, err)
+		if err == nil || !strings.Contains(err.Error(), "spec.localPrimaryIP") {
+			t.Errorf("host %q: expected spec.localPrimaryIP validation error, got %v", host, err)
 		}
 	}
 }

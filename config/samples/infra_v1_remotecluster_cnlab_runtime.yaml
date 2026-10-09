@@ -277,7 +277,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: EXAMPLE
+  password: EXAMPLEE
 ---
 # ============================================================
 # RemoteCluster — GPU worker node
