@@ -109,8 +109,6 @@ spec:
                 type: object
               host:
                 type: string
-              localPrimaryIP:
-                type: string
               nodeInfo:
                 properties:
                   hardwareType:
@@ -261,6 +259,9 @@ spec:
               user:
                 type: string
               vpnConfig:
+                description: LocalPrimaryIP string    `json:"localPrimaryIP,omitempty"`
+                  // the primary IP of the local node that is used to connect to the
+                  remote cluster, this is used for VPN connection
                 properties:
                   ip:
                     type: string

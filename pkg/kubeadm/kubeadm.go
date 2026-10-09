@@ -1115,9 +1115,12 @@ func ResolveNodeIP(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (st
 	if !cluster.Spec.DisableVPN {
 		return GetTunIP(client)
 	}
-	ip := strings.TrimSpace(cluster.Spec.LocalPrimaryIP)
+	ip, err := GetPrimaryIP(client)
+	if err != nil {
+		return "", err
+	}
 	if net.ParseIP(ip) == nil {
-		return "", fmt.Errorf("spec.disableVPN requires spec.localPrimaryIP to be an IP address, got %q", cluster.Spec.LocalPrimaryIP)
+		return "", fmt.Errorf("spec.disableVPN requires spec.host to be an IP address, got %q", cluster.Spec.Host)
 	}
 	if err := VerifyLocalIP(client, ip); err != nil {
 		return "", err
@@ -1135,6 +1138,34 @@ func VerifyLocalIP(client *sshhelper.Client, ip string) error {
 		return sshhelper.StepError(fmt.Sprintf("checking that %s is bound to a local interface (NATed public IPs are not supported when the VPN is disabled)", ip), err, out)
 	}
 	return nil
+}
+
+// GetPrimaryIP returns the primary IPv4 address used for outbound traffic
+// on the remote host.
+func GetPrimaryIP(client *sshhelper.Client) (string, error) {
+	output, err := sshhelper.RunStdout(client, `ip -4 route get 1.1.1.1`)
+	if err != nil {
+		return "", sshhelper.StepError("reading the primary host IP", err, output)
+	}
+
+	// Example output:
+	// 1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.100 uid 1000
+	fields := strings.Fields(strings.TrimSpace(output))
+	var ip string
+
+	for i := 0; i < len(fields)-1; i++ {
+		if fields[i] == "src" {
+			ip = fields[i+1]
+			break
+		}
+	}
+
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil || parsedIP.To4() == nil {
+		return "", fmt.Errorf("could not determine the primary IPv4 address from the routing table")
+	}
+
+	return ip, nil
 }
 
 // GetTunIP returns the IPv4 address of the wg0 interface on the remote host.
