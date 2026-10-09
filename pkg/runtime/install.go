@@ -166,8 +166,10 @@ else
     exit 1
   fi
   echo "[cnlab-runtime] installing $CNLAB_DEB"
-  DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite "$CNLAB_DEB" || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -f -y
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-overwrite "$CNLAB_DEB"; then
+    rm -rf "$CNLAB_WORK"
+    exit 1
+  fi
   rm -f /var/cache/apt/archives/cnlab-runtime_*.deb
   cnlab-runtime version
   rm -rf "$CNLAB_WORK"
@@ -248,8 +250,10 @@ if [ -z "$DEB" ]; then
   exit 1
 fi
 echo "[cnlab-runtime] installing $DEB"
-sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite "$DEB" || true
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y
+if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-overwrite "$DEB"; then
+  rm -rf "$WORK"
+  exit 1
+fi
 sudo rm -f /var/cache/apt/archives/cnlab-runtime_*.deb
 cnlab-runtime version
 rm -rf "$WORK"

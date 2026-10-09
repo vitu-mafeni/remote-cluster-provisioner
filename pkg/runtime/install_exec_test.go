@@ -62,8 +62,8 @@ func stubEnv(t *testing.T) (env []string, logDir, tmp string) {
 	}
 	write("oras", fakeOras)
 	write("dpkg", "#!/bin/bash\n[ \"$1\" = --print-architecture ] && { echo amd64; exit 0; }\necho \"dpkg $*\" >> \"$FAKE_LOG/dpkg.calls\"\n")
-	write("apt-get", "#!/bin/bash\necho \"apt-get $*\" >> \"$FAKE_LOG/dpkg.calls\"\n")
-	write("cnlab-runtime", "#!/bin/bash\n[ \"$1\" = version ] && echo \"${FAKE_HAVE:-}\"\nexit 0\n")
+	write("apt-get", "#!/bin/bash\necho \"apt-get $*\" >> \"$FAKE_LOG/dpkg.calls\"\n[ \"${FAKE_APT_INSTALL_FAIL:-0}\" != 1 ] || [ \"$1\" != install ] || exit 100\n")
+	write("cnlab-runtime", "#!/bin/bash\necho \"$*\" >> \"$FAKE_LOG/cnlab-runtime.calls\"\n[ \"$1\" = version ] && echo \"${FAKE_HAVE:-}\"\nexit 0\n")
 	write("crio", "#!/bin/bash\n") // the cloud-init idempotency check needs crio on PATH
 	write("sudo", "#!/bin/bash\nexec env \"$@\"\n")
 	env = append(os.Environ(),
@@ -145,8 +145,12 @@ func TestInstallScriptsExecute_WithTokenAndPublicRegistry(t *testing.T) {
 			} else if !strings.Contains(argv, "--password-stdin") || !strings.Contains(argv, "--username\nrobot") {
 				t.Errorf("unexpected login argv:\n%s", argv)
 			}
-			if !strings.Contains(readLog(t, logs, "dpkg.calls"), "dpkg -i") {
-				t.Errorf("deb was not installed:\n%s", readLog(t, logs, "dpkg.calls"))
+			installCalls := readLog(t, logs, "dpkg.calls")
+			if !strings.Contains(installCalls, "apt-get install -y") || !strings.Contains(installCalls, "cnlab-runtime_1.0.0_amd64.deb") {
+				t.Errorf("deb was not installed through apt:\n%s", installCalls)
+			}
+			if strings.Contains(installCalls, "dpkg -i") || strings.Contains(installCalls, "apt-get install -f") {
+				t.Errorf("runtime install must not leave dependency resolution to a later repair:\n%s", installCalls)
 			}
 			assertNoLeftovers(t, tmp)
 		})
@@ -204,6 +208,25 @@ func TestInstallScriptsExecute_NoDebPrintsFriendlyError(t *testing.T) {
 			}
 			if !strings.Contains(errOut, "no .deb found in pulled artifact") {
 				t.Errorf("friendly error not printed, stderr:\n%s", errOut)
+			}
+			assertNoLeftovers(t, tmp)
+		})
+	}
+}
+
+func TestInstallScriptsStopWhenAptCannotInstallRuntime(t *testing.T) {
+	for _, sc := range scriptCases() {
+		t.Run(sc.name, func(t *testing.T) {
+			env, logs, tmp := stubEnv(t)
+			env = append(env, "FAKE_APT_INSTALL_FAIL=1")
+			cfg := Config{}
+			cfg.ApplyDefaults()
+			out, errOut, err := runScript(t, sc.build(cfg), env)
+			if err == nil {
+				t.Fatalf("expected apt installation failure, stdout:\n%s\nstderr:\n%s", out, errOut)
+			}
+			if calls := readLog(t, logs, "cnlab-runtime.calls"); strings.Count(calls, "version\n") != 1 {
+				t.Errorf("runtime must not be queried after apt installation fails, calls:\n%s", calls)
 			}
 			assertNoLeftovers(t, tmp)
 		})
