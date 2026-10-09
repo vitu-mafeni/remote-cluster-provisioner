@@ -644,7 +644,7 @@ printf '[Unit]\nAfter=crio.service\nRequires=crio.service\n' \
        sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
        || { sudo journalctl -xeu crio.service --no-pager >&2; false; }; }`,
 			`test -f /etc/kubernetes/admin.conf || ( \
-sudo kubeadm init --config /tmp/kubeadm-config.yaml --cri-socket=unix:///var/run/crio/crio.sock; RC=$?; \
+sudo kubeadm init --config /tmp/kubeadm-config.yaml; RC=$?; \
 if [ $RC -ne 0 ]; then \
   echo "=== crictl ps -a ===" >&2; \
   sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a >&2 2>&1 || true; \
