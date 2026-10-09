@@ -415,9 +415,9 @@ runtimeRequestTimeout: "15m"
 imageGCHighThresholdPercent: 95
 imageGCLowThresholdPercent: 90
 evictionHard:
-	imagefs.available: "15%%"
+  imagefs.available: "15%%"
   memory.available: "500Mi"
-	nodefs.available: "10%%"
+  nodefs.available: "10%%"
   nodefs.inodesFree: "5%%"
 evictionPressureTransitionPeriod: 0s
 ---
