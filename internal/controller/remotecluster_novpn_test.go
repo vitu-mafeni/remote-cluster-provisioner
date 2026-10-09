@@ -228,11 +228,16 @@ func TestPushNetConfigViaSSH_VPNEnabledCarriesVPNFields(t *testing.T) {
 }
 
 // Creating the remote NetConfig of a VPN-less control-plane: the node IP is the
-// host's own address (no wg0 lookup), the object carries disableVPN and no VPN
+// primary local route address (no wg0 lookup), the object carries disableVPN and no VPN
 // range/server, the VPN credentials secret is not copied (even if a stale
 // vpnConfig is left in the spec) and no VPN IP is recorded in usedIPAddresses.
 func TestHandleCreateUpdateNodeProvisionConfig_CreateWithoutVPN(t *testing.T) {
-	cpSrv := startFakeSSH(t, okHandler)
+	cpSrv := startFakeSSH(t, func(script string) (string, string, int) {
+		if strings.Contains(script, "ip -4 route get 1.1.1.1") {
+			return "1.1.1.1 dev eth0 src 192.0.2.10", "", 0
+		}
+		return "", "", 0
+	})
 	cp := withSSH(novpnNode("cp", "control-plane"), cpSrv)
 	cp.Spec.VPNConfig = infrav1.VPNConfig{
 		IP: "10.8.0.2", VPNServerPublicIP: "203.0.113.9",
@@ -253,8 +258,11 @@ func TestHandleCreateUpdateNodeProvisionConfig_CreateWithoutVPN(t *testing.T) {
 	if cpSrv.ran("ip -4 addr show wg0") != 0 {
 		t.Error("wg0 must not be queried without a VPN")
 	}
+	if cpSrv.ran("ip -4 route get 1.1.1.1") != 1 {
+		t.Error("the primary local route address must be discovered")
+	}
 	if cpSrv.ran("ip -o addr show") != 1 {
-		t.Error("the host address must be verified as bound locally")
+		t.Error("the primary route address must be verified as bound locally")
 	}
 	nc := cpSrv.find("kind: NodeProvisionNetConfig\nmetadata")
 	if !strings.Contains(nc, "disableVPN: true") {

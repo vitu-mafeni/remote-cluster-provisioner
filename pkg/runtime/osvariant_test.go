@@ -42,7 +42,7 @@ func TestOSVariantAuto_PicksTagFromNodeOS(t *testing.T) {
 		{"ubuntu", "21.10", "1.0.2-ubuntu20"},
 		{"ubuntu", "22.04", "1.0.2-ubuntu22"},
 		{"ubuntu", "24.04", "1.0.2-ubuntu22"},
-		{"ubuntu", "26.04", "1.0.2-ubuntu22"},
+		{"ubuntu", "26.04", "1.0.2-ubuntu26"},
 	}
 	for _, sc := range scriptCases() {
 		for _, c := range cases {

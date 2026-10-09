@@ -444,7 +444,8 @@ and newer) and `<version>-ubuntu20` (Ubuntu 20.04). Two ways to choose:
   | Node OS | Tag pulled |
   |---|---|
   | Ubuntu 20.04 (20.x, 21.x) | `1.0.2-ubuntu20` |
-  | Ubuntu 22.04 and newer | `1.0.2-ubuntu22` |
+  | Ubuntu 22.04 through 25.x | `1.0.2-ubuntu22` |
+  | Ubuntu 26.04 and newer | `1.0.2-ubuntu26` |
   | Ubuntu older than 20.04, or not Ubuntu | install fails before contacting the registry |
 
   `osVariant: auto` requires an explicit `version` without an OS suffix; it works

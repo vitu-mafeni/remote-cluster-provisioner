@@ -58,7 +58,8 @@ func withDeadSSH(t *testing.T, n *infrav1.RemoteCluster) *infrav1.RemoteCluster 
 	return n
 }
 
-// novpnNode is a node in a VPN-less cluster (host = its own address).
+// novpnNode is a node in a VPN-less cluster; host is its SSH endpoint, while
+// the node IP is discovered from the host's primary local route.
 func novpnNode(name, nodeType string) *infrav1.RemoteCluster {
 	n := node(name, "c1", nodeType)
 	n.Spec.DisableVPN = true

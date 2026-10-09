@@ -264,13 +264,13 @@ echo "[cnlab-runtime] version $VERSION installed"`,
 
 // osVariantSnippet returns bash that resolves the per-OS artifact variant on the
 // node when cfg.OSVariant is OSVariantAuto (empty otherwise, so scripts for
-// explicit versions are unchanged). It appends -ubuntu20 / -ubuntu22 to
+// explicit versions are unchanged). It appends -ubuntu20 / -ubuntu22 / -ubuntu26 to
 // versionVar and rewrites the tag of refVar to match, so everything after it
 // (the "already installed" check and the oras pull) uses the resolved tag.
 //
-// Ubuntu 20.x/21.x get the ubuntu20 build and 22.x and newer the ubuntu22
-// build (the 22.04 build is the one for 22.04 and up). Anything else fails
-// before touching the registry. The os-release path can be overridden through
+// Ubuntu 20.x/21.x get the ubuntu20 build, 22.x-25.x the ubuntu22 build, and
+// 26.x and newer the ubuntu26 build. Unsupported systems fail before the
+// registry is contacted. The os-release path can be overridden through
 // CNLAB_OS_RELEASE_FILE, which the tests use.
 func osVariantSnippet(cfg Config, versionVar, refVar string) string {
 	if cfg.OSVariant != OSVariantAuto {
@@ -284,6 +284,8 @@ CNLAB_OS_MAJOR="${CNLAB_OS_VID%%.*}"
 if [ "$CNLAB_OS_ID" != "ubuntu" ] || ! [[ "$CNLAB_OS_MAJOR" =~ ^[0-9]+$ ]]; then
   echo "[cnlab-runtime] osVariant auto needs Ubuntu; found ID='${CNLAB_OS_ID}' VERSION_ID='${CNLAB_OS_VID}'" >&2
   exit 1
+elif [ "$CNLAB_OS_MAJOR" -ge 26 ]; then
+  CNLAB_OS_TAG=ubuntu26
 elif [ "$CNLAB_OS_MAJOR" -ge 22 ]; then
   CNLAB_OS_TAG=ubuntu22
 elif [ "$CNLAB_OS_MAJOR" -ge 20 ]; then

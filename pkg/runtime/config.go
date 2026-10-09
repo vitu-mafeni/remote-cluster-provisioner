@@ -8,8 +8,9 @@ const (
 
 	// OSVariantAuto makes the install script pick the artifact variant from the
 	// node's own /etc/os-release: "<Version>-ubuntu20" on Ubuntu 20.x/21.x and
-	// "<Version>-ubuntu22" on Ubuntu 22.x and newer. Version is then the base
-	// version (e.g. "1.0.2") without an OS suffix.
+	// "<Version>-ubuntu22" on Ubuntu 22.x-25.x and "<Version>-ubuntu26" on
+	// Ubuntu 26.x and newer. Version is the base version (e.g. "1.0.2") without
+	// an OS suffix.
 	OSVariantAuto = "auto"
 )
 

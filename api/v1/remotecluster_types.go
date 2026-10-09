@@ -166,8 +166,9 @@ type CnlabRuntimeConfig struct {
 	// is used exactly as given. "auto": Version is the base version (e.g.
 	// "1.0.2") and each node picks its own build from /etc/os-release, installing
 	// "<Version>-ubuntu20" on Ubuntu 20.x/21.x and "<Version>-ubuntu22" on
-	// Ubuntu 22.x and newer. Use it for clusters that mix OS releases; it
-	// requires an explicit Version without an OS suffix.
+	// Ubuntu 22.x-25.x and "<Version>-ubuntu26" on Ubuntu 26.x and newer. Use it
+	// for clusters that mix supported OS releases; it requires an explicit
+	// Version without an OS suffix.
 	// +kubebuilder:validation:Enum=auto
 	// +optional
 	OSVariant string `json:"osVariant,omitempty"`
