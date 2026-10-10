@@ -32,7 +32,13 @@ spec:
   # awsConfig is optional — all fields below are auto-populated when absent.
   # Uncomment to override any individual value:
   # awsConfig:
-  #   ami: ami-0c9c942bd7bf113a2
+  #   ami: ami-0c9c942bd7bf113a2   # a custom/private/shared Ubuntu 20.04+ AMI in spec.region
+  #   # ...or pick the newest AMI by name (resolved once, recorded in ami):
+  #   # amiName: "my-k8s-node-*"
+  #   # amiOwners: [self]            # self (default) | amazon | aws-marketplace | <12-digit account>
+  #   # ...and/or boot the root volume from an EBS snapshot (same region, completed):
+  #   # rootSnapshotId: snap-0123456789abcdef0
+  #   # rootVolumeSizeGB: 100        # must be >= the snapshot/AMI root size
   #   # Launch into an existing VPC/subnet instead of the region's default VPC.
   #   # Set any of vpcId / subnetId / securityGroupIds: the VPC is derived from
   #   # whichever is given (subnet first), everything must agree and exist in

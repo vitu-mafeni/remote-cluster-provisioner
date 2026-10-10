@@ -257,8 +257,10 @@ spec:
   awsConfig:
     vpcId: vpc-xxxxxxxx
     subnetId: subnet-xxxxxxxx
-    securityGroupIds: [sg-xxxxxxxx]
-    ami: ami-xxxxxxxx
+    securityGroupIds: [sg-xxxxxxxx]   # same VPC as the subnet; never modified by the controller
+    ami: ami-xxxxxxxx                 # custom AMI; or amiName: "my-k8s-node-*" to pick the newest
+    # rootSnapshotId: snap-xxxxxxxx   # boot the root volume from an EBS snapshot
+    # disablePublicIp: true           # private subnet (needs a NAT gateway)
     keyPairName: my-keypair
     iamInstanceProfile: my-profile
     rootVolumeSizeGB: 100
@@ -277,6 +279,9 @@ spec:
   region: us-central1         # or gcpConfig.zone: us-central1-a (authoritative when both are set)
   gcpConfig:                  # optional; project, zone, network and image are auto-resolved
     projectId: my-project
+    # network / subnetwork: an existing (Shared) VPC; the network is derived from the subnetwork
+    # sourceImage: my-golden-image       # custom image, or sourceSnapshot: my-boot-snapshot
+    # disableExternalIP: true            # private subnet (needs Cloud NAT)
     bootDiskSizeGB: 100
   credentialsRef:
     name: gcp-node-credentials   # Secret with the service-account key under `credentials.json`

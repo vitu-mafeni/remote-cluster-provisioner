@@ -99,6 +99,7 @@ type fakeEC2 struct {
 	existing    []types.Instance
 	describeErr error
 	runErr      error
+	imageErr    error
 	runInputs   []*ec2.RunInstancesInput
 	describes   int
 }
@@ -121,6 +122,39 @@ func (f *fakeEC2) RunInstances(_ context.Context, in *ec2.RunInstancesInput, _ .
 		return nil, f.runErr
 	}
 	return &ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: awssdk.String("i-new")}}}, nil
+}
+
+// ubuntuImage is what the fake returns for any AMI: an available, EBS-backed
+// x86_64 HVM Ubuntu-style image with an 8 GB /dev/sda1 root.
+func ubuntuImage(id string) types.Image {
+	return types.Image{
+		ImageId: awssdk.String(id), State: types.ImageStateAvailable, Architecture: types.ArchitectureValuesX8664,
+		RootDeviceType: types.DeviceTypeEbs, VirtualizationType: types.VirtualizationTypeHvm,
+		RootDeviceName: awssdk.String("/dev/sda1"),
+		BlockDeviceMappings: []types.BlockDeviceMapping{{
+			DeviceName: awssdk.String("/dev/sda1"), Ebs: &types.EbsBlockDevice{VolumeSize: awssdk.Int32(8)}}},
+	}
+}
+
+func (f *fakeEC2) DescribeImages(_ context.Context, in *ec2.DescribeImagesInput, _ ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.imageErr != nil {
+		return nil, f.imageErr
+	}
+	var out []types.Image
+	for _, id := range in.ImageIds {
+		out = append(out, ubuntuImage(id))
+	}
+	return &ec2.DescribeImagesOutput{Images: out}, nil
+}
+
+func (f *fakeEC2) DescribeSnapshots(context.Context, *ec2.DescribeSnapshotsInput, ...func(*ec2.Options)) (*ec2.DescribeSnapshotsOutput, error) {
+	return &ec2.DescribeSnapshotsOutput{}, nil
+}
+
+func (f *fakeEC2) DescribeInstanceTypes(context.Context, *ec2.DescribeInstanceTypesInput, ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	return &ec2.DescribeInstanceTypesOutput{}, nil
 }
 
 func (f *fakeEC2) CreateTags(context.Context, *ec2.CreateTagsInput, ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error) {
@@ -353,5 +387,39 @@ func TestProvisionEC2Node_VPNWithoutRangeFails(t *testing.T) {
 	}
 	if e.ec2.describes != 0 || len(e.ec2.runInputs) != 0 || e.Log("wg.calls") != "" {
 		t.Error("nothing may be called before the vpnRange validation")
+	}
+}
+
+// A bad image fails before a VPN peer is registered or an instance launched.
+func TestProvisionEC2Node_BadImageHasNoSideEffects(t *testing.T) {
+	e := newProvEnv(t)
+	e.ec2.imageErr = &smithy.GenericAPIError{Code: "InvalidAMIID.NotFound", Message: "no such image"}
+	res, err := e.provision(t)
+	if err == nil || !strings.Contains(err.Error(), "image validation failed") {
+		t.Fatalf("err = %v", err)
+	}
+	if res != nil {
+		t.Errorf("no peer was registered, so no result is owed to the caller: %+v", res)
+	}
+	if len(e.ec2.runInputs) != 0 || e.Log("wg.calls") != "" {
+		t.Error("a bad image must fail before any VPN peer or instance is created")
+	}
+	if e.confText() != wgConfBase {
+		t.Error("the VPN server config must be untouched")
+	}
+}
+
+// The launch maps the image's root device and any root snapshot.
+func TestProvisionEC2Node_LaunchUsesImageRootDevice(t *testing.T) {
+	e := newProvEnv(t)
+	if _, err := e.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.ec2.runInputs) != 1 {
+		t.Fatalf("launches = %d", len(e.ec2.runInputs))
+	}
+	m := e.ec2.runInputs[0].BlockDeviceMappings
+	if len(m) != 1 || awssdk.ToString(m[0].DeviceName) != "/dev/sda1" || awssdk.ToInt32(m[0].Ebs.VolumeSize) != 50 {
+		t.Fatalf("mappings = %+v", m)
 	}
 }

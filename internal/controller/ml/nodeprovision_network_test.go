@@ -133,3 +133,24 @@ func TestFailNodeProvision_StatusMessageHasNoAWSIdentifiers(t *testing.T) {
 		t.Errorf("phase = %s", got.Status.Phase)
 	}
 }
+
+// ── boot source completeness (GCP) ─────────────────────────────────────────
+
+func TestGCPDefaultsComplete_AcceptsAnImageOrASnapshot(t *testing.T) {
+	np := newNP("g", func(np *mlv1alpha1.NodeProvision) {
+		np.Spec.Provider = mlv1alpha1.CloudProviderGCP
+		np.Spec.Region, np.Spec.InstanceType = "us-east1", "n2-standard-4"
+		np.Spec.GCPConfig = &mlv1alpha1.GCPConfig{ProjectID: "p", Zone: "us-east1-b", Network: "default"}
+	})
+	if gcpDefaultsComplete(np) {
+		t.Fatal("no boot source yet: defaults are incomplete")
+	}
+	np.Spec.GCPConfig.SourceImage = "projects/p/global/images/x"
+	if !gcpDefaultsComplete(np) {
+		t.Error("an image completes the defaults")
+	}
+	np.Spec.GCPConfig.SourceImage, np.Spec.GCPConfig.SourceSnapshot = "", "snap"
+	if !gcpDefaultsComplete(np) {
+		t.Error("a snapshot completes the defaults (no image is resolved for it)")
+	}
+}

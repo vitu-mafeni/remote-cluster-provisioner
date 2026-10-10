@@ -38,6 +38,8 @@ type computeAPI interface {
 	GetMachineType(ctx context.Context, project, zone, name string) (*computepb.MachineType, error)
 	GetAcceleratorType(ctx context.Context, project, zone, name string) (*computepb.AcceleratorType, error)
 	GetImageFromFamily(ctx context.Context, project, family string) (*computepb.Image, error)
+	GetImage(ctx context.Context, project, name string) (*computepb.Image, error)
+	GetSnapshot(ctx context.Context, project, name string) (*computepb.Snapshot, error)
 
 	Close() error
 }
@@ -61,6 +63,7 @@ type sdkCompute struct {
 	machines  *compute.MachineTypesClient
 	accels    *compute.AcceleratorTypesClient
 	images    *compute.ImagesClient
+	snapshots *compute.SnapshotsClient
 }
 
 func newSDKCompute(ctx context.Context, creds Credentials) (*sdkCompute, error) {
@@ -106,6 +109,10 @@ func newSDKComputeWithOptions(ctx context.Context, opts ...option.ClientOption) 
 		_ = c.Close()
 		return nil, fmt.Errorf("creating GCE images client: %w", err)
 	}
+	if c.snapshots, err = compute.NewSnapshotsRESTClient(ctx, opts...); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("creating GCE snapshots client: %w", err)
+	}
 	return c, nil
 }
 
@@ -134,6 +141,9 @@ func (c *sdkCompute) Close() error {
 	}
 	if c.images != nil {
 		errs = append(errs, c.images.Close())
+	}
+	if c.snapshots != nil {
+		errs = append(errs, c.snapshots.Close())
 	}
 	return errors.Join(errs...)
 }
@@ -239,6 +249,14 @@ func (c *sdkCompute) GetMachineType(ctx context.Context, project, zone, name str
 
 func (c *sdkCompute) GetAcceleratorType(ctx context.Context, project, zone, name string) (*computepb.AcceleratorType, error) {
 	return c.accels.Get(ctx, &computepb.GetAcceleratorTypeRequest{Project: project, Zone: zone, AcceleratorType: name})
+}
+
+func (c *sdkCompute) GetImage(ctx context.Context, project, name string) (*computepb.Image, error) {
+	return c.images.Get(ctx, &computepb.GetImageRequest{Project: project, Image: name})
+}
+
+func (c *sdkCompute) GetSnapshot(ctx context.Context, project, name string) (*computepb.Snapshot, error) {
+	return c.snapshots.Get(ctx, &computepb.GetSnapshotRequest{Project: project, Snapshot: name})
 }
 
 func (c *sdkCompute) GetImageFromFamily(ctx context.Context, project, family string) (*computepb.Image, error) {

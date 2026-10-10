@@ -685,7 +685,8 @@ func (r *NodeProvisionReconciler) checkNoVPNControlPlane(
 
 // resolveAWSDefaults auto-populates any missing AWS spec fields before validation:
 //   - instanceType: derived from nodeLabel when not set (e.g. "cpu" → "t3.xlarge")
-//   - awsConfig.ami: latest Ubuntu 22.04 LTS AMI for the region
+//   - awsConfig.ami: from awsConfig.amiName when set, else the latest Ubuntu 22.04
+//     LTS AMI for the region
 //   - awsConfig.vpcId / subnetId / securityGroupIds: a user-set VPC and/or
 //     subnet is validated and honoured (the VPC is derived from the subnet);
 //     anything left unset comes from the region's default VPC, creating one if
@@ -816,12 +817,22 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		return false, err
 	}
 
-	// ── AMI: latest Ubuntu 22.04 for the region ───────────────────────────────
+	// ── AMI: amiName lookup, else latest Ubuntu 22.04 for the region ─────────
 	if needsAMI {
-		log.Info("Resolving latest Ubuntu 22.04 AMI", "region", np.Spec.Region)
-		amiID, err := awsprovision.ResolveUbuntu22AMI(ctx, np.Spec.Region, creds)
-		if err != nil {
-			return false, fmt.Errorf("resolving Ubuntu 22.04 AMI: %w", err)
+		var amiID string
+		var err error
+		if np.Spec.AWSConfig.AMIName != "" {
+			log.Info("Resolving AMI by name", "region", np.Spec.Region, "amiName", np.Spec.AWSConfig.AMIName, "owners", np.Spec.AWSConfig.AMIOwners)
+			amiID, err = awsprovision.ResolveAMIByName(ctx, np.Spec.Region, creds,
+				np.Spec.AWSConfig.AMIName, np.Spec.AWSConfig.AMIOwners, np.Spec.InstanceType)
+			if err != nil {
+				return false, fmt.Errorf("resolving AMI by name: %w", err)
+			}
+		} else {
+			log.Info("Resolving latest Ubuntu 22.04 AMI", "region", np.Spec.Region)
+			if amiID, err = awsprovision.ResolveUbuntu22AMI(ctx, np.Spec.Region, creds); err != nil {
+				return false, fmt.Errorf("resolving Ubuntu 22.04 AMI: %w", err)
+			}
 		}
 		np.Spec.AWSConfig.AMI = amiID
 		log.Info("Resolved AMI", "ami", amiID)

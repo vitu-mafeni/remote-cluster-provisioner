@@ -32,6 +32,11 @@ func (in *AWSConfig) DeepCopyInto(out *AWSConfig) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.AMIOwners != nil {
+		in, out := &in.AMIOwners, &out.AMIOwners
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Tags != nil {
 		in, out := &in.Tags, &out.Tags
 		*out = make(map[string]string, len(*in))

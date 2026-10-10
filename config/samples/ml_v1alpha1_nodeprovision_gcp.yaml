@@ -57,6 +57,8 @@ spec:
   #   subnetwork: default                    # name, regions/<r>/subnetworks/<n> or projects/<p>/regions/<r>/subnetworks/<n>; required for custom-mode networks
   #   disableExternalIP: true                # private subnet: no external IP (needs Cloud NAT)
   #   imageFamily: ubuntu-2204-lts           # + imageProject: ubuntu-os-cloud (the defaults)
+  #   # sourceImage: my-golden-image          # custom image (name in imageProject / this project)
+  #   # sourceSnapshot: my-boot-snapshot      # or boot the disk from a snapshot (excludes the image fields)
   #   # sourceImage: projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260101
   #   bootDiskSizeGB: 100                    # default 50
   #   bootDiskType: pd-ssd                   # default pd-balanced

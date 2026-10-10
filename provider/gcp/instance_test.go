@@ -369,6 +369,52 @@ func TestBuildInstance_Overrides(t *testing.T) {
 	}
 }
 
+func TestBuildInstance_BootSource(t *testing.T) {
+	disk := func(mut func(*mlv1alpha1.NodeProvision)) *computepb.AttachedDiskInitializeParams {
+		return builtInstance(t, mut).GetDisks()[0].GetInitializeParams()
+	}
+	// A bare image name is qualified with imageProject (else the instance project).
+	if got := disk(func(np *mlv1alpha1.NodeProvision) { np.Spec.GCPConfig.SourceImage = "golden" }).GetSourceImage(); got != "projects/proj-1/global/images/golden" {
+		t.Errorf("bare image: %q", got)
+	}
+	if got := disk(func(np *mlv1alpha1.NodeProvision) {
+		np.Spec.GCPConfig.SourceImage, np.Spec.GCPConfig.ImageProject = "golden", "shared"
+	}).GetSourceImage(); got != "projects/shared/global/images/golden" {
+		t.Errorf("bare image in imageProject: %q", got)
+	}
+	if got := disk(func(np *mlv1alpha1.NodeProvision) {
+		np.Spec.GCPConfig.SourceImage = "projects/p/global/images/family/f"
+	}).GetSourceImage(); got != "projects/p/global/images/family/f" {
+		t.Errorf("family: %q", got)
+	}
+	// A snapshot replaces the image; size, type and labels still apply.
+	d := disk(func(np *mlv1alpha1.NodeProvision) {
+		np.Spec.GCPConfig.SourceImage, np.Spec.GCPConfig.SourceSnapshot = "", "snap"
+		np.Spec.GCPConfig.BootDiskSizeGB = 80
+	})
+	if d.GetSourceSnapshot() != "projects/proj-1/global/snapshots/snap" || d.GetSourceImage() != "" || d.GetDiskSizeGb() != 80 || len(d.GetLabels()) == 0 {
+		t.Errorf("snapshot disk: %+v", d)
+	}
+	if got := disk(func(np *mlv1alpha1.NodeProvision) {
+		np.Spec.GCPConfig.SourceImage, np.Spec.GCPConfig.SourceSnapshot = "", "projects/shared/global/snapshots/s"
+	}).GetSourceSnapshot(); got != "projects/shared/global/snapshots/s" {
+		t.Errorf("snapshot in another project: %q", got)
+	}
+}
+
+func TestBuildInstance_BootSourceErrors(t *testing.T) {
+	for _, tc := range []struct{ image, snap, want string }{
+		{"", "", "both empty"},
+		{"img", "snap", "mutually exclusive"},
+	} {
+		np := testNP()
+		np.Spec.GCPConfig.SourceImage, np.Spec.GCPConfig.SourceSnapshot = tc.image, tc.snap
+		if _, err := buildInstance(np, "proj-1", InstanceName(np), "echo script", "ubuntu:ssh-rsa AAA ubuntu"); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("image %q snapshot %q: err = %v, want %q", tc.image, tc.snap, err, tc.want)
+		}
+	}
+}
+
 func TestBuildInstance_GPUShapes(t *testing.T) {
 	// N1 + explicit accelerator
 	inst := builtInstance(t, func(np *mlv1alpha1.NodeProvision) {

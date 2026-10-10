@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net"
 	"regexp"
 	"sort"
@@ -280,6 +281,19 @@ func ValidateGCPConfig(spec mlv1alpha1.NodeProvisionSpec) error {
 			return fmt.Errorf("spec.gcpConfig.accelerator.count must be between 1 and %d", maxAccelerators)
 		}
 	}
+	if cfg.SourceSnapshot != "" {
+		if cfg.SourceImage != "" || cfg.ImageFamily != "" || cfg.ImageProject != "" {
+			return fmt.Errorf("spec.gcpConfig.sourceSnapshot cannot be combined with sourceImage, imageFamily or imageProject: choose one boot source")
+		}
+		if _, _, err := ParseSnapshotRef(cfg.ProjectID, cfg.SourceSnapshot); err != nil {
+			return err
+		}
+	}
+	if cfg.SourceImage != "" {
+		if _, _, _, err := ParseImageRef(cfg.ProjectID, cfg.SourceImage); err != nil {
+			return err
+		}
+	}
 	if cfg.ServiceAccountEmail != "" && !strings.Contains(cfg.ServiceAccountEmail, "@") {
 		return fmt.Errorf("spec.gcpConfig.serviceAccountEmail %q is not an email address", cfg.ServiceAccountEmail)
 	}
@@ -472,31 +486,212 @@ func ResolveDefaults(ctx context.Context, creds Credentials, np *mlv1alpha1.Node
 		return nil, fmt.Errorf("VPC network %q is custom-mode: spec.gcpConfig.subnetwork is required", netName)
 	}
 
-	// ── image ─────────────────────────────────────────────────────────────────
+	// ── boot source: image or snapshot ────────────────────────────────────────
+	minDiskGB, err := resolveBootSource(ctx, c, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.BootDiskSizeGB != 0 && int64(cfg.BootDiskSizeGB) < minDiskGB {
+		return nil, fmt.Errorf("spec.gcpConfig.bootDiskSizeGB %d is smaller than the boot source (%d GB)", cfg.BootDiskSizeGB, minDiskGB)
+	}
+	if cfg.BootDiskSizeGB == 0 && minDiskGB > DefaultBootDiskGB {
+		cfg.BootDiskSizeGB = int32(minDiskGB) // unset: grow to fit rather than fail
+	}
+	return res, nil
+}
+
+// resolveBootSource validates the boot snapshot, or the boot image (resolving
+// the default family into cfg.SourceImage when none is set), and returns the
+// smallest boot disk in GB it fits on.
+func resolveBootSource(ctx context.Context, c computeAPI, cfg *mlv1alpha1.GCPConfig) (int64, error) {
+	if cfg.SourceSnapshot != "" {
+		project, name, err := ParseSnapshotRef(cfg.ProjectID, cfg.SourceSnapshot)
+		if err != nil {
+			return 0, err
+		}
+		sn, err := c.GetSnapshot(ctx, project, name)
+		if err != nil {
+			if IsNotFound(err) {
+				return 0, fmt.Errorf("snapshot %q not found in project %q: check spec.gcpConfig.sourceSnapshot (and that the service account can read it)", name, project)
+			}
+			return 0, apiErrorf(err, "looking up snapshot %q", name)
+		}
+		if st := sn.GetStatus(); st != "" && st != computepb.Snapshot_READY.String() {
+			return 0, fmt.Errorf("snapshot %q is not ready (status %s)", name, st)
+		}
+		if hasWindowsLicense(sn.GetLicenses()) {
+			return 0, fmt.Errorf("snapshot %q is of a Windows disk; nodes need an Ubuntu Linux boot disk", name)
+		}
+		return sn.GetDiskSizeGb(), nil
+	}
+
+	var (
+		img    *computepb.Image
+		err    error
+		what   string
+		family bool
+	)
 	if cfg.SourceImage == "" {
-		family, project := cfg.ImageFamily, cfg.ImageProject
-		if family == "" {
-			family = DefaultImageFamily
+		fam, project := cfg.ImageFamily, cfg.ImageProject
+		if fam == "" {
+			fam = DefaultImageFamily
 		}
 		if project == "" {
 			project = DefaultImageProject
 		}
-		img, err := c.GetImageFromFamily(ctx, project, family)
+		what, family = fmt.Sprintf("%s/%s", project, fam), true
+		img, err = c.GetImageFromFamily(ctx, project, fam)
+	} else {
+		var project, name string
+		project, name, family, err = ParseImageRef(defaultImageProject(cfg), cfg.SourceImage)
 		if err != nil {
-			if IsNotFound(err) {
-				return nil, fmt.Errorf("image family %q not found in project %q", family, project)
-			}
-			return nil, apiErrorf(err, "resolving image family %s/%s", project, family)
+			return 0, err
 		}
-		if a := img.GetArchitecture(); a != "" && a != computepb.Image_X86_64.String() {
-			return nil, fmt.Errorf("image family %s/%s resolves to a %s image; only X86_64 is supported", project, family, a)
-		}
-		cfg.SourceImage = compactResourcePath(img.GetSelfLink())
-		if cfg.SourceImage == "" {
-			return nil, fmt.Errorf("image family %s/%s has no selfLink", project, family)
+		what = fmt.Sprintf("%s/%s", project, name)
+		if family {
+			img, err = c.GetImageFromFamily(ctx, project, name)
+		} else {
+			img, err = c.GetImage(ctx, project, name)
 		}
 	}
-	return res, nil
+	kind := "image"
+	if family {
+		kind = "image family"
+	}
+	if err != nil {
+		if IsNotFound(err) {
+			return 0, fmt.Errorf("%s %q not found: check spec.gcpConfig.sourceImage/imageFamily/imageProject (and that the service account can read it)", kind, what)
+		}
+		return 0, apiErrorf(err, "looking up %s %s", kind, what)
+	}
+	if st := img.GetStatus(); st != "" && st != computepb.Image_READY.String() {
+		return 0, fmt.Errorf("%s %s is not ready (status %s)", kind, what, st)
+	}
+	switch img.GetDeprecated().GetState() {
+	case computepb.DeprecationStatus_DELETED.String(), computepb.DeprecationStatus_OBSOLETE.String():
+		return 0, fmt.Errorf("%s %s is %s and can no longer be used", kind, what, img.GetDeprecated().GetState())
+	case computepb.DeprecationStatus_DEPRECATED.String():
+		log.Printf("[WARN] GCP %s %s is deprecated; consider a newer image", kind, what)
+	}
+	if a := img.GetArchitecture(); a != "" && a != computepb.Image_X86_64.String() {
+		return 0, fmt.Errorf("%s %s is a %s image; only X86_64 is supported", kind, what, a)
+	}
+	if hasWindowsLicense(img.GetLicenses()) || hasWindowsFeature(img.GetGuestOsFeatures()) {
+		return 0, fmt.Errorf("%s %s is a Windows image; nodes need an Ubuntu Linux image", kind, what)
+	}
+	if cfg.SourceImage == "" {
+		cfg.SourceImage = compactResourcePath(img.GetSelfLink())
+		if cfg.SourceImage == "" {
+			return 0, fmt.Errorf("%s %s has no selfLink", kind, what)
+		}
+	}
+	return img.GetDiskSizeGb(), nil
+}
+
+func hasWindowsLicense(licenses []string) bool {
+	for _, l := range licenses {
+		if strings.Contains(strings.ToLower(l), "windows") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasWindowsFeature(fs []*computepb.GuestOsFeature) bool {
+	for _, f := range fs {
+		if strings.EqualFold(f.GetType(), "WINDOWS") {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultImageProject is where a bare image name is looked up: spec imageProject,
+// else the instance's own project (custom images usually live there).
+func defaultImageProject(cfg *mlv1alpha1.GCPConfig) string {
+	if cfg.ImageProject != "" {
+		return cfg.ImageProject
+	}
+	return cfg.ProjectID
+}
+
+// ParseImageRef splits an image reference into (project, name, isFamily). ref may
+// be a bare image name (defaultProject), "global/images/<n>", "global/images/family/<f>",
+// "projects/<p>/global/images/<n>", "projects/<p>/global/images/family/<f>" or
+// the full URL of any of them.
+func ParseImageRef(defaultProject, ref string) (project, name string, family bool, err error) {
+	ref = compactResourcePath(strings.TrimSpace(ref))
+	parts := strings.Split(ref, "/")
+	if len(parts) >= 2 && parts[0] == "projects" {
+		project, parts = parts[1], parts[2:]
+	} else {
+		project = defaultProject
+	}
+	switch {
+	case len(parts) == 1 && parts[0] != "" && project != "":
+		return project, parts[0], false, nil
+	case len(parts) == 3 && parts[0] == "global" && parts[1] == "images" && parts[2] != "":
+		return project, parts[2], false, nil
+	case len(parts) == 4 && parts[0] == "global" && parts[1] == "images" && parts[2] == "family" && parts[3] != "":
+		return project, parts[3], true, nil
+	}
+	return "", "", false, fmt.Errorf("spec.gcpConfig.sourceImage %q is not an image name, global/images/<n>, projects/<p>/global/images/<n> or projects/<p>/global/images/family/<f> reference", ref)
+}
+
+// ImageResource returns the canonical "projects/<p>/global/images[/family]/<n>"
+// path of spec.gcpConfig.sourceImage for an instance of project.
+func ImageResource(project string, cfg *mlv1alpha1.GCPConfig) (string, error) {
+	p := cfg.ProjectID
+	if p == "" {
+		p = project
+	}
+	imgProject, name, family, err := ParseImageRef(firstNonEmpty(cfg.ImageProject, p), cfg.SourceImage)
+	if err != nil {
+		return "", err
+	}
+	if family {
+		return fmt.Sprintf("projects/%s/global/images/family/%s", imgProject, name), nil
+	}
+	return fmt.Sprintf("projects/%s/global/images/%s", imgProject, name), nil
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// ParseSnapshotRef splits a snapshot reference into (project, name). ref may be a
+// bare name (defaultProject), "global/snapshots/<n>", "projects/<p>/global/snapshots/<n>"
+// or the full URL.
+func ParseSnapshotRef(defaultProject, ref string) (project, name string, err error) {
+	ref = compactResourcePath(strings.TrimSpace(ref))
+	parts := strings.Split(ref, "/")
+	project = defaultProject
+	if len(parts) >= 2 && parts[0] == "projects" {
+		project, parts = parts[1], parts[2:]
+	}
+	switch {
+	case len(parts) == 1 && parts[0] != "" && project != "":
+		return project, parts[0], nil
+	case len(parts) == 3 && parts[0] == "global" && parts[1] == "snapshots" && parts[2] != "":
+		return project, parts[2], nil
+	}
+	return "", "", fmt.Errorf("spec.gcpConfig.sourceSnapshot %q is not a snapshot name, global/snapshots/<n> or projects/<p>/global/snapshots/<n> reference", ref)
+}
+
+// SnapshotResource returns the canonical "projects/<p>/global/snapshots/<n>" path.
+func SnapshotResource(project string, cfg *mlv1alpha1.GCPConfig) (string, error) {
+	p := cfg.ProjectID
+	if p == "" {
+		p = project
+	}
+	sp, name, err := ParseSnapshotRef(p, cfg.SourceSnapshot)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("projects/%s/global/snapshots/%s", sp, name), nil
 }
 
 // compactResourcePath turns "https://www.googleapis.com/compute/v1/projects/p/..."

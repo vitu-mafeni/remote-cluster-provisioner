@@ -82,7 +82,7 @@ func TestBuildRunInstancesInput(t *testing.T) {
 			AWSConfig:    &mlv1alpha1.AWSConfig{AMI: "ami-1", SubnetID: "subnet-1"},
 		},
 	}
-	in := buildRunInstancesInput(np, "dXNlcmRhdGE=")
+	in := buildRunInstancesInput(np, "dXNlcmRhdGE=", launchImage{})
 
 	if got := awssdk.ToString(in.ClientToken); got != "np-11111111-2222-3333-4444-555555555555-0" {
 		t.Errorf("ClientToken = %q", got)
@@ -109,12 +109,12 @@ func TestBuildRunInstancesInput(t *testing.T) {
 	}
 
 	np.Status.ProvisionRetryCount = 3
-	if got := awssdk.ToString(buildRunInstancesInput(np, "dXNlcmRhdGE=").ClientToken); got != "np-11111111-2222-3333-4444-555555555555-3" {
+	if got := awssdk.ToString(buildRunInstancesInput(np, "dXNlcmRhdGE=", launchImage{}).ClientToken); got != "np-11111111-2222-3333-4444-555555555555-3" {
 		t.Errorf("ClientToken must follow the provisioning attempt, got %q", got)
 	}
 
 	np.UID = ""
-	if in := buildRunInstancesInput(np, "x"); in.ClientToken != nil || len(in.TagSpecifications) != 0 {
+	if in := buildRunInstancesInput(np, "x", launchImage{}); in.ClientToken != nil || len(in.TagSpecifications) != 0 {
 		t.Error("without a UID neither ClientToken nor uid tags should be set")
 	}
 }

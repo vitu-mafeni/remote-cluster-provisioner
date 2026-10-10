@@ -281,8 +281,25 @@ func buildInstance(np *mlv1alpha1.NodeProvision, project, instance, script, sshK
 	if !ok {
 		return nil, fmt.Errorf("spec.gcpConfig.zone %q is not a valid zone name", zone)
 	}
-	if cfg.SourceImage == "" {
-		return nil, fmt.Errorf("spec.gcpConfig.sourceImage is empty (defaults were not resolved)")
+	if cfg.SourceImage == "" && cfg.SourceSnapshot == "" {
+		return nil, fmt.Errorf("spec.gcpConfig.sourceImage and sourceSnapshot are both empty (defaults were not resolved)")
+	}
+	if cfg.SourceImage != "" && cfg.SourceSnapshot != "" {
+		return nil, fmt.Errorf("spec.gcpConfig.sourceImage and sourceSnapshot are mutually exclusive")
+	}
+	initParams := &computepb.AttachedDiskInitializeParams{}
+	if cfg.SourceSnapshot != "" {
+		snap, err := SnapshotResource(project, cfg)
+		if err != nil {
+			return nil, err
+		}
+		initParams.SourceSnapshot = proto.String(snap)
+	} else {
+		image, err := ImageResource(project, cfg)
+		if err != nil {
+			return nil, err
+		}
+		initParams.SourceImage = proto.String(image)
 	}
 
 	diskGB := int64(DefaultBootDiskGB)
@@ -336,6 +353,10 @@ func buildInstance(np *mlv1alpha1.NodeProvision, project, instance, script, sshK
 		items = append([]*computepb.Items{{Key: proto.String("startup-script"), Value: proto.String(script)}}, items...)
 	}
 
+	initParams.DiskSizeGb = proto.Int64(diskGB)
+	initParams.DiskType = proto.String(diskType)
+	initParams.Labels = labels
+
 	inst := &computepb.Instance{
 		Name:        proto.String(instance),
 		Description: proto.String(fmt.Sprintf("%s: NodeProvision %s/%s", firewallOwnerMarker, np.Namespace, np.Name)),
@@ -343,15 +364,10 @@ func buildInstance(np *mlv1alpha1.NodeProvision, project, instance, script, sshK
 		Labels:      labels,
 		Tags:        &computepb.Tags{Items: tags},
 		Disks: []*computepb.AttachedDisk{{
-			Boot:       proto.Bool(true),
-			AutoDelete: proto.Bool(true),
-			Type:       proto.String("PERSISTENT"),
-			InitializeParams: &computepb.AttachedDiskInitializeParams{
-				SourceImage: proto.String(cfg.SourceImage),
-				DiskSizeGb:  proto.Int64(diskGB),
-				DiskType:    proto.String(diskType),
-				Labels:      labels,
-			},
+			Boot:             proto.Bool(true),
+			AutoDelete:       proto.Bool(true),
+			Type:             proto.String("PERSISTENT"),
+			InitializeParams: initParams,
 		}},
 		NetworkInterfaces: []*computepb.NetworkInterface{nic},
 		Metadata:          &computepb.Metadata{Items: items},

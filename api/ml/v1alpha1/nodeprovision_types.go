@@ -91,8 +91,32 @@ type AWSConfig struct {
 	// when it is reachable by VPC peering or a transit gateway.
 	// +optional
 	SkipControlPlaneVPCCheck bool `json:"skipControlPlaneVpcCheck,omitempty"`
-	// AMI ID to use for the instance.
+	// AMI ID to boot, e.g. "ami-0123456789abcdef0": a public, shared or private
+	// (custom) image in spec.region. It must be an available, EBS-backed, HVM,
+	// non-Windows image whose architecture matches the instance type, and
+	// Ubuntu 20.04 or newer with cloud-init (the bootstrap uses apt and systemd).
+	// When empty it is resolved: from amiName if set, otherwise the latest
+	// Canonical Ubuntu 22.04 LTS. If both ami and amiName are set, ami wins.
+	// +optional
 	AMI string `json:"ami,omitempty"`
+	// AMIName selects the newest available image whose name matches (wildcards
+	// allowed, e.g. "my-k8s-node-*") among amiOwners, with the instance type's
+	// architecture. The result is recorded in ami and stays pinned.
+	// +optional
+	AMIName string `json:"amiName,omitempty"`
+	// AMIOwners limits the amiName search: "self" (default), "amazon",
+	// "aws-marketplace" or 12-digit account IDs.
+	// +optional
+	AMIOwners []string `json:"amiOwners,omitempty"`
+	// RootSnapshotID boots the instance from this EBS snapshot instead of the
+	// image's own root volume: the root volume is created from the snapshot
+	// ("snap-0123456789abcdef0", in spec.region, completed) while ami (or the
+	// default Ubuntu AMI) supplies architecture, boot mode and virtualization, so
+	// the snapshot must come from a compatible root volume. rootVolumeSizeGB
+	// must be at least the snapshot size. No AMI is registered, so nothing needs
+	// cleaning up when the node is deleted.
+	// +optional
+	RootSnapshotID string `json:"rootSnapshotId,omitempty"`
 	// EC2 key pair name for SSH access (optional when using cloud-init only).
 	// +optional
 	KeyPairName string `json:"keyPairName,omitempty"`
@@ -147,12 +171,23 @@ type GCPConfig struct {
 	// or a full URL. It must be in the instance's region and PRIVATE. Required for custom-mode networks; optional for auto-mode ones.
 	// +optional
 	Subnetwork string `json:"subnetwork,omitempty"`
-	// SourceImage is the boot image: a full image URL
-	// ("projects/<p>/global/images/<name>") or a "projects/<p>/global/images/family/<f>"
-	// reference. When empty the latest image of imageFamily/imageProject is
-	// resolved and recorded here (default: latest Ubuntu 22.04 LTS, x86_64).
+	// SourceImage is the boot image: a custom image name (in imageProject, default
+	// the instance's project), "projects/<p>/global/images/<name>",
+	// "projects/<p>/global/images/family/<f>" or a full URL. It must be a READY,
+	// non-deprecated, x86_64, non-Windows Ubuntu 20.04+ image (the startup script
+	// uses apt and systemd). When empty (and sourceSnapshot is unset) the latest
+	// image of imageFamily/imageProject is resolved and recorded here (default:
+	// latest Ubuntu 22.04 LTS, x86_64).
 	// +optional
 	SourceImage string `json:"sourceImage,omitempty"`
+	// SourceSnapshot boots the instance from a disk snapshot of a boot disk: a
+	// snapshot name (in the instance's project), "projects/<p>/global/snapshots/<n>"
+	// or a full URL. It is mutually exclusive with sourceImage, imageFamily and
+	// imageProject. The snapshot must be READY, non-Windows and from an x86_64
+	// Ubuntu 20.04+ boot disk; bootDiskSizeGB must be at least its size (when
+	// unset it is raised to fit).
+	// +optional
+	SourceSnapshot string `json:"sourceSnapshot,omitempty"`
 	// ImageFamily is the image family used when sourceImage is empty.
 	// Defaults to "ubuntu-2204-lts".
 	// +optional

@@ -294,6 +294,7 @@ func TestResolveDefaults_NeverOverwritesUserValues(t *testing.T) {
 	f := newFakeCompute()
 	f.networks["vpc-x"] = &computepb.Network{Name: proto.String("vpc-x"), AutoCreateSubnetworks: proto.Bool(false)}
 	addSubnet(f, "mine", "us-east1", "sub-x", "mine", "vpc-x")
+	addImage(f, "p", "custom", 20, nil)
 	f.machines["us-east1-b/n2-standard-4"] = true
 	useFake(t, f)
 
@@ -602,5 +603,214 @@ func TestParseSubnetworkRef(t *testing.T) {
 	}
 	if _, _, _, err := ParseSubnetworkRef("dp", "dr", ""); err == nil {
 		t.Error("empty ref must fail")
+	}
+}
+
+// ── boot image / snapshot ───────────────────────────────────────────────────
+
+func addImage(f *fakeCompute, project, name string, gb int64, mut func(*computepb.Image)) *computepb.Image {
+	img := &computepb.Image{
+		Name: proto.String(name), Status: proto.String("READY"), Architecture: proto.String("X86_64"), DiskSizeGb: proto.Int64(gb),
+		SelfLink: proto.String("https://www.googleapis.com/compute/v1/projects/" + project + "/global/images/" + name),
+	}
+	if mut != nil {
+		mut(img)
+	}
+	f.imgByName[project+"/"+name] = img
+	return img
+}
+
+func addSnapshot(f *fakeCompute, project, name string, gb int64, mut func(*computepb.Snapshot)) {
+	s := &computepb.Snapshot{Name: proto.String(name), Status: proto.String("READY"), DiskSizeGb: proto.Int64(gb)}
+	if mut != nil {
+		mut(s)
+	}
+	f.snapshots[project+"/"+name] = s
+}
+
+func bootNP(mut func(*mlv1alpha1.GCPConfig)) *mlv1alpha1.NodeProvision {
+	return resolveNP(func(np *mlv1alpha1.NodeProvision) {
+		np.Spec.Region = "us-east1"
+		np.Spec.InstanceType = "n2-standard-4"
+		np.Spec.GCPConfig = &mlv1alpha1.GCPConfig{}
+		if mut != nil {
+			mut(np.Spec.GCPConfig)
+		}
+	})
+}
+
+func bootFake(t *testing.T) *fakeCompute {
+	t.Helper()
+	f := newFakeCompute()
+	f.machines["us-east1-b/n2-standard-4"] = true
+	f.zones = append(f.zones, &computepb.Zone{Name: proto.String("us-east1-b"), Status: proto.String("UP")})
+	useFake(t, f)
+	return f
+}
+
+func TestParseImageRef(t *testing.T) {
+	for _, tc := range []struct {
+		in, p, n string
+		fam      bool
+	}{
+		{"my-image", "dp", "my-image", false},
+		{"global/images/my-image", "dp", "my-image", false},
+		{"global/images/family/fam", "dp", "fam", true},
+		{"projects/p1/global/images/my-image", "p1", "my-image", false},
+		{"projects/p1/global/images/family/fam", "p1", "fam", true},
+		{"https://www.googleapis.com/compute/v1/projects/p1/global/images/my-image", "p1", "my-image", false},
+		{"https://www.googleapis.com/compute/v1/projects/p1/global/images/family/fam", "p1", "fam", true},
+	} {
+		p, n, fam, err := ParseImageRef("dp", tc.in)
+		if err != nil || p != tc.p || n != tc.n || fam != tc.fam {
+			t.Errorf("%q -> %q %q %v %v", tc.in, p, n, fam, err)
+		}
+	}
+	for _, bad := range []string{"", "a/b", "projects/p1/global/disks/d", "projects/p1/images/x", "global/images/"} {
+		if _, _, _, err := ParseImageRef("dp", bad); err == nil {
+			t.Errorf("%q must be rejected", bad)
+		}
+	}
+}
+
+func TestParseSnapshotRef(t *testing.T) {
+	for _, tc := range []struct{ in, p, n string }{
+		{"snap", "dp", "snap"},
+		{"global/snapshots/snap", "dp", "snap"},
+		{"projects/p1/global/snapshots/snap", "p1", "snap"},
+		{"https://www.googleapis.com/compute/v1/projects/p1/global/snapshots/snap", "p1", "snap"},
+	} {
+		p, n, err := ParseSnapshotRef("dp", tc.in)
+		if err != nil || p != tc.p || n != tc.n {
+			t.Errorf("%q -> %q %q %v", tc.in, p, n, err)
+		}
+	}
+	for _, bad := range []string{"", "a/b", "projects/p1/global/images/x"} {
+		if _, _, err := ParseSnapshotRef("dp", bad); err == nil {
+			t.Errorf("%q must be rejected", bad)
+		}
+	}
+}
+
+func TestResolveDefaults_CustomImageForms(t *testing.T) {
+	f := bootFake(t)
+	addImage(f, "proj-1", "golden", 30, nil)
+	addImage(f, "shared", "base", 30, nil)
+	f.images["shared/golden-family"] = &computepb.Image{Name: proto.String("golden-v3"), Status: proto.String("READY"), Architecture: proto.String("X86_64"), DiskSizeGb: proto.Int64(30),
+		SelfLink: proto.String("https://www.googleapis.com/compute/v1/projects/shared/global/images/golden-v3")}
+	for _, tc := range []struct {
+		name string
+		mut  func(*mlv1alpha1.GCPConfig)
+	}{
+		{"bare name in the instance project", func(c *mlv1alpha1.GCPConfig) { c.SourceImage = "golden" }},
+		{"bare name in imageProject", func(c *mlv1alpha1.GCPConfig) { c.SourceImage = "base"; c.ImageProject = "shared" }},
+		{"full path", func(c *mlv1alpha1.GCPConfig) { c.SourceImage = "projects/shared/global/images/base" }},
+		{"family path", func(c *mlv1alpha1.GCPConfig) { c.SourceImage = "projects/shared/global/images/family/golden-family" }},
+		{"imageFamily + imageProject", func(c *mlv1alpha1.GCPConfig) { c.ImageFamily = "golden-family"; c.ImageProject = "shared" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := ResolveDefaults(context.Background(), testCreds(), bootNP(tc.mut))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Config.SourceImage == "" || res.Config.SourceSnapshot != "" {
+				t.Errorf("config = %+v", res.Config)
+			}
+		})
+	}
+}
+
+func TestResolveDefaults_CustomImageErrors(t *testing.T) {
+	f := bootFake(t)
+	addImage(f, "proj-1", "pending", 10, func(i *computepb.Image) { i.Status = proto.String("PENDING") })
+	addImage(f, "proj-1", "arm", 10, func(i *computepb.Image) { i.Architecture = proto.String("ARM64") })
+	addImage(f, "proj-1", "gone", 10, func(i *computepb.Image) {
+		i.Deprecated = &computepb.DeprecationStatus{State: proto.String("DELETED")}
+	})
+	addImage(f, "proj-1", "old", 10, func(i *computepb.Image) {
+		i.Deprecated = &computepb.DeprecationStatus{State: proto.String("DEPRECATED")}
+	})
+	addImage(f, "proj-1", "winlic", 10, func(i *computepb.Image) {
+		i.Licenses = []string{"https://www.googleapis.com/compute/v1/projects/windows-cloud/global/licenses/windows-server-2022-dc"}
+	})
+	addImage(f, "proj-1", "winfeat", 10, func(i *computepb.Image) {
+		i.GuestOsFeatures = []*computepb.GuestOsFeature{{Type: proto.String("WINDOWS")}}
+	})
+	addImage(f, "proj-1", "big", 120, nil)
+	for _, tc := range []struct {
+		name, image string
+		size        int32
+		want        string
+	}{
+		{"missing", "nope", 0, "not found"},
+		{"not ready", "pending", 0, "not ready (status PENDING)"},
+		{"arm", "arm", 0, "only X86_64"},
+		{"deleted", "gone", 0, "DELETED and can no longer be used"},
+		{"windows license", "winlic", 0, "Windows image"},
+		{"windows feature", "winfeat", 0, "Windows image"},
+		{"disk too small", "big", 100, "bootDiskSizeGB 100 is smaller than the boot source (120 GB)"},
+		{"malformed", "a/b", 0, "not an image name"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ResolveDefaults(context.Background(), testCreds(), bootNP(func(c *mlv1alpha1.GCPConfig) { c.SourceImage = tc.image; c.BootDiskSizeGB = tc.size }))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	// A deprecated (not deleted) image still works.
+	if _, err := ResolveDefaults(context.Background(), testCreds(), bootNP(func(c *mlv1alpha1.GCPConfig) { c.SourceImage = "old" })); err != nil {
+		t.Errorf("deprecated image: %v", err)
+	}
+	// An image bigger than the default boot disk grows an unset bootDiskSizeGB.
+	res, err := ResolveDefaults(context.Background(), testCreds(), bootNP(func(c *mlv1alpha1.GCPConfig) { c.SourceImage = "big" }))
+	if err != nil || res.Config.BootDiskSizeGB != 120 {
+		t.Errorf("boot disk = %d err %v", res.Config.BootDiskSizeGB, err)
+	}
+}
+
+func TestResolveDefaults_Snapshot(t *testing.T) {
+	f := bootFake(t)
+	addSnapshot(f, "proj-1", "golden", 40, nil)
+	addSnapshot(f, "shared", "base", 200, nil)
+	addSnapshot(f, "proj-1", "busy", 40, func(s *computepb.Snapshot) { s.Status = proto.String("CREATING") })
+	addSnapshot(f, "proj-1", "win", 40, func(s *computepb.Snapshot) {
+		s.Licenses = []string{"projects/windows-cloud/global/licenses/windows-server-2019-dc"}
+	})
+	ok := func(ref string, size int32) (*Resolved, error) {
+		return ResolveDefaults(context.Background(), testCreds(), bootNP(func(c *mlv1alpha1.GCPConfig) { c.SourceSnapshot = ref; c.BootDiskSizeGB = size }))
+	}
+	res, err := ok("golden", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Config.SourceSnapshot != "golden" || res.Config.SourceImage != "" || res.Config.BootDiskSizeGB != 0 {
+		t.Errorf("a 40 GB snapshot fits the default disk and no image is resolved: %+v", res.Config)
+	}
+	if res, err = ok("projects/shared/global/snapshots/base", 0); err != nil || res.Config.BootDiskSizeGB != 200 {
+		t.Errorf("a 200 GB snapshot grows an unset disk: %+v %v", res, err)
+	}
+	for ref, want := range map[string]string{
+		"nope": "not found in project", "busy": "not ready (status CREATING)", "win": "Windows disk", "a/b": "not a snapshot name",
+	} {
+		if _, err := ok(ref, 0); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: err = %v, want %q", ref, err, want)
+		}
+	}
+	if _, err := ok("projects/shared/global/snapshots/base", 100); err == nil || !strings.Contains(err.Error(), "smaller than the boot source (200 GB)") {
+		t.Errorf("explicit disk too small: %v", err)
+	}
+}
+
+func TestValidateGCPConfig_BootSourceIsExclusive(t *testing.T) {
+	for _, mut := range []func(*mlv1alpha1.GCPConfig){
+		func(c *mlv1alpha1.GCPConfig) { c.SourceImage = "img" },
+		func(c *mlv1alpha1.GCPConfig) { c.ImageFamily = "fam" },
+		func(c *mlv1alpha1.GCPConfig) { c.ImageProject = "proj" },
+	} {
+		_, err := ResolveDefaults(context.Background(), testCreds(), bootNP(func(c *mlv1alpha1.GCPConfig) { c.SourceSnapshot = "snap"; mut(c) }))
+		if err == nil || !strings.Contains(err.Error(), "choose one boot source") {
+			t.Errorf("err = %v", err)
+		}
 	}
 }

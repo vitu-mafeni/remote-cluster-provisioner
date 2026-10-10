@@ -40,6 +40,8 @@ type fakeCompute struct {
 	machines  map[string]bool // zone/type available
 	accels    map[string]bool // zone/type available
 	images    map[string]*computepb.Image
+	imgByName map[string]*computepb.Image    // key project/name
+	snapshots map[string]*computepb.Snapshot // key project/name
 
 	// error injection (nil = succeed)
 	getInstanceErr    error
@@ -68,9 +70,11 @@ func newFakeCompute() *fakeCompute {
 		networks: map[string]*computepb.Network{
 			"default": {Name: proto.String("default"), AutoCreateSubnetworks: proto.Bool(true)},
 		},
-		subnets:  map[string]*computepb.Subnetwork{},
-		machines: map[string]bool{},
-		accels:   map[string]bool{},
+		subnets:   map[string]*computepb.Subnetwork{},
+		imgByName: map[string]*computepb.Image{},
+		snapshots: map[string]*computepb.Snapshot{},
+		machines:  map[string]bool{},
+		accels:    map[string]bool{},
 		images: map[string]*computepb.Image{
 			DefaultImageProject + "/" + DefaultImageFamily: {
 				Name:         proto.String("ubuntu-2204-jammy-v20260101"),
@@ -239,6 +243,24 @@ func (f *fakeCompute) GetImageFromFamily(_ context.Context, project, family stri
 		return img, nil
 	}
 	return nil, gerr(404, "notFound", "image family not found")
+}
+
+func (f *fakeCompute) GetImage(_ context.Context, project, name string) (*computepb.Image, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if img, ok := f.imgByName[project+"/"+name]; ok {
+		return img, nil
+	}
+	return nil, gerr(404, "notFound", "image not found")
+}
+
+func (f *fakeCompute) GetSnapshot(_ context.Context, project, name string) (*computepb.Snapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if s, ok := f.snapshots[project+"/"+name]; ok {
+		return s, nil
+	}
+	return nil, gerr(404, "notFound", "snapshot not found")
 }
 
 func (f *fakeCompute) Close() error {

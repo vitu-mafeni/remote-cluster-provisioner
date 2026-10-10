@@ -307,7 +307,7 @@ func (r *NodeProvisionReconciler) reconcileGCPProvisioning(
 func gcpDefaultsComplete(np *mlv1alpha1.NodeProvision) bool {
 	c := np.Spec.GCPConfig
 	return c != nil && np.Spec.InstanceType != "" && np.Spec.Region != "" &&
-		c.ProjectID != "" && c.Zone != "" && c.SourceImage != "" && c.Network != ""
+		c.ProjectID != "" && c.Zone != "" && (c.SourceImage != "" || c.SourceSnapshot != "") && c.Network != ""
 }
 
 // resolveGCPDefaults fills in missing spec fields (project, machine type, zone,
@@ -345,7 +345,7 @@ func (r *NodeProvisionReconciler) resolveGCPDefaults(
 	}
 	log.Info("Patched NodeProvision spec with resolved GCP defaults",
 		"project", cfg.ProjectID, "zone", cfg.Zone, "machineType", res.InstanceType,
-		"network", cfg.Network, "image", cfg.SourceImage)
+		"network", cfg.Network, "image", cfg.SourceImage, "snapshot", cfg.SourceSnapshot)
 	return true, nil
 }
 

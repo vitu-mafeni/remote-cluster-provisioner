@@ -75,6 +75,7 @@ func newEC2Client(ctx context.Context, region string, creds AWSCredentials) (*ec
 // interface so the launch workflow can be unit-tested with a fake).
 type ec2LaunchAPI interface {
 	ec2DescribeInstancesAPI
+	ec2ImageAPI
 	RunInstances(ctx context.Context, params *ec2.RunInstancesInput, optFns ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error)
 	CreateTags(ctx context.Context, params *ec2.CreateTagsInput, optFns ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error)
 }
@@ -143,6 +144,9 @@ func ValidateAWSConfig(spec mlv1alpha1.NodeProvisionSpec) error {
 	}
 	if awsCfg.SubnetID == "" {
 		return fmt.Errorf("spec.awsConfig.subnetId is required")
+	}
+	if err := validateImageSpec(awsCfg); err != nil {
+		return err
 	}
 	return nil
 }
@@ -274,6 +278,12 @@ func ProvisionEC2Node(
 		return &ProvisionResult{InstanceID: existingID, Adopted: true}, nil
 	}
 
+	// ── Image / root snapshot: validated before any VPN peer is registered ─
+	rootImage, err := prepareLaunchImage(ctx, ec2Client, nodeProvision)
+	if err != nil {
+		return nil, fmt.Errorf("image validation failed: %w", err)
+	}
+
 	var (
 		vpnIP     string
 		publicKey string
@@ -322,7 +332,7 @@ func ProvisionEC2Node(
 	log.Printf("[INFO] NodeProvision/%s: Creating EC2 instance (type=%s region=%s)",
 		name, nodeProvision.Spec.InstanceType, nodeProvision.Spec.Region)
 
-	input := buildRunInstancesInput(nodeProvision, userDataB64)
+	input := buildRunInstancesInput(nodeProvision, userDataB64, rootImage)
 	runOut, err := ec2Client.RunInstances(ctx, input)
 	if err != nil {
 		if isIdempotentParameterMismatch(err) {
@@ -844,10 +854,22 @@ func ValidateInstanceTypeAvailability(ctx context.Context, region, instanceType 
 
 const defaultRootVolumeSizeGB = 50
 
-func buildRunInstancesInput(np *mlv1alpha1.NodeProvision, userDataB64 string) *ec2.RunInstancesInput {
-	rootVolumeGB := int32(defaultRootVolumeSizeGB)
-	if np.Spec.AWSConfig != nil && np.Spec.AWSConfig.RootVolumeSizeGB > 0 {
-		rootVolumeGB = np.Spec.AWSConfig.RootVolumeSizeGB
+func buildRunInstancesInput(np *mlv1alpha1.NodeProvision, userDataB64 string, img launchImage) *ec2.RunInstancesInput {
+	rootDevice := img.RootDeviceName
+	if rootDevice == "" {
+		rootDevice = defaultRootDeviceName
+	}
+	rootVolumeGB := img.VolumeGB
+	if rootVolumeGB == 0 {
+		rootVolumeGB = requestedRootGB(np.Spec.AWSConfig)
+	}
+	root := &types.EbsBlockDevice{
+		VolumeSize:          awssdk.Int32(rootVolumeGB),
+		VolumeType:          types.VolumeTypeGp3,
+		DeleteOnTermination: awssdk.Bool(true),
+	}
+	if img.SnapshotID != "" {
+		root.SnapshotId = awssdk.String(img.SnapshotID)
 	}
 
 	input := &ec2.RunInstancesInput{
@@ -857,14 +879,7 @@ func buildRunInstancesInput(np *mlv1alpha1.NodeProvision, userDataB64 string) *e
 		MaxCount:     awssdk.Int32(1),
 		UserData:     awssdk.String(userDataB64),
 		BlockDeviceMappings: []types.BlockDeviceMapping{
-			{
-				DeviceName: awssdk.String("/dev/sda1"),
-				Ebs: &types.EbsBlockDevice{
-					VolumeSize:          awssdk.Int32(rootVolumeGB),
-					VolumeType:          types.VolumeTypeGp3,
-					DeleteOnTermination: awssdk.Bool(true),
-				},
-			},
+			{DeviceName: awssdk.String(rootDevice), Ebs: root},
 		},
 		NetworkInterfaces: []types.InstanceNetworkInterfaceSpecification{
 			{

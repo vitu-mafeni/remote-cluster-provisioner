@@ -477,7 +477,7 @@ func TestBuildRunInstancesInput_PublicIPFollowsDisablePublicIP(t *testing.T) {
 		np := &mlv1alpha1.NodeProvision{}
 		np.Spec.InstanceType = "t3.micro"
 		np.Spec.AWSConfig = &mlv1alpha1.AWSConfig{AMI: "ami-1", SubnetID: "subnet-1", SecurityGroupIDs: []string{"sg-1", "sg-2"}, DisablePublicIP: disable}
-		nic := buildRunInstancesInput(np, "").NetworkInterfaces[0]
+		nic := buildRunInstancesInput(np, "", launchImage{}).NetworkInterfaces[0]
 		if got := awssdk.ToBool(nic.AssociatePublicIpAddress); got == disable {
 			t.Errorf("disablePublicIp=%v: AssociatePublicIpAddress=%v", disable, got)
 		}

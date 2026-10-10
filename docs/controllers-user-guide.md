@@ -515,7 +515,10 @@ spec:
   # awsConfig is entirely optional — every field below is auto-populated when omitted:
   # awsConfig:
   #   instanceType: p3.2xlarge   # overrides the nodeLabel → instance-type lookup
-  #   ami: ami-0c9c942bd7bf113a2
+  #   ami: ami-0c9c942bd7bf113a2   # custom/private/shared image; or select by name:
+  #   # amiName: "my-k8s-node-*"    # newest match among amiOwners (default: self)
+  #   # amiOwners: [self]
+  #   # rootSnapshotId: snap-xxxxxxxx  # boot the root volume from this snapshot
   #   vpcId: vpc-xxxxxxxx        # existing VPC to launch into (default: the region's default VPC)
   #   subnetId: subnet-xxxxxxxx  # existing subnet; its VPC is derived, or must match vpcId if both set
   #   securityGroupIds: [sg-xxxxxxxx]  # must be in the subnet's VPC; never modified
@@ -528,6 +531,21 @@ spec:
 
 Important fields:
 
+- **Custom images and snapshots (AWS)** — `awsConfig.ami` boots any AMI in `spec.region` (yours,
+  shared with you, or public). Just before launch (and before any VPN peer is registered) the
+  controller checks it exists, is `available`, EBS-backed, HVM, not Windows, and matches the instance
+  type's architecture, and maps the **image's own root device name** (`/dev/sda1`, `/dev/xvda`, …) so
+  `rootVolumeSizeGB` resizes the root instead of adding a second volume. An unset `rootVolumeSizeGB`
+  grows to the image/snapshot size; an explicit smaller one is rejected. `awsConfig.amiName` (+
+  `amiOwners`, default `self`) selects the newest available image whose name matches (wildcards
+  allowed) and has a matching architecture; it is resolved once and recorded in `ami`. If both are
+  set, `ami` wins. `awsConfig.rootSnapshotId` creates the root volume from an EBS snapshot (completed,
+  in `spec.region`) while `ami` — or the default Ubuntu 22.04 — supplies architecture, boot mode and
+  virtualization, so the snapshot must come from a compatible root volume. No AMI is registered, so
+  nothing needs cleaning up when the node is deleted. The bootstrap installs packages with apt and
+  needs cloud-init, so the image must be **Ubuntu 20.04 or newer**. Validation uses
+  `ec2:DescribeImages/DescribeSnapshots/DescribeInstanceTypes` (a missing `DescribeInstanceTypes` only
+  skips the architecture check).
 - **`awsConfig.vpcId` / `subnetId` / `securityGroupIds`** launch the instance into an existing
   network instead of the region's default VPC. Set any of them: the VPC is taken from the subnet,
   else `vpcId`, else the security groups, else the region's default VPC (created if the region has
@@ -564,9 +582,7 @@ Important fields:
     blobs redacted.
   - A spec that sets both `subnetId` and `securityGroupIds` is passed to EC2 without these
     pre-checks (EC2 rejects an inconsistent pair itself).
-  - On GCP the equivalent is `gcpConfig.network` / `gcpConfig.subnetwork` (+ `disableExternalIP`);
-    the subnetwork is validated (exists, in the instance's region, PRIVATE, READY) and, if `network`
-    is unset, determines it; Shared VPC subnetworks can be given as a host-project path or URL.
+  - On GCP see "Network, images and snapshots" in [§5.4](#54-nodeprovision-on-google-cloud-gcp).
 - **`disableVPN`** (default `false`) joins the node without a WireGuard tunnel — no VPN server
   connection, IP allocation, peer, WireGuard package or AWS security group rule. It is a property
   of the whole cluster, so you normally don't set it here: it is inherited from the cluster's
@@ -654,8 +670,12 @@ spec:
   # gcpConfig:
   #   projectId: my-project
   #   zone: us-central1-a
-  #   network: default
-  #   subnetwork: default
+  #   network: default              # or projects/<host>/global/networks/<vpc> (Shared VPC); derived from subnetwork when unset
+  #   subnetwork: default           # name, regions/<r>/subnetworks/<n> or projects/<p>/regions/<r>/subnetworks/<n>
+  #   imageFamily: ubuntu-2204-lts  # the default; or a custom image:
+  #   # sourceImage: my-golden-image
+  #   # sourceSnapshot: my-boot-snapshot   # boots from a snapshot; excludes the image fields
+  #   disableExternalIP: false      # true for private subnets (needs Cloud NAT)
   #   bootDiskSizeGB: 100
   #   bootDiskType: pd-ssd
   #   labels: {team: ml}
@@ -723,6 +743,31 @@ instance of the same name that belongs to something else is never adopted or del
 - Spot VMs (`spot: true`) are deleted when preempted; the NodeProvision then fails and retries.
 - `disableExternalIP: true` creates the VM without a public address; give it Cloud NAT for package
   downloads (and, with a VPN, to reach the VPN server).
+
+**Network, images and snapshots**
+
+- **Network.** `gcpConfig.network` (a name, or `projects/<host>/global/networks/<n>` for a Shared VPC)
+  and `gcpConfig.subnetwork` (a name in the network's project, `regions/<r>/subnetworks/<n>`,
+  `projects/<p>/regions/<r>/subnetworks/<n>` or a URL) are validated before launch: the subnetwork
+  must exist, be in the instance's region, be `PRIVATE` and `READY`, and belong to `network` when
+  both are set. If `network` is unset it is taken from the subnetwork (otherwise it defaults to
+  `default`). Custom-mode networks require a subnetwork. Firewall rules are created per node, scoped
+  to the node's network tag, in the network's project (the host project on a Shared VPC). Set
+  `disableExternalIP: true` for private subnets.
+- **Custom image.** `gcpConfig.sourceImage` accepts a bare custom image name (looked up in
+  `imageProject`, else the instance's project), `projects/<p>/global/images/<n>`,
+  `…/images/family/<f>` or a URL. The image must be `READY`, x86_64 and not Windows; `DELETED` or
+  `OBSOLETE` images are rejected and `DEPRECATED` ones only log a warning.
+- **Snapshot.** `gcpConfig.sourceSnapshot` accepts a snapshot name (in the instance's project),
+  `projects/<p>/global/snapshots/<n>` or a URL and creates the boot disk from it. It must be `READY`
+  and not a Windows disk. Choose **one** boot source: `sourceSnapshot` cannot be combined with
+  `sourceImage`, `imageFamily` or `imageProject`.
+- **Disk size.** `bootDiskSizeGB` smaller than the image or snapshot is rejected; left unset it
+  grows to fit (default 50).
+- **Requirements.** The image or snapshot must be **Ubuntu 20.04 or newer** (the startup script uses
+  apt and systemd). The service account needs read access (`compute.images.get` /
+  `compute.snapshots.get`; `compute.imageUser` for images in another project). A snapshot's OS cannot
+  be checked before boot, so this is documented rather than enforced.
 
 ---
 
@@ -1056,6 +1101,13 @@ INFO  RemoteCluster cleanup complete
 | `NodeProvision in terminal Failed state` | 5 consecutive failures on the remote side | `kubectl patch nodeprovision <name> --subresource=status --type=merge -p '{"status":{"provisionRetryCount":0}}'` |
 | `cnlab-runtime credential sync reached retry limit` | VPN link between clusters may be down, or the credentials Secret is malformed | Check VPN connectivity; reset via `kubectl patch remotecluster <name> --subresource=status --type=merge -p '{"status":{"cnlabSyncRetryCount":0}}'` |
 | Node stuck in `Bootstrapping` | Install is legitimately still running (5–15 min is normal), or it's genuinely hung | `kubectl get nodeprovision <name> -o jsonpath='{.status.message}'`; SSH in and check `sudo fuser /var/lib/dpkg/lock-frontend` and `tail -50 /var/log/node-provision.log` |
+| `NodeProvision` failed with `image validation failed: … is not available in region …` (AWS) | `awsConfig.ami` does not exist, is private to another account, or lives in a different region | Copy or share the AMI to `spec.region`, or fix the ID; `awsConfig.amiName` can select one by name |
+| `AMI … is arm64 but instance type … runs x86_64` / `not EBS-backed` / `Windows image` (AWS) | The AMI does not fit the instance type or the bootstrap | Use an Ubuntu 20.04+ EBS/HVM AMI with the instance type's architecture |
+| `rootVolumeSizeGB … is smaller than the root volume of …` (AWS) / `bootDiskSizeGB … is smaller than the boot source` (GCP) | The explicit disk size is below the image/snapshot size | Raise it, or leave it unset to grow automatically |
+| `AWS network validation failed: the control plane's API endpoint … is not inside VPC …` | Without a VPN the node's VPC does not contain the control plane's private endpoint | Set `awsConfig.vpcId`/`subnetId` to the control plane's VPC; if it is reachable by peering/transit gateway set `awsConfig.skipControlPlaneVpcCheck: true` |
+| `spec.awsConfig.subnetId … belongs to VPC …` / `security group … belongs to VPC …` | `vpcId`, `subnetId` and `securityGroupIds` point at different VPCs | Make them agree (the subnet decides the VPC) |
+| `sourceSnapshot cannot be combined with sourceImage, imageFamily or imageProject` (GCP) | Two boot sources set | Keep only one |
+| `subnetwork … belongs to network …` / `is in region …` (GCP) | `gcpConfig.subnetwork` does not match `network` or the instance's region | Fix `network`/`subnetwork`, or drop `network` to derive it from the subnetwork |
 | Registry pull returns `unauthorized` | Registry credentials missing/empty in the cluster's shared config | Apply the registry credentials Secret (or re-apply the sample, which includes it) |
 | Networking plugins missing after cluster install | An install step was interrupted | Manually install the CNI plugins bundle (`v1.5.1`) to `/opt/cni/bin` on the affected node |
 | GitOps platform resources not appearing / stuck | The platform hasn't synced the new cluster's repository yet, or a stale resource exists from a previous attempt | Check your Nephio/Porch resources; delete stale ones to force re-creation |
@@ -1343,8 +1395,8 @@ metrics endpoint on the controller Deployment.
 | `sshUsernameOverride` | string | |
 | `credentialsRef` | secret ref | key auto-detected if omitted |
 | `disableVPN` | bool | default `false`; join the node without WireGuard. Normally **inherited** from the cluster (`RemoteCluster` control-plane → `NodeProvisionNetConfig` → `NodeProvision`); setting `true` against a VPN cluster fails the provision. Set at creation; not changeable afterwards (see [§5.3](#53-nodeprovision--add-a-node-from-the-remote-cluster), [§7.5](#75-operational-notes)) |
-| `awsConfig` | object | `vpcId`, `subnetId`, `securityGroupIds[]`, `disablePublicIp`, `skipControlPlaneVpcCheck`, `ami`, `keyPairName`, `iamInstanceProfile`, `tags{}`, `rootVolumeSizeGB` — all auto-resolved if omitted |
-| `gcpConfig` | object | `projectId`, `zone`, `network`, `subnetwork`, `sourceImage` / `imageFamily` / `imageProject`, `bootDiskSizeGB`, `bootDiskType`, `labels{}`, `networkTags[]`, `serviceAccountEmail`, `serviceAccountScopes[]`, `accelerator{type,count}`, `spot`, `disableExternalIP`, `firewallSourceRanges[]` — all optional, auto-resolved if omitted (see [§5.4](#54-nodeprovision-on-google-cloud-gcp)) |
+| `awsConfig` | object | `vpcId`, `subnetId`, `securityGroupIds[]`, `disablePublicIp`, `amiName`, `amiOwners[]`, `rootSnapshotId`, `skipControlPlaneVpcCheck`, `ami`, `keyPairName`, `iamInstanceProfile`, `tags{}`, `rootVolumeSizeGB` — all auto-resolved if omitted |
+| `gcpConfig` | object | `projectId`, `zone`, `network`, `subnetwork`, `sourceImage` / `imageFamily` / `imageProject` / `sourceSnapshot`, `bootDiskSizeGB`, `bootDiskType`, `labels{}`, `networkTags[]`, `serviceAccountEmail`, `serviceAccountScopes[]`, `accelerator{type,count}`, `spot`, `disableExternalIP`, `firewallSourceRanges[]` — all optional, auto-resolved if omitted (see [§5.4](#54-nodeprovision-on-google-cloud-gcp)) |
 
 **Status:**
 
