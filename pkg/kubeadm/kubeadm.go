@@ -130,7 +130,7 @@ func cgroupV1CompatibilitySettings(version string) (configStep, preflightArg str
 	}
 	return `if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then
   sudo sed -i '/^featureGates:/i failCgroupV1: false' /tmp/kubeadm-config.yaml
-fi`, `$(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)`
+fi`, ` $(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)`
 }
 
 // ValidateJoinCommand rejects a `kubeadm join ...` command containing anything

@@ -37,9 +37,9 @@ func TestCgroupV1CompatibilitySettings(t *testing.T) {
 		version, wantConfigStep, wantPreflightArg string
 	}{
 		{"1.34.9", "", ""},
-		{"1.35.0", "if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then", "$(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)"},
-		{"1.36.1", "if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then", "$(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)"},
-		{"2.0.0", "if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then", "$(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)"},
+		{"1.35.0", "if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then", " $(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)"},
+		{"1.36.1", "if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then", " $(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)"},
+		{"2.0.0", "if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then", " $(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)"},
 	}
 	for _, tt := range tests {
 		gotConfigStep, gotPreflightArg := cgroupV1CompatibilitySettings(tt.version)
