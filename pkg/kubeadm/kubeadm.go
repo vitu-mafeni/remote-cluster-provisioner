@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,6 +116,21 @@ func ParseKubernetesVersion(v string) (clean, repoVersion string, err error) {
 	}
 	parts := strings.Split(clean, ".")
 	return clean, parts[0] + "." + parts[1], nil
+}
+
+func cgroupV1CompatibilitySettings(version string) (configStep, preflightArg string) {
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return "", ""
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	if majorErr != nil || minorErr != nil || (major < 1 || (major == 1 && minor < 35)) {
+		return "", ""
+	}
+	return `if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then
+  sudo sed -i '/^featureGates:/i failCgroupV1: false' /tmp/kubeadm-config.yaml
+fi`, `$(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)`
 }
 
 // ValidateJoinCommand rejects a `kubeadm join ...` command containing anything
@@ -362,6 +378,7 @@ func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteClu
 	if err != nil {
 		return "", err
 	}
+	cgroupV1ConfigStep, cgroupV1PreflightArg := cgroupV1CompatibilitySettings(clean)
 
 	kubeadmConfig := fmt.Sprintf(`
 apiVersion: kubeadm.k8s.io/v1beta4
@@ -410,7 +427,7 @@ cgroupDriver: systemd
 containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
 featureGates:
   DynamicResourceAllocation: true
-  DRAConsumableCapacity: true
+	DRAConsumableCapacity: true
 runtimeRequestTimeout: "15m"
 imageGCHighThresholdPercent: 95
 imageGCLowThresholdPercent: 90
@@ -638,13 +655,13 @@ printf '[Unit]\nAfter=crio.service\nRequires=crio.service\n' \
 		// kubeadm init is guarded by `test -f admin.conf` so it is safe to retry.
 		{Name: "kubeadm Init", Steps: []string{
 			`sudo mkdir -p /var/lib/kubelet /etc/containers`,
-			fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF", kubeadmConfig),
+			fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF\n%s", kubeadmConfig, cgroupV1ConfigStep),
 			`sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
   || { sudo systemctl restart crio && sleep 5 && \
        sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
        || { sudo journalctl -xeu crio.service --no-pager >&2; false; }; }`,
 			`test -f /etc/kubernetes/admin.conf || ( \
-sudo kubeadm init --config /tmp/kubeadm-config.yaml; RC=$?; \
+sudo kubeadm init --config /tmp/kubeadm-config.yaml` + cgroupV1PreflightArg + `; RC=$?; \
 if [ $RC -ne 0 ]; then \
   echo "=== crictl ps -a ===" >&2; \
   sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a >&2 2>&1 || true; \

@@ -32,6 +32,23 @@ func TestParseKubernetesVersion(t *testing.T) {
 	}
 }
 
+func TestCgroupV1CompatibilitySettings(t *testing.T) {
+	tests := []struct {
+		version, wantConfigStep, wantPreflightArg string
+	}{
+		{"1.34.9", "", ""},
+		{"1.35.0", "if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then", "$(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)"},
+		{"1.36.1", "if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then", "$(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)"},
+		{"2.0.0", "if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then", "$(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)"},
+	}
+	for _, tt := range tests {
+		gotConfigStep, gotPreflightArg := cgroupV1CompatibilitySettings(tt.version)
+		if !strings.HasPrefix(gotConfigStep, tt.wantConfigStep) || gotPreflightArg != tt.wantPreflightArg {
+			t.Errorf("cgroupV1CompatibilitySettings(%q) = %q, %q; want config prefix %q and preflight arg %q", tt.version, gotConfigStep, gotPreflightArg, tt.wantConfigStep, tt.wantPreflightArg)
+		}
+	}
+}
+
 func TestValidateJoinCommand(t *testing.T) {
 	good := "kubeadm join 10.8.0.1:6443 --token abcdef.0123456789abcdef --discovery-token-ca-cert-hash sha256:0123abcd"
 	if err := ValidateJoinCommand(good); err != nil {
