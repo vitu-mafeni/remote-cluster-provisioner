@@ -1515,7 +1515,7 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 	// getJoinCommand for why: a stray KUBECONFIG env var on the target host
 	// can silently redirect kubeadm at an unrelated API server.
 	// Stdout only: the output is stored as the join command.
-	out, err := sshhelper.RunStdoutCtx(sshCtx, sshClient, "kubeadm token create --print-join-command --kubeconfig=/etc/kubernetes/admin.conf 2>/dev/null")
+	out, err := sshhelper.RunStdoutCtx(sshCtx, sshClient, "sudo kubeadm token create --print-join-command --kubeconfig=/etc/kubernetes/admin.conf")
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("kubeadm token create: %w\nOutput: %s", err, out)
 	}

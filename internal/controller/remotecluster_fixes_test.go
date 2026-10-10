@@ -446,8 +446,10 @@ func TestTokenRequeueAfter_IsAlwaysPositiveAndBounded(t *testing.T) {
 
 func TestReconcile_ReadyControlPlaneRefreshesOverdueTokenFromStdoutOnly(t *testing.T) {
 	const joinCmd = "kubeadm join 127.0.0.1:6443 --token zzzzzz.0123456789abcdef --discovery-token-ca-cert-hash sha256:"
+	var tokenScript string
 	srv := startFakeSSH(t, func(s string) (string, string, int) {
 		if strings.Contains(s, "kubeadm token create") {
+			tokenScript = s
 			return joinCmd + strings.Repeat("b", 64) + "\n", "sudo: unable to resolve host cp\n", 0
 		}
 		return "", "", 0
@@ -465,6 +467,9 @@ func TestReconcile_ReadyControlPlaneRefreshesOverdueTokenFromStdoutOnly(t *testi
 	got := getRC(t, r, "cp")
 	if !strings.HasPrefix(got.Status.JoinCommand, joinCmd) || strings.Contains(got.Status.JoinCommand, "sudo:") || strings.Contains(got.Status.JoinCommand, "\n") {
 		t.Errorf("join command must be the stdout only: %q", got.Status.JoinCommand)
+	}
+	if !strings.Contains(tokenScript, "sudo kubeadm token create") || strings.Contains(tokenScript, "2>/dev/null") {
+		t.Errorf("token refresh must use sudo and preserve stderr for diagnostics:\n%s", tokenScript)
 	}
 	if res.RequeueAfter < tokenRefreshInterval-time.Minute || res.RequeueAfter > tokenRefreshInterval {
 		t.Errorf("after a refresh the next wake-up is a full interval away, got %v", res.RequeueAfter)
