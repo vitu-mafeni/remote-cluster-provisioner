@@ -133,6 +133,10 @@ func cgroupV1CompatibilitySettings(version string) (configStep, preflightArg str
 fi`, ` $(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)`
 }
 
+func normalizeKubeadmConfig(config string) string {
+	return strings.ReplaceAll(config, "\t", "  ")
+}
+
 // ValidateJoinCommand rejects a `kubeadm join ...` command containing anything
 // but plain arguments (no shell metacharacters), since it is embedded in shell
 // scripts run on the node.
@@ -442,6 +446,7 @@ apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
 mode: ipvs
 `, nodeIP, clean, yamlString(cluster.Spec.ClusterName))
+	kubeadmConfig = normalizeKubeadmConfig(kubeadmConfig)
 
 	// Mirrors the worker-join labeling logic below (see labelAndTaintCmd) so a
 	// single-node ("one box") cluster — where the control-plane node is also

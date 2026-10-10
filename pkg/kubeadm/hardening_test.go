@@ -49,6 +49,14 @@ func TestCgroupV1CompatibilitySettings(t *testing.T) {
 	}
 }
 
+func TestNormalizeKubeadmConfigReplacesTabs(t *testing.T) {
+	got := normalizeKubeadmConfig("featureGates:\n\tDRAConsumableCapacity: true\n")
+	want := "featureGates:\n  DRAConsumableCapacity: true\n"
+	if got != want {
+		t.Fatalf("normalizeKubeadmConfig() = %q, want %q", got, want)
+	}
+}
+
 func TestValidateJoinCommand(t *testing.T) {
 	good := "kubeadm join 10.8.0.1:6443 --token abcdef.0123456789abcdef --discovery-token-ca-cert-hash sha256:0123abcd"
 	if err := ValidateJoinCommand(good); err != nil {
