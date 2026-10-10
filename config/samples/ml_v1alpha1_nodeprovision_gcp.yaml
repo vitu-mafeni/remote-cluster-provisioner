@@ -98,7 +98,7 @@ spec:
     namespace: default
   gcpConfig:
     zone: europe-west4-a
-    # The control plane's / controller's address ranges (default: RFC1918 10/8, 172.16/12, 192.168/16).
+    # The control plane's / controller's address ranges (default: RFC1918 10/8, 172.16/12, 192.168/16 plus the node's own subnetwork range, so a VPC outside RFC1918 works).
     firewallSourceRanges:
       - 172.20.0.0/16
     # GPUs: N1 machine types take an accelerator ...

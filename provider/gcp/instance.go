@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"strconv"
 	"strings"
 
@@ -208,6 +209,12 @@ func ProvisionInstance(
 	}
 
 	// ── Firewall rules (no VPN server involved; cleaned up on deletion) ─────
+	// Without a VPN and without explicit ranges the controller and control plane
+	// reach the node from its own network: allow the node's subnetwork too, or a
+	// VPC that is not RFC1918 (e.g. 172.168.0.0/16) would lock them out.
+	if noVPN && len(plan.SSHSources) == 0 {
+		plan.SSHSources = defaultMgmtSources(ctx, c, project, cfg)
+	}
 	if err := ensureFirewalls(ctx, c, plan); err != nil {
 		if !IsPermissionDenied(err) {
 			return nil, err
@@ -542,3 +549,45 @@ func parsePort(s string, def int) int {
 	}
 	return n
 }
+
+// defaultMgmtSources returns the default source ranges of the no-VPN per-node
+// rule: the RFC1918 ranges plus the node's own subnetwork range when it is not
+// already inside one of them. The lookup is best effort: if the subnetwork cannot
+// be read the RFC1918 default is used.
+func defaultMgmtSources(ctx context.Context, c computeAPI, project string, cfg *mlv1alpha1.GCPConfig) []string {
+	out := append([]string(nil), PrivateRanges...)
+	region, ok := RegionOfZone(cfg.Zone)
+	if !ok {
+		return out
+	}
+	netProject, netName := ParseNetworkRef(project, cfg.Network)
+	// An auto-mode network's subnetwork in a region is named like the network.
+	subProject, subRegion, subName := netProject, region, netName
+	if cfg.Subnetwork != "" {
+		p, r, n, err := ParseSubnetworkRef(netProject, region, cfg.Subnetwork)
+		if err != nil {
+			return out
+		}
+		subProject, subRegion, subName = p, r, n
+	}
+	sn, err := c.GetSubnetwork(ctx, subProject, subRegion, subName)
+	if err != nil {
+		log.Printf("[WARN] firewall: cannot read subnetwork %s/%s to widen the default source ranges (using RFC1918 only): %s",
+			subRegion, subName, Describe(err))
+		return out
+	}
+	_, subnet, err := net.ParseCIDR(sn.GetIpCidrRange())
+	if err != nil {
+		return out
+	}
+	for _, r := range PrivateRanges {
+		if _, priv, perr := net.ParseCIDR(r); perr == nil && priv.Contains(subnet.IP) {
+			if ones, _ := subnet.Mask.Size(); ones >= maskLen(priv) {
+				return out // already covered: keep the standard rule unchanged
+			}
+		}
+	}
+	return append(out, subnet.String())
+}
+
+func maskLen(n *net.IPNet) int { o, _ := n.Mask.Size(); return o }

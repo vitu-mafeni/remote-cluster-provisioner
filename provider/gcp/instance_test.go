@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"cloud.google.com/go/compute/apiv1/computepb"
+	"google.golang.org/protobuf/proto"
 
 	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
 )
@@ -87,7 +88,7 @@ func TestProvisionInstance_VPNLaunchRegistersPeerAndUsesAttemptRequestID(t *test
 			t.Errorf("startup script missing %q", want)
 		}
 	}
-	if strings.Contains(script, "computeMetadata") {
+	if strings.Contains(script, "network-interfaces/0/ip") {
 		t.Error("VPN mode takes the node IP from the tunnel, not the metadata server")
 	}
 	// Firewall: only the WireGuard rule, only from the VPN server.
@@ -722,5 +723,90 @@ func TestParsePort(t *testing.T) {
 		if got := parsePort(in, 51820); got != want {
 			t.Errorf("parsePort(%q) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+// ── no-VPN firewall source ranges ───────────────────────────────────────────
+
+// mgmtSources provisions a no-VPN node and returns the sources of its management rule.
+func mgmtSources(t *testing.T, mut func(e *provEnv)) []string {
+	t.Helper()
+	e := newProvEnv(t)
+	e.np.Spec.DisableVPN = true
+	e.nc.Spec.VPNRange = nil
+	if mut != nil {
+		mut(e)
+	}
+	if _, err := ProvisionInstance(context.Background(), e.np, testCreds(), e.pubKey, nil, e.nc, pkgruntimeConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.gce.insertedFW) != 1 {
+		t.Fatalf("rules = %v", e.gce.insertedFW)
+	}
+	return e.gce.insertedFW[0].GetSourceRanges()
+}
+
+func addSubnetCIDR(e *provEnv, project, region, name, cidr string) {
+	e.gce.subnets[project+"/"+region+"/"+name] = &computepb.Subnetwork{Name: proto.String(name), IpCidrRange: proto.String(cidr)}
+}
+
+// A VPC outside RFC1918 (here 172.168.0.0/16, NOT 172.16.0.0/12) must not lock the
+// controller and control plane out of the node's SSH, kubelet and flannel ports.
+func TestNoVPNFirewall_DefaultSourcesIncludeANonRFC1918Subnet(t *testing.T) {
+	got := mgmtSources(t, func(e *provEnv) {
+		e.np.Spec.GCPConfig.Network = "custom"
+		e.np.Spec.GCPConfig.Subnetwork = "sub-a"
+		addSubnetCIDR(e, "proj-1", "us-central1", "sub-a", "172.168.0.0/24")
+	})
+	want := append(append([]string(nil), PrivateRanges...), "172.168.0.0/24")
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("sources = %v, want %v", got, want)
+	}
+}
+
+func TestNoVPNFirewall_AutoModeNetworkUsesTheSubnetNamedLikeTheNetwork(t *testing.T) {
+	got := mgmtSources(t, func(e *provEnv) {
+		addSubnetCIDR(e, "proj-1", "us-central1", "default", "100.72.0.0/20")
+	})
+	if got[len(got)-1] != "100.72.0.0/20" || len(got) != len(PrivateRanges)+1 {
+		t.Fatalf("sources = %v", got)
+	}
+}
+
+func TestNoVPNFirewall_RFC1918SubnetKeepsTheStandardRule(t *testing.T) {
+	got := mgmtSources(t, func(e *provEnv) {
+		addSubnetCIDR(e, "proj-1", "us-central1", "default", "10.128.0.0/20")
+	})
+	if strings.Join(got, ",") != strings.Join(PrivateRanges, ",") {
+		t.Fatalf("a subnet inside RFC1918 must not change the rule (avoids recreating existing rules): %v", got)
+	}
+}
+
+func TestNoVPNFirewall_ExplicitRangesAreNeverWidened(t *testing.T) {
+	got := mgmtSources(t, func(e *provEnv) {
+		e.np.Spec.GCPConfig.FirewallSourceRanges = []string{"203.0.113.0/24"}
+		addSubnetCIDR(e, "proj-1", "us-central1", "default", "172.168.0.0/24")
+	})
+	if strings.Join(got, ",") != "203.0.113.0/24" {
+		t.Fatalf("explicit firewallSourceRanges must be used as given: %v", got)
+	}
+}
+
+func TestNoVPNFirewall_UnreadableSubnetFallsBackToRFC1918(t *testing.T) {
+	got := mgmtSources(t, nil) // no subnetwork registered in the fake: 404
+	if strings.Join(got, ",") != strings.Join(PrivateRanges, ",") {
+		t.Fatalf("sources = %v", got)
+	}
+}
+
+// Shared VPC: the subnetwork lives in the host project.
+func TestNoVPNFirewall_SharedVPCSubnetIsLookedUpInTheHostProject(t *testing.T) {
+	got := mgmtSources(t, func(e *provEnv) {
+		e.np.Spec.GCPConfig.Network = "projects/host/global/networks/shared"
+		e.np.Spec.GCPConfig.Subnetwork = "sub-h"
+		addSubnetCIDR(e, "host", "us-central1", "sub-h", "172.168.8.0/22")
+	})
+	if got[len(got)-1] != "172.168.8.0/22" {
+		t.Fatalf("sources = %v", got)
 	}
 }

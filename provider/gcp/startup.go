@@ -28,6 +28,17 @@ done
 report "Node IP is ${NODE_IP}"
 `
 
+// gceInstanceIDScript is the body of current_instance_id() on GCE: the instance's
+// numeric id from the metadata server (unique per VM, stable across restarts).
+const gceInstanceIDScript = `  local id="" i
+  for i in 1 2 3 4 5; do
+    id="$(curl -fsS -m 3 -H 'Metadata-Flavor: Google' http://169.254.169.254/computeMetadata/v1/instance/id 2>/dev/null || true)"
+    [[ -n "$id" ]] && break
+    sleep 2
+  done
+  printf '%s' "$id"
+`
+
 // StartupParams builds the bootstrap parameters of a NodeProvision: the AWS
 // mapping plus the GCE node-IP lookup and the "GCP" provider label.
 // wgConfig/vpnIP are empty in no-VPN mode.
@@ -35,6 +46,7 @@ func StartupParams(np *mlv1alpha1.NodeProvision, joinCommand, kubernetesVersion,
 	runtimeCfg pkgruntime.Config, wgConfig, vpnIP string) awsprovision.CloudInitParams {
 	p := awsprovision.BuildCloudInitParams(np, joinCommand, kubernetesVersion, kubernetesMinor, runtimeCfg)
 	p.NodeIPScript = gceNodeIPScript
+	p.InstanceIDScript = gceInstanceIDScript
 	p.ProviderLabel = string(mlv1alpha1.CloudProviderGCP)
 	if !np.Spec.DisableVPN {
 		p.WGConfig = wgConfig

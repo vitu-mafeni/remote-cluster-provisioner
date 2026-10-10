@@ -230,8 +230,9 @@ spec:
                     description: |-
                       FirewallSourceRanges are the CIDRs allowed to reach the node through the
                       per-node firewall rules (SSH, and kubelet/flannel without a VPN). Defaults
-                      to the RFC1918 private ranges: the controller and the control plane reach
-                      the node's internal address. With a VPN SSH travels inside the tunnel, so
+                      to the RFC1918 private ranges plus the node's own subnetwork range (so a VPC
+                      that is not RFC1918, e.g. 172.168.0.0/16, is not locked out): the controller
+                      and the control plane reach the node's internal address. With a VPN SSH travels inside the tunnel, so
                       the SSH rule is created only when this is set.
                     items:
                       type: string

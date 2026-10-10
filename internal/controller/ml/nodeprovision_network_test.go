@@ -154,3 +154,13 @@ func TestGCPDefaultsComplete_AcceptsAnImageOrASnapshot(t *testing.T) {
 		t.Error("a snapshot completes the defaults (no image is resolved for it)")
 	}
 }
+
+// ── SSH port ────────────────────────────────────────────────────────────────
+
+func TestEffectiveSSHPort(t *testing.T) {
+	for in, want := range map[int]int{0: 22, -1: 22, 70000: 22, 22: 22, 2222: 2222, 65535: 65535} {
+		if got := effectiveSSHPort(in); got != want {
+			t.Errorf("effectiveSSHPort(%d) = %d, want %d", in, got, want)
+		}
+	}
+}

@@ -66,6 +66,12 @@ type CloudInitParams struct {
 	// NODE_IP (non-empty) or `exit 1`, and use the report helper. Trusted,
 	// controller-authored text: never fill it from user input.
 	NodeIPScript string
+	// InstanceIDScript replaces the bash body of current_instance_id(), which
+	// prints this VM's unique instance id (nothing when unavailable). It lets the
+	// script tell a reboot of the same node from a NEW instance booted from an
+	// image or snapshot of a bootstrapped node. Empty selects the EC2 IMDSv2
+	// lookup. Trusted controller text, never user input.
+	InstanceIDScript string
 	// ProviderLabel is the value of the ml.dcn.ssu.ac.kr/provider kubelet label
 	// stamped on GPU nodes at registration (default "AWS"); it must equal what the
 	// NodeProvision controller stamps (Spec.Provider).
@@ -75,6 +81,19 @@ type CloudInitParams struct {
 const (
 	crioSocket = "/var/run/crio/crio.sock"
 )
+
+// defaultInstanceIDScript is the EC2 (IMDSv2) lookup of the instance id.
+const defaultInstanceIDScript = `  local id="" tok="" i
+  for i in 1 2 3 4 5; do
+    tok="$(curl -fsS -m 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)"
+    if [[ -n "$tok" ]]; then
+      id="$(curl -fsS -m 3 -H "X-aws-ec2-metadata-token: $tok" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
+    fi
+    [[ -n "$id" ]] && break
+    sleep 2
+  done
+  printf '%s' "$id"
+`
 
 // defaultNodeIPScript is the EC2 (IMDSv2) lookup of the private IPv4 used as the
 // kubelet node IP when no VPN is in use. Kept byte-for-byte identical to the
@@ -232,6 +251,7 @@ type templateData struct {
 	RuntimeInstallScript string // rendered by pkgruntime.InstallScript
 	NodeJoinedFunc       string // bash function node_already_joined (kubeadm.NodeAlreadyJoinedFunc)
 	NodeIPScript         string // NoVPN node-IP lookup; trusted controller text, see CloudInitParams.NodeIPScript
+	InstanceIDScript     string // current_instance_id body; trusted controller text, see CloudInitParams.InstanceIDScript
 	// InsecureRegistriesScript is the registries.conf.d drop-in writer
 	// (pkgruntime.InsecureRegistriesScript, run as root); empty when none.
 	InsecureRegistriesScript string
@@ -262,6 +282,17 @@ func nodeIPScript(p CloudInitParams) string {
 		return p.NodeIPScript
 	}
 	return defaultNodeIPScript
+}
+
+// instanceIDScript returns the instance-id lookup: the caller's, else the EC2 one.
+func instanceIDScript(p CloudInitParams) string {
+	if p.InstanceIDScript == "" {
+		return defaultInstanceIDScript
+	}
+	if !strings.HasSuffix(p.InstanceIDScript, "\n") {
+		return p.InstanceIDScript + "\n"
+	}
+	return p.InstanceIDScript
 }
 
 func renderBootstrapScript(p CloudInitParams) (string, error) {
@@ -305,6 +336,7 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 		RuntimeInstallScript: pkgruntime.InstallScript(runtimeCfg),
 		NodeJoinedFunc:       kubeadm.NodeAlreadyJoinedFunc,
 		NodeIPScript:         nodeIPScript(p),
+		InstanceIDScript:     instanceIDScript(p),
 
 		InsecureRegistriesScript: pkgruntime.InsecureRegistriesScript(p.InsecureRegistries, false),
 	}
@@ -322,7 +354,13 @@ set -Eeuo pipefail
 LOG=/var/log/node-bootstrap.log
 STATUS_FILE=/var/lib/node-bootstrap-status
 COMPLETE_FILE=/var/lib/node-bootstrap-complete
-LOCK_FILE=/var/lock/node-bootstrap.lock
+INSTANCE_FILE=/var/lib/node-bootstrap-instance
+K8S_DIR=/etc/kubernetes
+KUBELET_DIR=/var/lib/kubelet
+KUBELET_DEFAULTS=/etc/default/kubelet
+CNI_DIR=/etc/cni/net.d
+{{if not .NoVPN}}WG_CONF=/etc/wireguard/wg0.conf
+{{end}}LOCK_FILE=/var/lock/node-bootstrap.lock
 
 mkdir -p /var/log /var/lib
 exec > >(tee -a "$LOG") 2>&1
@@ -360,11 +398,6 @@ trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 exec 9>"$LOCK_FILE"
 flock -n 9 || { report "Another bootstrap process is already running"; exit 0; }
 
-if [[ -f "$COMPLETE_FILE" ]]; then
-  report "Bootstrap already completed; nothing to do"
-  exit 0
-fi
-
 K8S_VERSION="{{.KubernetesVersion}}"
 K8S_MINOR="{{.KubernetesMinor}}"
 CRIO_SOCKET="{{.CRIOSocket}}"
@@ -373,6 +406,80 @@ NODE_NAME="{{.NodeName}}"
 
 report "Bootstrap started"
 report "Kubernetes version: v${K8S_VERSION}; repo: ${K8S_MINOR}"
+
+# -----------------------------------------------------------------------------
+# Completed bootstrap / state inherited from a custom image or snapshot
+# -----------------------------------------------------------------------------
+# An image or snapshot made from an already bootstrapped node carries its
+# completion marker, kubelet identity and join state. Booting a NEW instance from
+# it must not be mistaken for "already done": that state is reset first. A reboot
+# of the same instance (same instance id, same kubelet identity) is left alone.
+# BEGIN image-state
+current_instance_id() {
+{{.InstanceIDScript}}}
+
+# kubelet_client_cn prints the CN of kubelet.conf's client certificate
+# ("system:node:<name>"), or nothing when it cannot be determined.
+kubelet_client_cn() {
+  local kc="${CNLAB_KUBELET_CONF:-$K8S_DIR/kubelet.conf}" pem="" data=""
+  [[ -f "$kc" ]] || return 0
+  command -v openssl >/dev/null 2>&1 || return 0
+  pem="$(awk '$1=="client-certificate:" {print $2; exit}' "$kc")"
+  data="$(awk '$1=="client-certificate-data:" {print $2; exit}' "$kc")"
+  if [[ -n "$pem" && -f "$pem" ]]; then
+    openssl x509 -in "$pem" -noout -subject -nameopt RFC2253 2>/dev/null
+  elif [[ -n "$data" ]]; then
+    printf '%s' "$data" | base64 -d 2>/dev/null | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null
+  fi | grep -o 'CN=[^,]*' | head -1 | cut -d= -f2-
+}
+
+# stale_node_state succeeds, setting STALE_REASON, when this disk carries the
+# bootstrap/join state of a different instance or node.
+stale_node_state() {
+  local cur rec cn want
+  STALE_REASON=""
+  cur="$(current_instance_id)"
+  rec="$(cat "$INSTANCE_FILE" 2>/dev/null || true)"
+  if [[ -n "$cur" && -n "$rec" && "$cur" != "$rec" ]]; then
+    STALE_REASON="the disk was bootstrapped by instance ${rec}, this is ${cur}"
+    return 0
+  fi
+  cn="$(kubelet_client_cn || true)"
+  want="${NODE_NAME:-$(hostname)}"
+  want="${want,,}"
+  if [[ -n "$cn" && "${cn,,}" != "system:node:${want}" ]]; then
+    STALE_REASON="kubelet.conf belongs to ${cn}, this node is ${want}"
+    return 0
+  fi
+  return 1
+}
+
+reset_stale_node_state() {
+  systemctl stop kubelet >/dev/null 2>&1 || true
+  if command -v kubeadm >/dev/null 2>&1; then
+    kubeadm reset --force --cri-socket="unix://${CRIO_SOCKET}" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$K8S_DIR" "$KUBELET_DIR"
+  rm -f "$KUBELET_DEFAULTS" "$CNI_DIR"/*flannel* 2>/dev/null || true
+  rm -f "$COMPLETE_FILE" "$STATUS_FILE" "$INSTANCE_FILE"
+{{if not .NoVPN}}  systemctl disable --now wg-quick@wg0 >/dev/null 2>&1 || true
+  rm -f "$WG_CONF"
+{{end}}}
+
+if stale_node_state; then
+  report "This disk carries bootstrap/join state of another node (${STALE_REASON}): an image or snapshot made from a bootstrapped node. Resetting it before bootstrapping this one"
+  reset_stale_node_state
+fi
+
+CURRENT_INSTANCE_ID="$(current_instance_id)"
+if [[ -f "$COMPLETE_FILE" ]]; then
+  # Remember which instance this is, so a later image of it is recognised.
+  [[ -s "$INSTANCE_FILE" || -z "$CURRENT_INSTANCE_ID" ]] || printf '%s\n' "$CURRENT_INSTANCE_ID" > "$INSTANCE_FILE"
+  report "Bootstrap already completed; nothing to do"
+  exit 0
+fi
+[[ -z "$CURRENT_INSTANCE_ID" ]] || printf '%s\n' "$CURRENT_INSTANCE_ID" > "$INSTANCE_FILE"
+# END image-state
 
 # -----------------------------------------------------------------------------
 # Validation and helpers

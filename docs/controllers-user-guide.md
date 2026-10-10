@@ -701,7 +701,7 @@ spec:
   hardwareType: gpu
   gcpConfig:
     zone: europe-west4-a
-    firewallSourceRanges: ["172.20.0.0/16"]   # the control plane / controller (default: RFC1918)
+    firewallSourceRanges: ["172.20.0.0/16"]   # the control plane / controller (default: RFC1918 + the node's subnet)
   credentialsRef:
     name: gcp-node-credentials
 ```
@@ -722,7 +722,7 @@ owns the driver, container toolkit and CDI (leave Secure Boot off, the default, 
 |---|---|---|
 | VPN | `wg` | UDP `vpnPort` (default 51820) **from the VPN server's IP only** |
 | VPN | `ssh` (only if `firewallSourceRanges` is set) | TCP 22 from those ranges — with a VPN, SSH travels inside the tunnel |
-| no VPN | `mgmt` | TCP 22, TCP 10250 (kubelet), UDP 8472 (flannel VXLAN) and ICMP from `firewallSourceRanges` (default RFC1918) |
+| no VPN | `mgmt` | TCP 22, TCP 10250 (kubelet), UDP 8472 (flannel VXLAN) and ICMP from `firewallSourceRanges` (default: RFC1918 **plus the node's own subnetwork range**, so a VPC outside RFC1918 such as `172.168.0.0/16` works) |
 
 If the service account may not create firewall rules the controller logs a warning and carries on
 (rules managed centrally); pre-create equivalent rules in that case.
@@ -768,6 +768,31 @@ instance of the same name that belongs to something else is never adopted or del
   apt and systemd). The service account needs read access (`compute.images.get` /
   `compute.snapshots.get`; `compute.imageUser` for images in another project). A snapshot's OS cannot
   be checked before boot, so this is documented rather than enforced.
+
+**Preparing a custom image or snapshot (AWS and GCP)**
+
+- **Base and agents.** Start from Ubuntu 20.04+. On **GCP** the bootstrap is delivered as
+  `startup-script` metadata and run by the **Google guest agent** (`google-guest-agent`,
+  `google-startup-scripts.service`) on every boot — *not* by cloud-init, so cloud-init logs (which
+  will show "no user-data") say nothing about it. An image without the guest environment never runs
+  the script and the node stays in `Bootstrapping`. On **AWS** the bootstrap is cloud-init user-data,
+  so cloud-init must be enabled.
+- **Images of bootstrapped nodes are fine.** The script records the instance that bootstrapped the
+  disk (`/var/lib/node-bootstrap-instance`). When a *new* instance boots from an image or snapshot of
+  a node that already joined, it detects the inherited state — a different recorded instance, or a
+  `kubelet.conf` client certificate for another node — and resets it first (`kubeadm reset`, removes
+  `/etc/kubernetes`, `/var/lib/kubelet`, the completion marker and, with a VPN, the old `wg0`
+  config) before bootstrapping. A reboot of the same node is never reset, and nodes bootstrapped by
+  older versions are recognised by their kubelet identity. Before this check existed, such a disk
+  stopped at "Bootstrap already completed; nothing to do" and the node never registered.
+- **Recommended cleanup before imaging**: `sudo kubeadm reset -f`, `sudo rm -f /var/lib/node-bootstrap-*`,
+  `sudo cloud-init clean --logs` and `sudo truncate -s 0 /etc/machine-id` (so every node gets its own
+  machine id). Do not bake in VPN keys or registry tokens.
+- **If a node never joins**, on the node: `sudo cat /var/lib/node-bootstrap-status` and
+  `sudo tail -100 /var/log/node-bootstrap.log`. If neither exists the script never ran: on GCP check
+  `systemctl status google-guest-agent` and `sudo journalctl -u google-startup-scripts.service`
+  (or `gcloud compute instances get-serial-port-output <name> --zone <zone>`); on AWS check
+  `/var/log/cloud-init-output.log`.
 
 ---
 
@@ -1108,6 +1133,9 @@ INFO  RemoteCluster cleanup complete
 | `spec.awsConfig.subnetId … belongs to VPC …` / `security group … belongs to VPC …` | `vpcId`, `subnetId` and `securityGroupIds` point at different VPCs | Make them agree (the subnet decides the VPC) |
 | `sourceSnapshot cannot be combined with sourceImage, imageFamily or imageProject` (GCP) | Two boot sources set | Keep only one |
 | `subnetwork … belongs to network …` / `is in region …` (GCP) | `gcpConfig.subnetwork` does not match `network` or the instance's region | Fix `network`/`subnetwork`, or drop `network` to derive it from the subnetwork |
+| GCP node stuck in `Bootstrapping`; no `/var/log/node-bootstrap.log`; cloud-init shows no user-data | GCP runs the bootstrap from `startup-script` metadata via the Google guest agent, not cloud-init; a custom image without the guest environment never runs it | Install/enable `google-guest-agent` in the image; check `sudo journalctl -u google-startup-scripts.service` |
+| Node booted from a custom image/snapshot of a joined node never registers; log says `Bootstrap already completed; nothing to do` | The image carried the old node's completion marker and kubelet identity | Use a controller version with the image-state reset (it detects and clears inherited state); see "Preparing a custom image or snapshot" in [§5.4](#54-nodeprovision-on-google-cloud-gcp) |
+| `opening SSH connection for credential sync … dial tcp <ip>:0: connection refused` | `spec.sshPort` is unset on cloud nodes and was dialled as port 0 | Fixed: the port now defaults to 22 |
 | Registry pull returns `unauthorized` | Registry credentials missing/empty in the cluster's shared config | Apply the registry credentials Secret (or re-apply the sample, which includes it) |
 | Networking plugins missing after cluster install | An install step was interrupted | Manually install the CNI plugins bundle (`v1.5.1`) to `/opt/cni/bin` on the affected node |
 | GitOps platform resources not appearing / stuck | The platform hasn't synced the new cluster's repository yet, or a stale resource exists from a previous attempt | Check your Nephio/Porch resources; delete stale ones to force re-creation |

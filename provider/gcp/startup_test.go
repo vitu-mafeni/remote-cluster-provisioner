@@ -71,7 +71,9 @@ func TestBuildStartupScript_VPN(t *testing.T) {
 			t.Errorf("VPN GCE script missing %q", wanted)
 		}
 	}
-	for _, unwanted := range []string{"computeMetadata", "Metadata-Flavor", "meta-data/local-ipv4"} {
+	// The instance id (image-state detection) may use the metadata server; the
+	// NODE IP must not.
+	for _, unwanted := range []string{"network-interfaces/0/ip", "meta-data/local-ipv4"} {
 		if strings.Contains(script, unwanted) {
 			t.Errorf("VPN GCE script must not resolve the node IP from a metadata server (%q)", unwanted)
 		}

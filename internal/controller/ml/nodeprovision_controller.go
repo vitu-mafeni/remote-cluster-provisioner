@@ -2822,10 +2822,23 @@ func resolveSecretKey(secret *corev1.Secret, key string) ([]byte, error) {
 
 // dialSSH auto-detects the auth method from the credential value.
 func dialSSH(host string, port int, user, credential string) (*ssh.Client, error) {
+	port = effectiveSSHPort(port)
 	if strings.HasPrefix(strings.TrimSpace(credential), "-----BEGIN") {
 		return ssh.ConnectWithPrivateKey(host, port, user, credential)
 	}
 	return ssh.Connect(host, port, user, credential)
+}
+
+// defaultSSHPort is used when spec.sshPort is unset. Cloud nodes (AWS, GCP)
+// never set it, and dialling "host:0" is always refused.
+const defaultSSHPort = 22
+
+// effectiveSSHPort returns port, or the default SSH port when it is unset or invalid.
+func effectiveSSHPort(port int) int {
+	if port <= 0 || port > 65535 {
+		return defaultSSHPort
+	}
+	return port
 }
 
 func ensureFinalizer(np *mlv1alpha1.NodeProvision, finalizer string) bool {

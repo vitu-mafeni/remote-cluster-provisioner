@@ -14,8 +14,9 @@ import (
 // encoded authorization failure blob.
 var (
 	reARN = regexp.MustCompile(`arn:aws[a-z-]*:[a-z0-9-]*:[a-z0-9-]*:[0-9]{0,12}:[^\s,;"')\]]+`)
-	// "RequestID: <id>", "request id: <id>", "Request ID <id>".
-	reRequestID = regexp.MustCompile(`(?i)(\brequest[ _-]?id[:=]?\s+)[A-Za-z0-9-]+`)
+	// "RequestID: <id>", "request id: <id>", "request-id=<id>". The separator is
+	// required so ordinary prose ("request id is required") is left alone.
+	reRequestID = regexp.MustCompile(`(?i)(\brequest[ _-]?id\s*[:=]\s*)[A-Za-z0-9-]+`)
 	// "Encoded authorization failure message: <blob>".
 	reEncodedAuth = regexp.MustCompile(`(?i)(encoded authorization failure message:?\s+)\S+`)
 	// "account 123456789012", "account id: 123456789012", "account-id=123456789012".

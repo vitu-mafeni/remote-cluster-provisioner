@@ -620,7 +620,8 @@ func TestRedactIdentifiers(t *testing.T) {
 	for in, banned := range map[string][]string{
 		leakyMsg: {"123456789012", "arn:aws", "alice", "AbCdEf0123456789"},
 		"operation error EC2: DescribeSubnets, https response error StatusCode: 403, RequestID: 5f1c2d3e-aaaa-bbbb-cccc-0123456789ab, api error": {"5f1c2d3e"},
-		"Request ID 0123456789ABCDEF failed":         {"0123456789ABCDEF"},
+		"Request ID: 0123456789ABCDEF failed":        {"0123456789ABCDEF"},
+		"request-id=0123456789ABCDEF failed":         {"0123456789ABCDEF"},
 		"denied for account 123456789012":            {"123456789012"},
 		"account-id=123456789012":                    {"123456789012"},
 		"key AKIAABCDEFGHIJKLMNOP rejected":          {"AKIAABCDEFGHIJKLMNOP"},
@@ -643,6 +644,7 @@ func TestRedactIdentifiers(t *testing.T) {
 		"vpc-0123456789abcdef0 is not available",
 		"started at 202610102333 and ended", // bare 12 digits, no account context
 		"request failed: connection refused",
+		"request id is required for this call",
 	} {
 		if got := RedactIdentifiers(keep); got != keep {
 			t.Errorf("over-redacted: %q -> %q", keep, got)
