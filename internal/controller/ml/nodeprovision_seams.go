@@ -44,7 +44,9 @@ import (
 type awsAPI struct {
 	FindInstanceID    func(ctx context.Context, np *mlv1alpha1.NodeProvision, creds awsprovision.AWSCredentials) (string, error)
 	TerminateInstance func(ctx context.Context, np *mlv1alpha1.NodeProvision, creds awsprovision.AWSCredentials, instanceID string) error
-	ProvisionEC2Node  func(ctx context.Context, np *mlv1alpha1.NodeProvision, creds awsprovision.AWSCredentials,
+	// VerifyControlPlaneInVPC is the no-VPN guard (nil = the real check).
+	VerifyControlPlaneInVPC func(ctx context.Context, region string, creds awsprovision.AWSCredentials, vpcID, subnetID, host string) error
+	ProvisionEC2Node        func(ctx context.Context, np *mlv1alpha1.NodeProvision, creds awsprovision.AWSCredentials,
 		vpn *ssh.Client, nc *mlv1alpha1.NodeProvisionNetConfig, rt pkgruntime.Config) (*awsprovision.ProvisionResult, error)
 }
 
@@ -56,6 +58,9 @@ func (r *NodeProvisionReconciler) aws() awsAPI {
 	}
 	if a.TerminateInstance == nil {
 		a.TerminateInstance = awsprovision.TerminateInstance
+	}
+	if a.VerifyControlPlaneInVPC == nil {
+		a.VerifyControlPlaneInVPC = awsprovision.VerifyControlPlaneInVPC
 	}
 	if a.ProvisionEC2Node == nil {
 		a.ProvisionEC2Node = awsprovision.ProvisionEC2Node

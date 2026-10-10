@@ -475,117 +475,10 @@ func TerminateInstance(
 	return nil
 }
 
-// NetworkConfig holds the resolved AWS network identifiers.
-type NetworkConfig struct {
-	VPCID           string
-	SubnetID        string
-	SecurityGroupID string
-}
-
-// ResolveOrCreateNetworkConfig checks the region for a default VPC.
-// If one exists its first available subnet and default security group are
-// returned.  If no default VPC exists one is created first, which also
-// automatically creates default subnets and a default security group.
-// The returned NetworkConfig can then be used to populate AWSConfig fields
-// that the user left unset.
-//
-// includeWireGuard controls whether the default security group is opened for
-// WireGuard (UDP 51820); pass false for clusters that run without a VPN.
-func ResolveOrCreateNetworkConfig(ctx context.Context, region string, creds AWSCredentials, includeWireGuard bool) (*NetworkConfig, error) {
-	client, err := newEC2Client(ctx, region, creds)
-	if err != nil {
-		return nil, fmt.Errorf("creating EC2 client: %w", err)
-	}
-
-	// ── VPC ──────────────────────────────────────────────────────────────────
-	vpcID, err := ensureDefaultVPC(ctx, client, region)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[INFO] Network resolution: using VPC %s in %s", vpcID, region)
-
-	// ── Subnet ───────────────────────────────────────────────────────────────
-	subnetID, err := resolveDefaultSubnet(ctx, client, vpcID)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[INFO] Network resolution: using subnet %s", subnetID)
-
-	// ── Security group ────────────────────────────────────────────────────────
-	sgID, err := resolveDefaultSecurityGroup(ctx, client, vpcID, includeWireGuard)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[INFO] Network resolution: using security group %s", sgID)
-
-	return &NetworkConfig{
-		VPCID:           vpcID,
-		SubnetID:        subnetID,
-		SecurityGroupID: sgID,
-	}, nil
-}
-
-// ensureDefaultVPC returns the ID of the region's default VPC, creating one
-// if it does not yet exist.
-func ensureDefaultVPC(ctx context.Context, client *ec2.Client, region string) (string, error) {
-	out, err := client.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{
-		Filters: []types.Filter{
-			{Name: awssdk.String("isDefault"), Values: []string{"true"}},
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("describing VPCs in %s: %w", region, err)
-	}
-	if len(out.Vpcs) > 0 {
-		return awssdk.ToString(out.Vpcs[0].VpcId), nil
-	}
-
-	log.Printf("[INFO] Network resolution: no default VPC in %s, creating one", region)
-	created, err := client.CreateDefaultVpc(ctx, &ec2.CreateDefaultVpcInput{})
-	if err != nil {
-		return "", fmt.Errorf("creating default VPC in %s: %w", region, err)
-	}
-	if created.Vpc == nil {
-		return "", fmt.Errorf("CreateDefaultVpc returned nil Vpc in %s", region)
-	}
-	return awssdk.ToString(created.Vpc.VpcId), nil
-}
-
-// resolveDefaultSubnet returns the first available subnet in the given VPC.
-// Default subnets are preferred; if none are found any subnet is accepted.
-func resolveDefaultSubnet(ctx context.Context, client *ec2.Client, vpcID string) (string, error) {
-	out, err := client.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
-		Filters: []types.Filter{
-			{Name: awssdk.String("vpc-id"), Values: []string{vpcID}},
-			{Name: awssdk.String("defaultForAz"), Values: []string{"true"}},
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("describing subnets for VPC %s: %w", vpcID, err)
-	}
-	if len(out.Subnets) > 0 {
-		return awssdk.ToString(out.Subnets[0].SubnetId), nil
-	}
-
-	// Fall back to any subnet in the VPC.
-	all, err := client.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
-		Filters: []types.Filter{
-			{Name: awssdk.String("vpc-id"), Values: []string{vpcID}},
-		},
-	})
-	if err != nil {
-		return "", fmt.Errorf("describing subnets for VPC %s: %w", vpcID, err)
-	}
-	if len(all.Subnets) == 0 {
-		return "", fmt.Errorf("no subnets found in VPC %s", vpcID)
-	}
-	return awssdk.ToString(all.Subnets[0].SubnetId), nil
-}
-
 // resolveDefaultSecurityGroup returns the ID of the VPC's default security group
-// and ensures it has inbound rules for SSH (TCP 22) and, when includeWireGuard
+// and, when manageRules is set, ensures it has inbound rules for SSH (TCP 22) and, when includeWireGuard
 // is set, WireGuard (UDP 51820).
-func resolveDefaultSecurityGroup(ctx context.Context, client *ec2.Client, vpcID string, includeWireGuard bool) (string, error) {
+func resolveDefaultSecurityGroup(ctx context.Context, client ec2NetworkAPI, vpcID string, includeWireGuard, manageRules bool) (string, error) {
 	out, err := client.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
 		Filters: []types.Filter{
 			{Name: awssdk.String("vpc-id"), Values: []string{vpcID}},
@@ -593,13 +486,16 @@ func resolveDefaultSecurityGroup(ctx context.Context, client *ec2.Client, vpcID 
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("describing security groups for VPC %s: %w", vpcID, err)
+		return "", apiErrorf(err, "describing security groups for VPC %s", vpcID)
 	}
 	if len(out.SecurityGroups) == 0 {
 		return "", fmt.Errorf("no default security group found in VPC %s", vpcID)
 	}
 	sgID := awssdk.ToString(out.SecurityGroups[0].GroupId)
 	sg := out.SecurityGroups[0]
+	if !manageRules {
+		return sgID, nil
+	}
 	if err := ensureNodeIngressRules(ctx, client, sgID, sg.IpPermissions, includeWireGuard); err != nil {
 		log.Printf("[WARN] Security group %s: could not ensure ingress rules: %v", sgID, err)
 	}
@@ -625,7 +521,7 @@ func requiredIngressRules(includeWireGuard bool) []ingressRule {
 // ensureNodeIngressRules adds TCP 22 (SSH) and UDP 51820 (WireGuard) ingress rules
 // to the security group if they are not already present.  Existing rules are never
 // removed.  Duplicate-rule errors from AWS are silently ignored.
-func ensureNodeIngressRules(ctx context.Context, client *ec2.Client, sgID string, existing []types.IpPermission, includeWireGuard bool) error {
+func ensureNodeIngressRules(ctx context.Context, client ec2NetworkAPI, sgID string, existing []types.IpPermission, includeWireGuard bool) error {
 	present := make(map[ingressRule]bool)
 	for _, perm := range existing {
 		if perm.FromPort == nil || perm.ToPort == nil || perm.IpProtocol == nil {
@@ -664,7 +560,7 @@ func ensureNodeIngressRules(ctx context.Context, client *ec2.Client, sgID string
 		IpPermissions: toAdd,
 	})
 	if err != nil && !strings.Contains(err.Error(), "InvalidPermission.Duplicate") {
-		return fmt.Errorf("authorizing ingress on %s: %w", sgID, err)
+		return apiErrorf(err, "authorizing ingress on %s", sgID)
 	}
 	for _, r := range toAdd {
 		log.Printf("[WARN] Security group %s: added WORLD-OPEN ingress rule %s/%d from 0.0.0.0/0 (the VPC's default security group is shared; restrict it if this is not intended)",
@@ -974,7 +870,7 @@ func buildRunInstancesInput(np *mlv1alpha1.NodeProvision, userDataB64 string) *e
 			{
 				DeviceIndex:              awssdk.Int32(0),
 				SubnetId:                 awssdk.String(np.Spec.AWSConfig.SubnetID),
-				AssociatePublicIpAddress: awssdk.Bool(true),
+				AssociatePublicIpAddress: awssdk.Bool(!np.Spec.AWSConfig.DisablePublicIP),
 			},
 		},
 		// IMDSv2 only: user-data carries the registry token and VPN private key,

@@ -35,6 +35,7 @@ type fakeCompute struct {
 	instances map[string]*computepb.Instance // key zone/name
 	firewalls map[string]*computepb.Firewall
 	networks  map[string]*computepb.Network
+	subnets   map[string]*computepb.Subnetwork // key project/region/name
 	zones     []*computepb.Zone
 	machines  map[string]bool // zone/type available
 	accels    map[string]bool // zone/type available
@@ -67,6 +68,7 @@ func newFakeCompute() *fakeCompute {
 		networks: map[string]*computepb.Network{
 			"default": {Name: proto.String("default"), AutoCreateSubnetworks: proto.Bool(true)},
 		},
+		subnets:  map[string]*computepb.Subnetwork{},
 		machines: map[string]bool{},
 		accels:   map[string]bool{},
 		images: map[string]*computepb.Image{
@@ -186,6 +188,15 @@ func (f *fakeCompute) GetNetwork(_ context.Context, _, name string) (*computepb.
 		return n, nil
 	}
 	return nil, gerr(404, "notFound", "network not found")
+}
+
+func (f *fakeCompute) GetSubnetwork(_ context.Context, project, region, name string) (*computepb.Subnetwork, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if sn, ok := f.subnets[project+"/"+region+"/"+name]; ok {
+		return sn, nil
+	}
+	return nil, gerr(404, "notFound", "subnetwork not found")
 }
 
 func (f *fakeCompute) ListZones(_ context.Context, _, region string) ([]*computepb.Zone, error) {

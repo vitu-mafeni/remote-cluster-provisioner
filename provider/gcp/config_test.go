@@ -293,6 +293,7 @@ func TestResolveDefaults_MinimalSpecGetsEverything(t *testing.T) {
 func TestResolveDefaults_NeverOverwritesUserValues(t *testing.T) {
 	f := newFakeCompute()
 	f.networks["vpc-x"] = &computepb.Network{Name: proto.String("vpc-x"), AutoCreateSubnetworks: proto.Bool(false)}
+	addSubnet(f, "mine", "us-east1", "sub-x", "mine", "vpc-x")
 	f.machines["us-east1-b/n2-standard-4"] = true
 	useFake(t, f)
 
@@ -494,5 +495,112 @@ func TestResolveDefaults_ImageFamilyOverride(t *testing.T) {
 	}))
 	if err != nil || res.Config.SourceImage != "projects/my-images/global/images/golden-v2" {
 		t.Errorf("got %+v err=%v", res, err)
+	}
+}
+
+// addSubnet registers a PRIVATE, READY subnetwork of network (in netProject).
+func addSubnet(f *fakeCompute, project, region, name, netProject, network string) *computepb.Subnetwork {
+	sn := &computepb.Subnetwork{
+		Name:    proto.String(name),
+		Network: proto.String("https://www.googleapis.com/compute/v1/projects/" + netProject + "/global/networks/" + network),
+		Purpose: proto.String("PRIVATE"),
+		State:   proto.String("READY"),
+	}
+	f.subnets[project+"/"+region+"/"+name] = sn
+	return sn
+}
+
+func subnetNP(network, subnetwork string) *mlv1alpha1.NodeProvision {
+	return resolveNP(func(np *mlv1alpha1.NodeProvision) {
+		np.Spec.Region = "us-east1"
+		np.Spec.InstanceType = "n2-standard-4"
+		np.Spec.GCPConfig = &mlv1alpha1.GCPConfig{Network: network, Subnetwork: subnetwork}
+	})
+}
+
+func subnetFake(t *testing.T) *fakeCompute {
+	t.Helper()
+	f := newFakeCompute()
+	f.networks["custom"] = &computepb.Network{Name: proto.String("custom"), AutoCreateSubnetworks: proto.Bool(false)}
+	f.networks["other"] = &computepb.Network{Name: proto.String("other"), AutoCreateSubnetworks: proto.Bool(false)}
+	f.machines["us-east1-b/n2-standard-4"] = true
+	f.machines["us-east1-c/n2-standard-4"] = true
+	f.zones = append(f.zones, &computepb.Zone{Name: proto.String("us-east1-b"), Status: proto.String("UP")})
+	useFake(t, f)
+	return f
+}
+
+func TestResolveDefaults_SubnetworkAloneDerivesNetwork(t *testing.T) {
+	f := subnetFake(t)
+	addSubnet(f, "proj-1", "us-east1", "sub-1", "proj-1", "custom")
+	res, err := ResolveDefaults(context.Background(), testCreds(), subnetNP("", "sub-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Config.Network != "projects/proj-1/global/networks/custom" || res.Config.Subnetwork != "sub-1" {
+		t.Errorf("network must come from the subnetwork, got %q / %q", res.Config.Network, res.Config.Subnetwork)
+	}
+}
+
+func TestResolveDefaults_SharedVPCSubnetworkForms(t *testing.T) {
+	f := subnetFake(t)
+	addSubnet(f, "host", "us-east1", "shared-sub", "host", "shared")
+	f.networks["shared"] = &computepb.Network{Name: proto.String("shared"), AutoCreateSubnetworks: proto.Bool(false)}
+	for _, tc := range []struct{ name, network, sub string }{
+		{"bare name, host network", "projects/host/global/networks/shared", "shared-sub"},
+		{"short path, host network", "projects/host/global/networks/shared", "regions/us-east1/subnetworks/shared-sub"},
+		{"full path, no network", "", "projects/host/regions/us-east1/subnetworks/shared-sub"},
+		{"full URL, no network", "", "https://www.googleapis.com/compute/v1/projects/host/regions/us-east1/subnetworks/shared-sub"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := ResolveDefaults(context.Background(), testCreds(), subnetNP(tc.network, tc.sub))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Config.Network != "projects/host/global/networks/shared" {
+				t.Errorf("network = %q", res.Config.Network)
+			}
+		})
+	}
+}
+
+func TestResolveDefaults_SubnetworkErrors(t *testing.T) {
+	f := subnetFake(t)
+	addSubnet(f, "proj-1", "us-east1", "sub-1", "proj-1", "custom")
+	addSubnet(f, "proj-1", "us-west1", "west", "proj-1", "custom")
+	addSubnet(f, "proj-1", "us-east1", "proxy", "proj-1", "custom").Purpose = proto.String("REGIONAL_MANAGED_PROXY")
+	f.subnets["proj-1/us-east1/proxy"].Purpose = proto.String("REGIONAL_MANAGED_PROXY")
+	addSubnet(f, "proj-1", "us-east1", "drain", "proj-1", "custom").State = proto.String("DRAINING")
+	for _, tc := range []struct{ name, network, sub, want string }{
+		{"not found", "", "nope", "not found in project"},
+		{"wrong region", "", "projects/proj-1/regions/us-west1/subnetworks/west", "is in region"},
+		{"network mismatch", "other", "sub-1", "belongs to network projects/proj-1/global/networks/custom"},
+		{"proxy-only purpose", "", "proxy", "only PRIVATE"},
+		{"draining", "", "drain", "not ready"},
+		{"malformed", "", "a/b/c", "not a subnetwork name"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ResolveDefaults(context.Background(), testCreds(), subnetNP(tc.network, tc.sub))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseSubnetworkRef(t *testing.T) {
+	for _, tc := range []struct{ in, p, r, n string }{
+		{"s", "dp", "dr", "s"},
+		{"regions/r1/subnetworks/s", "dp", "r1", "s"},
+		{"projects/p1/regions/r1/subnetworks/s", "p1", "r1", "s"},
+		{"https://www.googleapis.com/compute/v1/projects/p1/regions/r1/subnetworks/s", "p1", "r1", "s"},
+	} {
+		p, r, n, err := ParseSubnetworkRef("dp", "dr", tc.in)
+		if err != nil || p != tc.p || r != tc.r || n != tc.n {
+			t.Errorf("%q -> %q %q %q %v", tc.in, p, r, n, err)
+		}
+	}
+	if _, _, _, err := ParseSubnetworkRef("dp", "dr", ""); err == nil {
+		t.Error("empty ref must fail")
 	}
 }

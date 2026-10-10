@@ -106,9 +106,10 @@ func truncateMessage(s string, max int) string {
 	return s[:cut] + marker
 }
 
-// sanitizeStatusMessage redacts secrets and bounds the length.
+// sanitizeStatusMessage redacts secrets and cloud account identifiers (AWS ARNs,
+// account and request IDs from raw SDK errors) and bounds the length.
 func sanitizeStatusMessage(s string) string {
-	return truncateMessage(redactSecrets(s), statusMessageMaxLen)
+	return truncateMessage(awsprovision.RedactIdentifiers(redactSecrets(s)), statusMessageMaxLen)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

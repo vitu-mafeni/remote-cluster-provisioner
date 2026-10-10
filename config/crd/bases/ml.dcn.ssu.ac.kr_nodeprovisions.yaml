@@ -46,6 +46,13 @@ spec:
                   ami:
                     description: AMI ID to use for the instance.
                     type: string
+                  disablePublicIp:
+                    description: |-
+                      DisablePublicIP launches the instance without a public IPv4 address, for
+                      private subnets. The node then needs an egress path (NAT gateway, transit
+                      gateway, ...) for package/image downloads and, with a VPN, to reach the VPN
+                      server. Default false: the instance gets a public IP.
+                    type: boolean
                   iamInstanceProfile:
                     description: IAM instance profile name or ARN for the instance.
                     type: string
@@ -61,12 +68,27 @@ spec:
                     format: int32
                     type: integer
                   securityGroupIds:
-                    description: Security group IDs to attach to the instance.
+                    description: |-
+                      Security group IDs to attach to the instance; they must all be in the
+                      instance's VPC. When vpcId and subnetId are unset, the VPC is taken from
+                      these groups. When empty, the default security group of the resolved VPC is
+                      used: if the controller chose the whole network (nothing set here, vpcId
+                      or subnetId) it opens SSH, and WireGuard when the VPN is enabled, on that
+                      group; for a VPC or subnet you named it leaves the group's rules untouched.
                     items:
                       type: string
                     type: array
+                  skipControlPlaneVpcCheck:
+                    description: |-
+                      SkipControlPlaneVPCCheck turns off the no-VPN guard that fails a node whose
+                      VPC does not contain the control plane's (private) API endpoint. Without a
+                      VPN every node must be able to route to the control plane; set this only
+                      when it is reachable by VPC peering or a transit gateway.
+                    type: boolean
                   subnetId:
-                    description: Subnet ID for the instance's primary network interface.
+                    description: |-
+                      Subnet ID for the instance's primary network interface. Determines the VPC
+                      when vpcId is unset. Must be in spec.region.
                     type: string
                   tags:
                     additionalProperties:
@@ -74,7 +96,11 @@ spec:
                     description: Additional tags to apply to created AWS resources.
                     type: object
                   vpcId:
-                    description: VPC ID where the instance will be launched.
+                    description: |-
+                      VPC ID where the instance will be launched, e.g. "vpc-0123456789abcdef0".
+                      When subnetId is also set it must be that subnet's VPC. When only vpcId is
+                      set, a subnet of this VPC is chosen. When neither is set the region's
+                      default VPC is used (and created if the region has none).
                     type: string
                 type: object
               clusterName:
@@ -198,8 +224,10 @@ spec:
                       labels cannot be overridden.
                     type: object
                   network:
-                    description: Network is the VPC network name (or full resource
-                      URL). Defaults to "default".
+                    description: |-
+                      Network is the VPC network name or "projects/<host>/global/networks/<n>"
+                      (Shared VPC). When unset it is taken from subnetwork if that is set,
+                      otherwise "default". If both are set the subnetwork must belong to it.
                     type: string
                   networkTags:
                     description: NetworkTags are extra network tags for the instance
@@ -237,8 +265,9 @@ spec:
                     type: boolean
                   subnetwork:
                     description: |-
-                      Subnetwork is the subnetwork name (or full resource URL) in the instance's
-                      region. Required for custom-mode networks; optional for auto-mode ones.
+                      Subnetwork is a subnetwork name (in the network's project), or
+                      "regions/<r>/subnetworks/<n>", "projects/<p>/regions/<r>/subnetworks/<n>"
+                      or a full URL. It must be in the instance's region and PRIVATE. Required for custom-mode networks; optional for auto-mode ones.
                     type: string
                   zone:
                     description: Zone is the compute zone, e.g. "us-central1-a" (see

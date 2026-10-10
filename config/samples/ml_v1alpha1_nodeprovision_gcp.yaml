@@ -53,8 +53,9 @@ spec:
   # gcpConfig:
   #   projectId: my-project
   #   zone: us-central1-a
-  #   network: default                       # or projects/<host>/global/networks/<vpc> (Shared VPC)
-  #   subnetwork: default                    # required for custom-mode networks
+  #   network: default                       # or projects/<host>/global/networks/<vpc> (Shared VPC); derived from subnetwork when unset
+  #   subnetwork: default                    # name, regions/<r>/subnetworks/<n> or projects/<p>/regions/<r>/subnetworks/<n>; required for custom-mode networks
+  #   disableExternalIP: true                # private subnet: no external IP (needs Cloud NAT)
   #   imageFamily: ubuntu-2204-lts           # + imageProject: ubuntu-os-cloud (the defaults)
   #   # sourceImage: projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20260101
   #   bootDiskSizeGB: 100                    # default 50

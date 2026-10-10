@@ -33,9 +33,19 @@ spec:
   # Uncomment to override any individual value:
   # awsConfig:
   #   ami: ami-0c9c942bd7bf113a2
+  #   # Launch into an existing VPC/subnet instead of the region's default VPC.
+  #   # Set any of vpcId / subnetId / securityGroupIds: the VPC is derived from
+  #   # whichever is given (subnet first), everything must agree and exist in
+  #   # spec.region, and a subnet is picked from the VPC when none is set.
+  #   vpcId: vpc-0123456789abcdef0
   #   subnetId: subnet-0123456789abcdef0
-  #   securityGroupIds:
+  #   securityGroupIds:           # must be in the subnet's VPC; never modified by the controller
   #     - sg-0123456789abcdef0
+  #   disablePublicIp: true       # private subnet: no public IP (needs NAT/egress)
+  #   # Cluster without a VPN: the node's VPC must contain the control plane's private
+  #   # API endpoint (checked before anything is created). Set only when it is
+  #   # reachable by VPC peering / transit gateway instead:
+  #   skipControlPlaneVpcCheck: true
   #   keyPairName: my-keypair
   #   iamInstanceProfile: my-profile
   #   tags:

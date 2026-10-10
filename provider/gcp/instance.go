@@ -302,13 +302,11 @@ func buildInstance(np *mlv1alpha1.NodeProvision, project, instance, script, sshK
 		Network: proto.String(fmt.Sprintf("projects/%s/global/networks/%s", netProject, netName)),
 	}
 	if cfg.Subnetwork != "" {
-		sub := cfg.Subnetwork
-		if strings.Contains(sub, "/") {
-			sub = compactResourcePath(sub)
-		} else {
-			sub = fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", netProject, region, sub)
+		subProject, subRegion, subName, err := ParseSubnetworkRef(netProject, region, cfg.Subnetwork)
+		if err != nil {
+			return nil, err
 		}
-		nic.Subnetwork = proto.String(sub)
+		nic.Subnetwork = proto.String(fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", subProject, subRegion, subName))
 	}
 	if !cfg.DisableExternalIP {
 		// Ephemeral external IPv4, like AssociatePublicIpAddress on EC2.

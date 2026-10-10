@@ -415,6 +415,44 @@ func ResolveDefaults(ctx context.Context, creds Credentials, np *mlv1alpha1.Node
 		cfg.Zone = zone
 	}
 
+	// ── subnetwork ────────────────────────────────────────────────────────────
+	// A subnetwork pins the network too: when spec.network is unset it is taken
+	// from the subnetwork (otherwise it would silently default to "default" and
+	// the instance create would fail with a network/subnetwork mismatch).
+	if cfg.Subnetwork != "" {
+		// A bare subnetwork name lives in the network's project (the Shared VPC
+		// host project when spec.network names one).
+		defProject, _ := ParseNetworkRef(cfg.ProjectID, cfg.Network)
+		subProject, subRegion, subName, err := ParseSubnetworkRef(defProject, res.Region, cfg.Subnetwork)
+		if err != nil {
+			return nil, err
+		}
+		if subRegion != res.Region {
+			return nil, fmt.Errorf("spec.gcpConfig.subnetwork %q is in region %q but the instance is in region %q (zone %s): a subnetwork is regional",
+				cfg.Subnetwork, subRegion, res.Region, cfg.Zone)
+		}
+		sn, err := c.GetSubnetwork(ctx, subProject, subRegion, subName)
+		if err != nil {
+			if IsNotFound(err) {
+				return nil, fmt.Errorf("subnetwork %q not found in project %q region %q: check spec.gcpConfig.subnetwork", subName, subProject, subRegion)
+			}
+			return nil, apiErrorf(err, "looking up subnetwork %q", subName)
+		}
+		if p := sn.GetPurpose(); p != "" && p != computepb.Subnetwork_PRIVATE.String() {
+			return nil, fmt.Errorf("subnetwork %q has purpose %s: only PRIVATE subnetworks can host instances", subName, p)
+		}
+		if st := sn.GetState(); st != "" && st != computepb.Subnetwork_READY.String() {
+			return nil, fmt.Errorf("subnetwork %q is not ready (state %s)", subName, st)
+		}
+		snProject, snName := ParseNetworkRef(subProject, sn.GetNetwork())
+		if cfg.Network == "" {
+			cfg.Network = fmt.Sprintf("projects/%s/global/networks/%s", snProject, snName)
+		} else if netProject, netName := ParseNetworkRef(cfg.ProjectID, cfg.Network); netProject != snProject || netName != snName {
+			return nil, fmt.Errorf("subnetwork %q belongs to network projects/%s/global/networks/%s, not spec.gcpConfig.network %q",
+				subName, snProject, snName, cfg.Network)
+		}
+	}
+
 	// ── network ───────────────────────────────────────────────────────────────
 	netProject, netName := ParseNetworkRef(cfg.ProjectID, cfg.Network)
 	nw, err := c.GetNetwork(ctx, netProject, netName)
@@ -483,6 +521,24 @@ func ParseNetworkRef(defaultProject, ref string) (project, name string) {
 		return parts[1], parts[4]
 	}
 	return defaultProject, parts[len(parts)-1]
+}
+
+// ParseSubnetworkRef splits a subnetwork reference into (project, region, name).
+// ref may be a bare name (defaultProject and defaultRegion),
+// "regions/<r>/subnetworks/<n>", "projects/<p>/regions/<r>/subnetworks/<n>" or
+// the full URL (Shared VPC host project).
+func ParseSubnetworkRef(defaultProject, defaultRegion, ref string) (project, region, name string, err error) {
+	ref = compactResourcePath(strings.TrimSpace(ref))
+	parts := strings.Split(ref, "/")
+	switch {
+	case len(parts) == 1 && parts[0] != "":
+		return defaultProject, defaultRegion, parts[0], nil
+	case len(parts) == 4 && parts[0] == "regions" && parts[2] == "subnetworks":
+		return defaultProject, parts[1], parts[3], nil
+	case len(parts) == 6 && parts[0] == "projects" && parts[2] == "regions" && parts[4] == "subnetworks":
+		return parts[1], parts[3], parts[5], nil
+	}
+	return "", "", "", fmt.Errorf("spec.gcpConfig.subnetwork %q is not a subnetwork name or a regions/<r>/subnetworks/<n> or projects/<p>/regions/<r>/subnetworks/<n> reference", ref)
 }
 
 // checkShape verifies that the machine type (and accelerator) exist in zone.

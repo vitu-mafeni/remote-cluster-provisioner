@@ -51,6 +51,7 @@ import (
 	"dcn.ssu.ac.kr/infra/pkg/ssh"
 	awsprovision "dcn.ssu.ac.kr/infra/provider/aws"
 	remotenodeprovision "dcn.ssu.ac.kr/infra/provider/onprem"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -569,6 +570,13 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 		return res, aErr
 	}
 
+	// ── No VPN: the control plane must be reachable from the node's VPC ─────
+	// Runs after adoption (an instance that already exists is never failed
+	// here) and before any VPN peer or instance is created.
+	if err := r.checkNoVPNControlPlane(ctx, np, creds, netConfig); err != nil {
+		return r.failNodeProvision(ctx, np, fmt.Sprintf("AWS network validation failed: %v", err))
+	}
+
 	// ── Connect to VPN server ───────────────────────────────────────────────
 	if !np.Spec.DisableVPN {
 		r.setPhaseStatus(np, mlv1alpha1.NodeProvisionPhaseConfiguringVPN, "Configuring VPN client", 15)
@@ -654,11 +662,34 @@ func (r *NodeProvisionReconciler) reconcileAWSProvisioning(
 	return ctrl.Result{RequeueAfter: requeueShort}, nil
 }
 
+// checkNoVPNControlPlane enforces that, without a VPN, the node's VPC contains
+// the control plane's private API endpoint (see awsprovision.NetworkRequest).
+// It does nothing for VPN clusters, when spec.awsConfig.skipControlPlaneVpcCheck
+// is set, or when the endpoint cannot be judged (hostname, public address).
+func (r *NodeProvisionReconciler) checkNoVPNControlPlane(
+	ctx context.Context,
+	np *mlv1alpha1.NodeProvision,
+	creds awsprovision.AWSCredentials,
+	nc *mlv1alpha1.NodeProvisionNetConfig,
+) error {
+	if !np.Spec.DisableVPN || np.Spec.AWSConfig == nil || np.Spec.AWSConfig.SkipControlPlaneVPCCheck {
+		return nil
+	}
+	host := awsprovision.ControlPlaneEndpointHost(nc.Status.ClusterJoinCommand)
+	if host == "" {
+		return nil
+	}
+	return r.aws().VerifyControlPlaneInVPC(ctx, np.Spec.Region, creds,
+		np.Spec.AWSConfig.VPCID, np.Spec.AWSConfig.SubnetID, host)
+}
+
 // resolveAWSDefaults auto-populates any missing AWS spec fields before validation:
 //   - instanceType: derived from nodeLabel when not set (e.g. "cpu" → "t3.xlarge")
 //   - awsConfig.ami: latest Ubuntu 22.04 LTS AMI for the region
-//   - awsConfig.vpcId / subnetId / securityGroupIds: resolved from the region's
-//     default VPC, creating one if none exists
+//   - awsConfig.vpcId / subnetId / securityGroupIds: a user-set VPC and/or
+//     subnet is validated and honoured (the VPC is derived from the subnet);
+//     anything left unset comes from the region's default VPC, creating one if
+//     none exists
 //
 // All resolved values are written back via a Patch so they are persisted in the
 // CRD and visible to operators.  Fields already set by the user are never overwritten.
@@ -746,6 +777,10 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 ) (patched bool, err error) {
 	log := logf.FromContext(ctx)
 
+	// The network is resolved, with whatever the user did pin (vpcId, subnetId,
+	// securityGroupIds) validated and honoured, whenever the subnet or security
+	// groups are missing. A spec that names both is passed straight to EC2,
+	// which rejects an inconsistent pair with a precise error.
 	needsNetwork := np.Spec.AWSConfig == nil ||
 		np.Spec.AWSConfig.SubnetID == "" ||
 		len(np.Spec.AWSConfig.SecurityGroupIDs) == 0
@@ -792,27 +827,42 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		log.Info("Resolved AMI", "ami", amiID)
 	}
 
-	// ── Network: default VPC / subnet / security group ───────────────────────
+	// ── Network: user-specified or default VPC / subnet / security groups ───
 	if needsNetwork {
-		log.Info("Resolving default network config", "region", np.Spec.Region)
-		netCfg, err := awsprovision.ResolveOrCreateNetworkConfig(ctx, np.Spec.Region, creds, !np.Spec.DisableVPN)
+		log.Info("Resolving network config", "region", np.Spec.Region,
+			"vpcId", np.Spec.AWSConfig.VPCID, "subnetId", np.Spec.AWSConfig.SubnetID,
+			"securityGroupIds", np.Spec.AWSConfig.SecurityGroupIDs)
+		// Without a VPN the control plane must share the node's VPC: hand the
+		// resolver its endpoint so a mismatch is caught before anything is
+		// created or modified. Best effort — the join command may not exist yet,
+		// and reconcileAWSProvisioning re-checks once the NetConfig is loaded.
+		cpHost := ""
+		if np.Spec.DisableVPN && !np.Spec.AWSConfig.SkipControlPlaneVPCCheck {
+			if nc, ncErr := r.netConfigFor(ctx, np); ncErr == nil {
+				cpHost = awsprovision.ControlPlaneEndpointHost(nc.Status.ClusterJoinCommand)
+			}
+		}
+		netCfg, err := awsprovision.ResolveOrCreateNetworkConfig(ctx, np.Spec.Region, creds, awsprovision.NetworkRequest{
+			ControlPlaneHost: cpHost,
+			VPCID:            np.Spec.AWSConfig.VPCID,
+			SubnetID:         np.Spec.AWSConfig.SubnetID,
+			SecurityGroupIDs: np.Spec.AWSConfig.SecurityGroupIDs,
+			InstanceType:     np.Spec.InstanceType,
+			DisablePublicIP:  np.Spec.AWSConfig.DisablePublicIP,
+			IncludeWireGuard: !np.Spec.DisableVPN,
+		})
 		if err != nil {
 			return false, fmt.Errorf("resolving AWS network config: %w", err)
 		}
-		if np.Spec.AWSConfig.VPCID == "" {
-			np.Spec.AWSConfig.VPCID = netCfg.VPCID
-		}
-		if np.Spec.AWSConfig.SubnetID == "" {
-			np.Spec.AWSConfig.SubnetID = netCfg.SubnetID
-		}
-		if len(np.Spec.AWSConfig.SecurityGroupIDs) == 0 {
-			np.Spec.AWSConfig.SecurityGroupIDs = []string{netCfg.SecurityGroupID}
+		np.Spec.AWSConfig.VPCID = netCfg.VPCID
+		np.Spec.AWSConfig.SubnetID = netCfg.SubnetID
+		np.Spec.AWSConfig.SecurityGroupIDs = netCfg.SecurityGroupIDs
+		for _, w := range netCfg.Warnings {
+			log.Info("Network warning", "warning", w)
 		}
 		log.Info("Resolved network config",
-			"vpcId", np.Spec.AWSConfig.VPCID,
-			"subnetId", np.Spec.AWSConfig.SubnetID,
-			"securityGroupId", np.Spec.AWSConfig.SecurityGroupIDs[0],
-		)
+			"vpcId", netCfg.VPCID, "subnetId", netCfg.SubnetID,
+			"availabilityZone", netCfg.AvailabilityZone, "securityGroupIds", netCfg.SecurityGroupIDs)
 	}
 
 	// ── Key pair: generate or reuse ─────────────────────────────────────────
@@ -825,6 +875,12 @@ func (r *NodeProvisionReconciler) resolveAWSDefaults(
 		log.Info("Resolved EC2 key pair", "keyPairName", kpName)
 	}
 
+	// Validation-only passes (everything user-specified and consistent) change
+	// nothing: patching would be a no-op that raises no watch event, so report
+	// "not patched" and let the caller carry on in this reconcile.
+	if equality.Semantic.DeepEqual(base.Spec, np.Spec) {
+		return false, nil
+	}
 	if err := r.Patch(ctx, np, client.MergeFrom(base)); err != nil {
 		return false, fmt.Errorf("patching NodeProvision spec with resolved defaults: %w", err)
 	}

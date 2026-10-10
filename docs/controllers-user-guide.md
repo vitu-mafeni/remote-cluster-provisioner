@@ -516,9 +516,10 @@ spec:
   # awsConfig:
   #   instanceType: p3.2xlarge   # overrides the nodeLabel → instance-type lookup
   #   ami: ami-0c9c942bd7bf113a2
-  #   vpcId: vpc-xxxxxxxx
-  #   subnetId: subnet-xxxxxxxx
-  #   securityGroupIds: [sg-xxxxxxxx]
+  #   vpcId: vpc-xxxxxxxx        # existing VPC to launch into (default: the region's default VPC)
+  #   subnetId: subnet-xxxxxxxx  # existing subnet; its VPC is derived, or must match vpcId if both set
+  #   securityGroupIds: [sg-xxxxxxxx]  # must be in the subnet's VPC; never modified
+  #   disablePublicIp: false     # true for private subnets (needs NAT)
   #   keyPairName: my-keypair
   #   iamInstanceProfile: my-profile
   #   rootVolumeSizeGB: 100
@@ -527,6 +528,45 @@ spec:
 
 Important fields:
 
+- **`awsConfig.vpcId` / `subnetId` / `securityGroupIds`** launch the instance into an existing
+  network instead of the region's default VPC. Set any of them: the VPC is taken from the subnet,
+  else `vpcId`, else the security groups, else the region's default VPC (created if the region has
+  none). The controller validates that everything exists in `spec.region`, that the subnet and
+  every security group belong to that VPC, and that the subnet's AZ offers the instance type.
+  When no subnet is given, one is picked from the VPC (only AZs offering the instance type;
+  preferring default-for-AZ, then public-IP subnets, then lowest ID). A VPC or subnet you name
+  never triggers default-VPC creation.
+  - *Security groups:* `securityGroupIds` are attached as-is and never modified. If omitted, the
+    VPC's default security group is used; only when the controller chose the whole network (nothing
+    set) does it open SSH, and WireGuard when the VPN is enabled, on that group. For a VPC or subnet
+    you named, the group's rules are left untouched — grant what you need yourself, or pass
+    `securityGroupIds`.
+  - *Private subnets:* set `awsConfig.disablePublicIp: true` to launch without a public IP. The node
+    then needs a NAT gateway (or other egress) for package/image downloads and, with a VPN, to reach
+    the VPN server. The controller warns in its log when the subnet has no `0.0.0.0/0` route, or
+    routes through an internet gateway while `disablePublicIp` is set. Without a VPN the node IP is
+    the instance's private IP, so the cluster must be able to route to it (peering, VPN, Direct Connect).
+  - *IAM:* validation uses `ec2:DescribeVpcs/Subnets/SecurityGroups/RouteTables/InstanceTypeOfferings`.
+    Missing `DescribeRouteTables` or `DescribeInstanceTypeOfferings` only skips those checks.
+  - *No VPN (`disableVPN: true`):* every node must be able to route to the control plane, normally
+    because they share one VPC (the node IP is the instance's private IP). When the control plane's
+    API endpoint (from the cluster join command) is a private address (RFC1918 or `100.64.0.0/10`),
+    the controller checks it lies inside the node's VPC CIDRs (primary and associated) and otherwise
+    fails the node *before* creating or modifying anything, naming the endpoint and VPC. Hostnames
+    and public addresses (an EIP can front a control plane inside the VPC) cannot be judged and are
+    skipped. If the control plane is reachable by VPC peering or a transit gateway, set
+    `awsConfig.skipControlPlaneVpcCheck: true`. Inside one VPC the default security group already
+    allows node↔control-plane traffic (10250, 8472) *provided both use that group*; if the control
+    plane has its own group, give the nodes `securityGroupIds` that allow it.
+  - *Errors:* failures never leave resources behind — the checks run before a default VPC is
+    created or any security-group rule is added. AWS errors shown in `status.message` and logs are
+    reduced to `<code>: <message>` with ARNs, account IDs, request IDs and encoded authorization
+    blobs redacted.
+  - A spec that sets both `subnetId` and `securityGroupIds` is passed to EC2 without these
+    pre-checks (EC2 rejects an inconsistent pair itself).
+  - On GCP the equivalent is `gcpConfig.network` / `gcpConfig.subnetwork` (+ `disableExternalIP`);
+    the subnetwork is validated (exists, in the instance's region, PRIVATE, READY) and, if `network`
+    is unset, determines it; Shared VPC subnetworks can be given as a host-project path or URL.
 - **`disableVPN`** (default `false`) joins the node without a WireGuard tunnel — no VPN server
   connection, IP allocation, peer, WireGuard package or AWS security group rule. It is a property
   of the whole cluster, so you normally don't set it here: it is inherited from the cluster's
@@ -1303,7 +1343,7 @@ metrics endpoint on the controller Deployment.
 | `sshUsernameOverride` | string | |
 | `credentialsRef` | secret ref | key auto-detected if omitted |
 | `disableVPN` | bool | default `false`; join the node without WireGuard. Normally **inherited** from the cluster (`RemoteCluster` control-plane → `NodeProvisionNetConfig` → `NodeProvision`); setting `true` against a VPN cluster fails the provision. Set at creation; not changeable afterwards (see [§5.3](#53-nodeprovision--add-a-node-from-the-remote-cluster), [§7.5](#75-operational-notes)) |
-| `awsConfig` | object | `vpcId`, `subnetId`, `securityGroupIds[]`, `ami`, `keyPairName`, `iamInstanceProfile`, `tags{}`, `rootVolumeSizeGB` — all auto-resolved if omitted |
+| `awsConfig` | object | `vpcId`, `subnetId`, `securityGroupIds[]`, `disablePublicIp`, `skipControlPlaneVpcCheck`, `ami`, `keyPairName`, `iamInstanceProfile`, `tags{}`, `rootVolumeSizeGB` — all auto-resolved if omitted |
 | `gcpConfig` | object | `projectId`, `zone`, `network`, `subnetwork`, `sourceImage` / `imageFamily` / `imageProject`, `bootDiskSizeGB`, `bootDiskType`, `labels{}`, `networkTags[]`, `serviceAccountEmail`, `serviceAccountScopes[]`, `accelerator{type,count}`, `spot`, `disableExternalIP`, `firewallSourceRanges[]` — all optional, auto-resolved if omitted (see [§5.4](#54-nodeprovision-on-google-cloud-gcp)) |
 
 **Status:**

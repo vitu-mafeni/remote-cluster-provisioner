@@ -61,13 +61,36 @@ type CredentialsRef struct {
 
 // AWSConfig holds AWS-specific parameters for EC2 node provisioning.
 type AWSConfig struct {
-	// VPC ID where the instance will be launched.
+	// VPC ID where the instance will be launched, e.g. "vpc-0123456789abcdef0".
+	// When subnetId is also set it must be that subnet's VPC. When only vpcId is
+	// set, a subnet of this VPC is chosen. When neither is set the region's
+	// default VPC is used (and created if the region has none).
+	// +optional
 	VPCID string `json:"vpcId,omitempty"`
-	// Subnet ID for the instance's primary network interface.
+	// Subnet ID for the instance's primary network interface. Determines the VPC
+	// when vpcId is unset. Must be in spec.region.
+	// +optional
 	SubnetID string `json:"subnetId,omitempty"`
-	// Security group IDs to attach to the instance.
+	// Security group IDs to attach to the instance; they must all be in the
+	// instance's VPC. When vpcId and subnetId are unset, the VPC is taken from
+	// these groups. When empty, the default security group of the resolved VPC is
+	// used: if the controller chose the whole network (nothing set here, vpcId
+	// or subnetId) it opens SSH, and WireGuard when the VPN is enabled, on that
+	// group; for a VPC or subnet you named it leaves the group's rules untouched.
 	// +optional
 	SecurityGroupIDs []string `json:"securityGroupIds,omitempty"`
+	// DisablePublicIP launches the instance without a public IPv4 address, for
+	// private subnets. The node then needs an egress path (NAT gateway, transit
+	// gateway, ...) for package/image downloads and, with a VPN, to reach the VPN
+	// server. Default false: the instance gets a public IP.
+	// +optional
+	DisablePublicIP bool `json:"disablePublicIp,omitempty"`
+	// SkipControlPlaneVPCCheck turns off the no-VPN guard that fails a node whose
+	// VPC does not contain the control plane's (private) API endpoint. Without a
+	// VPN every node must be able to route to the control plane; set this only
+	// when it is reachable by VPC peering or a transit gateway.
+	// +optional
+	SkipControlPlaneVPCCheck bool `json:"skipControlPlaneVpcCheck,omitempty"`
 	// AMI ID to use for the instance.
 	AMI string `json:"ami,omitempty"`
 	// EC2 key pair name for SSH access (optional when using cloud-init only).
@@ -114,11 +137,14 @@ type GCPConfig struct {
 	// Zone is the compute zone, e.g. "us-central1-a" (see the type comment).
 	// +optional
 	Zone string `json:"zone,omitempty"`
-	// Network is the VPC network name (or full resource URL). Defaults to "default".
+	// Network is the VPC network name or "projects/<host>/global/networks/<n>"
+	// (Shared VPC). When unset it is taken from subnetwork if that is set,
+	// otherwise "default". If both are set the subnetwork must belong to it.
 	// +optional
 	Network string `json:"network,omitempty"`
-	// Subnetwork is the subnetwork name (or full resource URL) in the instance's
-	// region. Required for custom-mode networks; optional for auto-mode ones.
+	// Subnetwork is a subnetwork name (in the network's project), or
+	// "regions/<r>/subnetworks/<n>", "projects/<p>/regions/<r>/subnetworks/<n>"
+	// or a full URL. It must be in the instance's region and PRIVATE. Required for custom-mode networks; optional for auto-mode ones.
 	// +optional
 	Subnetwork string `json:"subnetwork,omitempty"`
 	// SourceImage is the boot image: a full image URL

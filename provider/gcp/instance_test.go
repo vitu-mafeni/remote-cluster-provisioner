@@ -359,6 +359,14 @@ func TestBuildInstance_Overrides(t *testing.T) {
 	if got := inst.GetNetworkInterfaces()[0].GetSubnetwork(); got != "projects/p/regions/europe-west1/subnetworks/s" {
 		t.Errorf("subnetwork URL: %q", got)
 	}
+	// The short regions/<r>/subnetworks/<n> form is qualified with the network's project.
+	inst = builtInstance(t, func(np *mlv1alpha1.NodeProvision) {
+		np.Spec.GCPConfig.Network = "projects/host/global/networks/shared"
+		np.Spec.GCPConfig.Subnetwork = "regions/us-central1/subnetworks/s"
+	})
+	if got := inst.GetNetworkInterfaces()[0].GetSubnetwork(); got != "projects/host/regions/us-central1/subnetworks/s" {
+		t.Errorf("short subnetwork path: %q", got)
+	}
 }
 
 func TestBuildInstance_GPUShapes(t *testing.T) {

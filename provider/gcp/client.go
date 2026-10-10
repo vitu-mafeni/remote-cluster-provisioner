@@ -33,6 +33,7 @@ type computeAPI interface {
 	DeleteFirewall(ctx context.Context, project, name string) error
 
 	GetNetwork(ctx context.Context, project, name string) (*computepb.Network, error)
+	GetSubnetwork(ctx context.Context, project, region, name string) (*computepb.Subnetwork, error)
 	ListZones(ctx context.Context, project, region string) ([]*computepb.Zone, error)
 	GetMachineType(ctx context.Context, project, zone, name string) (*computepb.MachineType, error)
 	GetAcceleratorType(ctx context.Context, project, zone, name string) (*computepb.AcceleratorType, error)
@@ -55,6 +56,7 @@ type sdkCompute struct {
 	instances *compute.InstancesClient
 	firewalls *compute.FirewallsClient
 	networks  *compute.NetworksClient
+	subnets   *compute.SubnetworksClient
 	zones     *compute.ZonesClient
 	machines  *compute.MachineTypesClient
 	accels    *compute.AcceleratorTypesClient
@@ -83,6 +85,10 @@ func newSDKComputeWithOptions(ctx context.Context, opts ...option.ClientOption) 
 	if c.networks, err = compute.NewNetworksRESTClient(ctx, opts...); err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("creating GCE networks client: %w", err)
+	}
+	if c.subnets, err = compute.NewSubnetworksRESTClient(ctx, opts...); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("creating GCE subnetworks client: %w", err)
 	}
 	if c.zones, err = compute.NewZonesRESTClient(ctx, opts...); err != nil {
 		_ = c.Close()
@@ -113,6 +119,9 @@ func (c *sdkCompute) Close() error {
 	}
 	if c.networks != nil {
 		errs = append(errs, c.networks.Close())
+	}
+	if c.subnets != nil {
+		errs = append(errs, c.subnets.Close())
 	}
 	if c.zones != nil {
 		errs = append(errs, c.zones.Close())
@@ -198,6 +207,10 @@ func (c *sdkCompute) DeleteFirewall(ctx context.Context, project, name string) e
 
 func (c *sdkCompute) GetNetwork(ctx context.Context, project, name string) (*computepb.Network, error) {
 	return c.networks.Get(ctx, &computepb.GetNetworkRequest{Project: project, Network: name})
+}
+
+func (c *sdkCompute) GetSubnetwork(ctx context.Context, project, region, name string) (*computepb.Subnetwork, error) {
+	return c.subnets.Get(ctx, &computepb.GetSubnetworkRequest{Project: project, Region: region, Subnetwork: name})
 }
 
 func (c *sdkCompute) ListZones(ctx context.Context, project, region string) ([]*computepb.Zone, error) {
