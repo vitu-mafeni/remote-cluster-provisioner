@@ -251,8 +251,12 @@ type templateData struct {
 	RuntimeInstallScript string // rendered by pkgruntime.InstallScript
 	NodeJoinedFunc       string // bash function node_already_joined (kubeadm.NodeAlreadyJoinedFunc)
 	CgroupV1JoinSnippet  string // defines CGROUP_V1_JOIN_ARGS (kubeadm.CgroupV1JoinSnippet)
-	NodeIPScript         string // NoVPN node-IP lookup; trusted controller text, see CloudInitParams.NodeIPScript
-	InstanceIDScript     string // current_instance_id body; trusted controller text, see CloudInitParams.InstanceIDScript
+	// CheckpointStorageSnippet mounts the control plane's shared checkpoint NFS
+	// directory (kubeadm.CheckpointStorageMountSnippet); empty when the join
+	// command has no usable control-plane host.
+	CheckpointStorageSnippet string
+	NodeIPScript             string // NoVPN node-IP lookup; trusted controller text, see CloudInitParams.NodeIPScript
+	InstanceIDScript         string // current_instance_id body; trusted controller text, see CloudInitParams.InstanceIDScript
 	// InsecureRegistriesScript is the registries.conf.d drop-in writer
 	// (pkgruntime.InsecureRegistriesScript, run as root); empty when none.
 	InsecureRegistriesScript string
@@ -320,25 +324,26 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 		"export CNLAB_REGISTRY_TOKEN=" + sshhelper.ShellQuote(runtimeCfg.Token)
 
 	d := templateData{
-		WGConfigB64:          base64.StdEncoding.EncodeToString([]byte(p.WGConfig)),
-		VpnIP:                p.VpnIP,
-		NoVPN:                p.NoVPN,
-		JoinCommand:          p.JoinCommand,
-		JoinCommandB64:       base64.StdEncoding.EncodeToString([]byte(p.JoinCommand)),
-		KubernetesVersion:    strings.TrimPrefix(p.KubernetesVersion, "v"),
-		KubernetesMinor:      strings.TrimPrefix(p.KubernetesMinorVersion, "v"),
-		NodeName:             p.NodeName,
-		SSHUsername:          p.SSHUsername,
-		HasSSHUsername:       p.SSHUsername != "",
-		IsGPUNode:            p.IsGPUNode,
-		KubeletNodeLabels:    kubeletNodeLabels(p),
-		CRIOSocket:           crioSocket,
-		RuntimeCredentials:   runtimeCreds,
-		RuntimeInstallScript: pkgruntime.InstallScript(runtimeCfg),
-		NodeJoinedFunc:       kubeadm.NodeAlreadyJoinedFunc,
-		CgroupV1JoinSnippet:  kubeadm.CgroupV1JoinSnippet(p.KubernetesVersion, ""),
-		NodeIPScript:         nodeIPScript(p),
-		InstanceIDScript:     instanceIDScript(p),
+		WGConfigB64:              base64.StdEncoding.EncodeToString([]byte(p.WGConfig)),
+		VpnIP:                    p.VpnIP,
+		NoVPN:                    p.NoVPN,
+		JoinCommand:              p.JoinCommand,
+		JoinCommandB64:           base64.StdEncoding.EncodeToString([]byte(p.JoinCommand)),
+		KubernetesVersion:        strings.TrimPrefix(p.KubernetesVersion, "v"),
+		KubernetesMinor:          strings.TrimPrefix(p.KubernetesMinorVersion, "v"),
+		NodeName:                 p.NodeName,
+		SSHUsername:              p.SSHUsername,
+		HasSSHUsername:           p.SSHUsername != "",
+		IsGPUNode:                p.IsGPUNode,
+		KubeletNodeLabels:        kubeletNodeLabels(p),
+		CRIOSocket:               crioSocket,
+		RuntimeCredentials:       runtimeCreds,
+		RuntimeInstallScript:     pkgruntime.InstallScript(runtimeCfg),
+		NodeJoinedFunc:           kubeadm.NodeAlreadyJoinedFunc,
+		CgroupV1JoinSnippet:      kubeadm.CgroupV1JoinSnippet(p.KubernetesVersion, ""),
+		CheckpointStorageSnippet: kubeadm.CheckpointStorageMountSnippet(kubeadm.NFSServerFromJoinCommand(p.JoinCommand), ""),
+		NodeIPScript:             nodeIPScript(p),
+		InstanceIDScript:         instanceIDScript(p),
 
 		InsecureRegistriesScript: pkgruntime.InsecureRegistriesScript(p.InsecureRegistries, false),
 	}
@@ -926,7 +931,15 @@ chmod 0440 /etc/sudoers.d/nopasswd-{{.SSHUsername}}
 visudo -cf /etc/sudoers.d/nopasswd-{{.SSHUsername}}
 {{end}}
 
+{{if .CheckpointStorageSnippet}}# -----------------------------------------------------------------------------
+# Shared checkpoint storage (NFS from the control plane; best effort, never fails
+# the bootstrap)
 # -----------------------------------------------------------------------------
+report "Mounting shared checkpoint storage"
+# BEGIN checkpoint-storage
+{{.CheckpointStorageSnippet}}# END checkpoint-storage
+
+{{end}}# -----------------------------------------------------------------------------
 # Completion marker
 # -----------------------------------------------------------------------------
 printf 'SUCCESS\n' > "$STATUS_FILE"

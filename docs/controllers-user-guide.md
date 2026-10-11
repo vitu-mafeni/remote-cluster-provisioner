@@ -1249,6 +1249,36 @@ ssh ubuntu@<cp-ip> 'wg show wg0'
   after `password`/`secret`/`token`/`key` style keys). Because the rule is deliberately broad, a
   diagnostic such as `secret: <word>` may lose the word that follows it.
 
+**Shared checkpoint storage (every worker)** — each worker node mounts the control plane's
+`/srv/nfs/k8s/checkpoint-storage` export at `/shared-pvc/checkpoint-storage` once it has joined. It
+applies to every way a worker is created: the AWS and GCP bootstrap, the on-prem `NodeProvision`, and
+`RemoteCluster` workers. The steps are the manual ones —
+
+```bash
+sudo apt-get update && sudo apt-get install -y nfs-common
+sudo mkdir -p /shared-pvc/checkpoint-storage
+sudo mount -t nfs <control-plane-ip>:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage
+```
+
+— where `<control-plane-ip>` is the host of the cluster's join command (the VPN IP, or the private
+IP without a VPN: the address the node already reaches the control plane on). Details:
+
+- *Idempotent and persistent.* Nothing is remounted if the path is already mounted, and an
+  `/etc/fstab` entry (`nfs defaults,_netdev,nofail,x-systemd.automount`) is written, replacing any
+  earlier entry for the same mount point and leaving other lines alone — so the mount comes back
+  after a reboot (the GCE startup script exits early on reboot) even if the tunnel is not up yet, and
+  a node re-created from an image of another cluster does not keep a stale server.
+- *Never fails the node.* The mount is retried (5 time-bounded attempts) after the join; if it still
+  cannot be mounted the node keeps going and the log shows `WARNING: could not mount …` (the
+  `fstab` entry keeps retrying at boot). Check that the control plane's firewall / security group
+  allows NFS (TCP/UDP 2049, and 111 for NFSv3) from the workers.
+- *Control plane.* The NFS phase of a new control plane creates the directory under the existing
+  `/srv/nfs/k8s` export. A control plane provisioned earlier lacks it: the worker creates it through
+  the parent export (`no_root_squash`) the first time it mounts.
+- *Where.* AWS/GCP: after the join in the bootstrap script (`/var/log/node-bootstrap.log`);
+  on-prem `NodeProvision`: a step after the kubelet restart; `RemoteCluster` workers: a final
+  "Shared Storage" phase (so the numbering of earlier phases is unchanged).
+
 **Controller image** — the published image is **no longer obfuscated**. Obfuscation (garble)
 is opt-in at build time with `--build-arg OBFUSCATE=true` (or the `OBFUSCATE` repository variable
 for the publish workflow) and makes crash traces much harder to read.

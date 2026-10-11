@@ -539,6 +539,16 @@ fi`); rerr != nil {
 		return fail(rerr)
 	}
 
+	// Shared checkpoint storage from the control plane. Best effort by design: the
+	// snippet reports a problem as a warning and never fails, so the node that just
+	// joined is not failed over optional storage.
+	if snippet := kubeadm.CheckpointStorageMountSnippet(kubeadm.NFSServerFromJoinCommand(netNodeConfig.Status.ClusterJoinCommand), "sudo"); snippet != "" {
+		reportStep("mounting shared checkpoint storage from the control plane")
+		if rerr := runStep("mounting shared checkpoint storage", 1, 1, snippet); rerr != nil {
+			log.Printf("[%s] WARNING: shared checkpoint storage step failed (continuing): %v", nodeProvision.Name, rerr)
+		}
+	}
+
 	log.Printf("[%s] successfully joined cluster", nodeProvision.Name)
 
 	return nodeIP, publicKey, nil

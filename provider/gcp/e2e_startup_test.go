@@ -67,6 +67,8 @@ cat /etc/default/kubelet > $OUT/f.default-kubelet 2>/dev/null
 cat /var/lib/node-bootstrap-kubeadm-patches/kubeletconfiguration+merge.yaml > $OUT/f.patch 2>/dev/null
 cat /etc/wireguard/wg0.conf > $OUT/f.wg0 2>/dev/null
 [ -e /var/lib/kubelet/pki ] && echo yes > $OUT/f.pki
+cat /etc/fstab > $OUT/f.fstab 2>/dev/null
+[ -d /shared-pvc/checkpoint-storage ] && echo yes > $OUT/f.mountdir
 `,
 	})
 }
@@ -256,5 +258,46 @@ func TestE2E_GCE_AndAWSScriptsShareTheCgroupV1Handling(t *testing.T) {
 				t.Errorf("script missing %q", want)
 			}
 		}
+	}
+}
+
+// ── shared checkpoint storage (NFS from the control plane) ────────────────────
+
+const checkpointMount = "mount -t nfs 10.0.0.1:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage"
+
+func TestE2E_GCE_WorkerMountsTheControlPlanesCheckpointStorage(t *testing.T) {
+	for _, noVPN := range []bool{true, false} {
+		t.Run(fmt.Sprintf("noVPN=%v", noVPN), func(t *testing.T) {
+			h := host{noVPN: noVPN, v1: true, minor: "35", id: "111", runs: 2}
+			r := h.run(t, e2eScript(t, noVPN, "1.35.0"))
+			if r.Exits[0] != 0 || r.Exits[1] != 0 {
+				t.Fatalf("%s", r.Dump())
+			}
+			calls := r.Calls()
+			if n := strings.Count(calls, checkpointMount); n != 1 {
+				t.Fatalf("one mount in total (the reboot must not remount), got %d:\n%s", n, calls)
+			}
+			if strings.Index(calls, "kubeadm join") > strings.Index(calls, checkpointMount) {
+				t.Error("the mount must come after the join")
+			}
+			if n := strings.Count(r.File("f.fstab"), "/shared-pvc/checkpoint-storage"); n != 1 {
+				t.Errorf("fstab = %q", r.File("f.fstab"))
+			}
+			if r.File("f.mountdir") != "yes\n" {
+				t.Error("the mount point must exist")
+			}
+		})
+	}
+}
+
+func TestE2E_GCE_UnreachableNFSNeverFailsTheStartupScript(t *testing.T) {
+	env := []string{"CNLAB_CGROUP_CONTROLLERS=/work/out/none", "FAKE_K8S_MINOR=35", "FAKE_JOIN_FAILS=0", "FAKE_GCE_ID=111", "FAKE_NODE_IP=10.128.0.7", "FAKE_NFS_FAIL=1"}
+	r := e2esandbox.Run(t, e2esandbox.Options{
+		Script: e2eScript(t, true, "1.35.0"), Env: env,
+		After: "[ -e /var/lib/node-bootstrap-complete ] && echo yes > $OUT/f.complete\n",
+	})
+	requireBootstrapped(t, r)
+	if !strings.Contains(r.Log, "WARNING: could not mount") {
+		t.Errorf("the problem must be reported:\n%s", r.Log)
 	}
 }

@@ -127,8 +127,10 @@ func TestJoinWorkerNode_HealthyJoinedNodeIsNeverReset(t *testing.T) {
 	if _, statErr := os.Stat(g.conf); statErr != nil {
 		t.Fatalf("kubelet.conf must survive: %v", statErr)
 	}
-	if len(completed) != 1 || completed[0] != WorkerPhaseJoin {
-		t.Errorf("progress callback = %v, want [%d]", completed, WorkerPhaseJoin)
+	// The join is recorded as done without running it, then the (idempotent, never
+	// failing) shared-storage phase runs: a resumed healthy worker still gets its mount.
+	if len(completed) != 2 || completed[0] != WorkerPhaseJoin || completed[1] != WorkerPhaseSharedStorage {
+		t.Errorf("progress callback = %v, want [%d %d]", completed, WorkerPhaseJoin, WorkerPhaseSharedStorage)
 	}
 	if !strings.Contains(g.Log("kubectl.calls"), "label node") {
 		t.Errorf("the post-join labelling must still run:\n%s", g.Log("kubectl.calls"))

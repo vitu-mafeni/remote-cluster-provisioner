@@ -75,6 +75,8 @@ cat /etc/default/kubelet > $OUT/f.default-kubelet 2>/dev/null
 cat /var/lib/node-bootstrap-kubeadm-patches/kubeletconfiguration+merge.yaml > $OUT/f.patch 2>/dev/null
 cat /etc/wireguard/wg0.conf > $OUT/f.wg0 2>/dev/null
 [ -e /var/lib/kubelet/pki ] && echo yes > $OUT/f.pki
+cat /etc/fstab > $OUT/f.fstab 2>/dev/null
+[ -d /shared-pvc/checkpoint-storage ] && echo yes > $OUT/f.mountdir
 `
 
 func (h e2eHost) run(t *testing.T, script string) e2esandbox.Result {
@@ -461,4 +463,102 @@ func TestE2E_PrefixNamesAreNotConfusedWithoutOpenSSL(t *testing.T) {
 			t.Fatalf("worker-1's state must be reset on worker-10:\n%s", r.Log)
 		}
 	})
+}
+
+// ── shared checkpoint storage (NFS from the control plane) ────────────────────
+
+const checkpointMount = "mount -t nfs 10.0.0.1:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage"
+
+func TestE2E_WorkerMountsTheControlPlanesCheckpointStorage(t *testing.T) {
+	for _, noVPN := range []bool{true, false} {
+		for _, v1 := range []bool{true, false} {
+			t.Run(fmt.Sprintf("noVPN=%v/cgroups v1=%v", noVPN, v1), func(t *testing.T) {
+				h := e2eHost{noVPN: noVPN, v1: v1, minor: "35", id: "i-aaaa"}
+				r := h.run(t, e2eScript(t, noVPN, "1.35.0", nil))
+				requireBootstrapped(t, r)
+				calls := r.Calls()
+				if n := strings.Count(calls, checkpointMount); n != 1 {
+					t.Fatalf("want exactly one checkpoint mount, got %d:\n%s", n, calls)
+				}
+				// The control plane's address is the join endpoint; the mount comes after the
+				// join so a slow or unreachable NFS server can never delay it.
+				if strings.Index(calls, "kubeadm join") > strings.Index(calls, checkpointMount) {
+					t.Error("the mount must come after the join")
+				}
+				if !strings.Contains(calls, "install -y nfs-common") {
+					t.Errorf("nfs-common must be installed:\n%s", calls)
+				}
+				if r.File("f.mountdir") != "yes\n" {
+					t.Error("the mount point must exist")
+				}
+				if n := strings.Count(r.File("f.fstab"), "/shared-pvc/checkpoint-storage"); n != 1 || !strings.Contains(r.File("f.fstab"), "10.0.0.1:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage nfs defaults,_netdev,nofail") {
+					t.Errorf("fstab = %q", r.File("f.fstab"))
+				}
+			})
+		}
+	}
+}
+
+// An unreachable NFS server is a warning: the node still joins and completes.
+func TestE2E_UnreachableNFSNeverFailsTheBootstrap(t *testing.T) {
+	h := e2eHost{noVPN: true, v1: true, minor: "35", id: "i-aaaa"}
+	script := e2eScript(t, true, "1.35.0", nil)
+	r := e2esandbox.Run(t, e2esandbox.Options{
+		Script: script, Env: append(h.env(), "FAKE_NFS_FAIL=1"), After: finalState,
+	})
+	requireBootstrapped(t, r)
+	if !strings.Contains(r.Log, "WARNING: could not mount 10.0.0.1:/srv/nfs/k8s/checkpoint-storage") {
+		t.Errorf("the problem must be reported:\n%s", r.Log)
+	}
+	if !strings.Contains(r.File("f.fstab"), "10.0.0.1:/srv/nfs/k8s/checkpoint-storage") {
+		t.Error("the fstab entry must still be written (the boot-time mount retries)")
+	}
+	if joins, _ := joinLines(r.Calls()); len(joins) != 1 {
+		t.Errorf("the join must be unaffected: %d", len(joins))
+	}
+}
+
+// Reboots never remount or duplicate the fstab entry.
+func TestE2E_CheckpointStorageSurvivesRebootsWithoutDuplicates(t *testing.T) {
+	h := e2eHost{noVPN: true, v1: true, minor: "35", id: "i-aaaa", runs: 3}
+	r := h.run(t, e2eScript(t, true, "1.35.0", nil))
+	if r.Exits[2] != 0 {
+		t.Fatalf("%s", r.Dump())
+	}
+	if n := strings.Count(r.Calls(), checkpointMount); n != 1 {
+		t.Errorf("reboots must not remount: %d mounts", n)
+	}
+	if n := strings.Count(r.File("f.fstab"), "/shared-pvc/checkpoint-storage"); n != 1 {
+		t.Errorf("fstab must hold one entry, got %d: %q", n, r.File("f.fstab"))
+	}
+}
+
+// A custom image of a node of ANOTHER cluster carries an fstab entry for the old
+// control plane; the new node must end up with exactly one entry, for its own.
+func TestE2E_CloneReplacesTheStaleCheckpointFstabEntry(t *testing.T) {
+	stale := nodeAState(true, false) +
+		"echo '10.0.0.99:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage nfs defaults 0 0' >> /etc/fstab\n"
+	h := e2eHost{noVPN: true, v1: true, minor: "35", id: "i-new", setup: stale}
+	r := h.run(t, e2eScript(t, true, "1.35.0", nil))
+	requireBootstrapped(t, r)
+	f := r.File("f.fstab")
+	if strings.Contains(f, "10.0.0.99") || strings.Count(f, "/shared-pvc/checkpoint-storage") != 1 || !strings.Contains(f, "10.0.0.1:/srv/nfs/k8s/checkpoint-storage") {
+		t.Errorf("fstab = %q", f)
+	}
+}
+
+// A join command without a usable control-plane host produces a script without the
+// storage step at all (and nothing breaks).
+func TestRenderBootstrapScript_NoStorageStepWithoutAControlPlaneHost(t *testing.T) {
+	p := baseParams()
+	p.NoVPN = true
+	p.JoinCommand = "kubeadm join cp.example.com:6443 --token abc.def --discovery-token-ca-cert-hash sha256:00"
+	s, err := renderBootstrapScript(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(s, "NFS_SRC_HOST='cp.example.com'") {
+		t.Error("a DNS name is a valid NFS server")
+	}
+	assertBashSyntax(t, s)
 }

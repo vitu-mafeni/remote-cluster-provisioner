@@ -198,6 +198,16 @@ exit 0
 `,
 		"fuser":  "exit 1\n", // nobody holds the dpkg locks
 		"visudo": logCall + "exit 0\n",
+		// NFS: the container cannot mount anything. A "-t nfs" mount succeeds (and the
+		// path counts as mounted) unless FAKE_NFS_FAIL=1; mountpoint reflects that.
+		"mount": logCall + `if [ "$1" = "-t" ] && [ "$2" = "nfs" ]; then
+  [ "${FAKE_NFS_FAIL:-0}" = 1 ] && { echo "mount.nfs: Connection timed out" >&2; exit 32; }
+  : > "$FAKE_LOG/mounted.$(printf '%s' "$4" | tr / _)"; exit 0
+fi
+exit 0
+`,
+		"umount":     logCall + "exit 0\n",
+		"mountpoint": `[ -e "$FAKE_LOG/mounted.$(printf '%s' "${@: -1}" | tr / _)" ]` + "\n",
 		// The container has no sudo and runs as root: pass the command through.
 		"sudo": `[ "$1" = "-n" ] && shift
 exec "$@"

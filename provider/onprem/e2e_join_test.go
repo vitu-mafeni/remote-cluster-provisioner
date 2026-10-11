@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"dcn.ssu.ac.kr/infra/internal/e2esandbox"
+	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 )
 
 // Container end-to-end test of the on-prem join step: the REAL command the
@@ -69,4 +70,33 @@ func TestE2E_OnPremJoinStep_WithoutTheFixFailsOnCgroupV1(t *testing.T) {
 	if r.ExitCode == 0 || !strings.Contains(r.Log, "cgroups v1 support is deprecated") {
 		t.Fatalf("expected the field failure:\n%s", r.Dump())
 	}
+}
+
+// The on-prem step mounts the control plane's shared checkpoint directory with sudo,
+// and a failure never fails the step.
+func TestE2E_OnPremSharedStorageStep(t *testing.T) {
+	step := kubeadmSharedStorageStep(t)
+	r := e2esandbox.Run(t, e2esandbox.Options{
+		Script: "set -o pipefail\n" + step,
+		After:  "cat /etc/fstab > $OUT/f.fstab\n",
+	})
+	if r.ExitCode != 0 || !strings.Contains(r.Calls(), "mount -t nfs 10.0.0.9:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage") {
+		t.Fatalf("%s", r.Dump())
+	}
+	if !strings.Contains(r.File("f.fstab"), "10.0.0.9:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage nfs") {
+		t.Errorf("fstab = %q", r.File("f.fstab"))
+	}
+	bad := e2esandbox.Run(t, e2esandbox.Options{Script: "set -o pipefail\n" + step, Env: []string{"FAKE_NFS_FAIL=1"}})
+	if bad.ExitCode != 0 || !strings.Contains(bad.Log, "WARNING: could not mount") {
+		t.Fatalf("a failed mount must be a warning:\n%s", bad.Dump())
+	}
+}
+
+func kubeadmSharedStorageStep(t *testing.T) string {
+	t.Helper()
+	s := kubeadm.CheckpointStorageMountSnippet(kubeadm.NFSServerFromJoinCommand(flowJoinCmd), "sudo")
+	if s == "" {
+		t.Fatal("no snippet for " + flowJoinCmd)
+	}
+	return s
 }

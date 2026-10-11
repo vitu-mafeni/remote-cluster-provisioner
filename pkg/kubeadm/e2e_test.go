@@ -209,3 +209,85 @@ func TestE2E_WorkerJoin_WithoutTheVersionFailsOnCgroupV1(t *testing.T) {
 		t.Fatalf("expected the field failure:\n%s", r.Dump())
 	}
 }
+
+// ── shared checkpoint storage (NFS) ───────────────────────────────────────────
+
+const nfsAfter = "cat /etc/fstab > $OUT/f.fstab 2>/dev/null\n[ -d /shared-pvc/checkpoint-storage ] && echo yes > $OUT/f.mountdir\n"
+
+func TestE2E_WorkerSharedStoragePhase(t *testing.T) {
+	phases := sharedStoragePhases(e2eJoinCmd)
+	if len(phases) != 1 || phases[0].Name != "Shared Storage" || len(phases[0].Steps) != 1 {
+		t.Fatalf("phases = %+v", phases)
+	}
+	// It must be the LAST worker phase, after the join, so earlier phase numbers
+	// (stored as progress on in-flight provisioning) never shift.
+	if WorkerPhaseSharedStorage != WorkerPhaseJoin+1 {
+		t.Fatalf("WorkerPhaseSharedStorage = %d, WorkerPhaseJoin = %d", WorkerPhaseSharedStorage, WorkerPhaseJoin)
+	}
+	if got := sharedStoragePhases("kubeadm join not-an-endpoint --token x"); got != nil {
+		t.Errorf("no usable control-plane host: no phase, got %+v", got)
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  []string
+		runs int
+	}{
+		{"mounts the control plane's checkpoint directory", nil, 1},
+		{"is idempotent across retries", nil, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := e2esandbox.Run(t, e2esandbox.Options{Script: stepsScript(phases[0].Steps), Env: tc.env, Runs: tc.runs, After: nfsAfter})
+			for i, c := range r.Exits {
+				if c != 0 {
+					t.Fatalf("run %d failed:\n%s", i+1, r.Dump())
+				}
+			}
+			calls := r.Calls()
+			if n := strings.Count(calls, "mount -t nfs 10.0.0.1:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage"); n != 1 {
+				t.Errorf("want exactly one mount of the checkpoint export, got %d:\n%s", n, calls)
+			}
+			if !strings.Contains(calls, "apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=5 install -y nfs-common") {
+				t.Errorf("nfs-common must be installed on a node without it:\n%s", calls)
+			}
+			if r.File("f.mountdir") != "yes\n" {
+				t.Error("the mount point must exist")
+			}
+			if n := strings.Count(r.File("f.fstab"), "/shared-pvc/checkpoint-storage"); n != 1 || !strings.Contains(r.File("f.fstab"), "10.0.0.1:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage nfs defaults,_netdev,nofail") {
+				t.Errorf("fstab = %q", r.File("f.fstab"))
+			}
+		})
+	}
+}
+
+// An unreachable NFS server never fails the worker phase.
+func TestE2E_WorkerSharedStorage_FailureDoesNotFailTheNode(t *testing.T) {
+	r := e2esandbox.Run(t, e2esandbox.Options{
+		Script: stepsScript(sharedStoragePhases(e2eJoinCmd)[0].Steps), Env: []string{"FAKE_NFS_FAIL=1"}, After: nfsAfter,
+	})
+	if r.ExitCode != 0 || !strings.Contains(r.Log, "WARNING: could not mount 10.0.0.1:/srv/nfs/k8s/checkpoint-storage") {
+		t.Fatalf("a failed mount must be a warning:\n%s", r.Dump())
+	}
+	if !strings.Contains(r.File("f.fstab"), "10.0.0.1:/srv/nfs/k8s/checkpoint-storage") {
+		t.Error("the fstab entry must still be written so the boot-time mount can succeed later")
+	}
+}
+
+// The control-plane side: the directory every worker mounts is created, idempotently,
+// readable by workers, under the existing /srv/nfs/k8s export.
+func TestE2E_ControlPlane_CheckpointExportDirectory(t *testing.T) {
+	step := checkpointExportStep()
+	if !strings.Contains(step, CheckpointNFSExport) || !strings.HasPrefix(CheckpointNFSExport, CheckpointNFSParentExport+"/") {
+		t.Fatalf("step = %q", step)
+	}
+	r := e2esandbox.Run(t, e2esandbox.Options{
+		Script: stepsScript([]string{step}), Runs: 2,
+		After: "stat -c '%U:%G %a' /srv/nfs/k8s/checkpoint-storage > $OUT/f.stat\n",
+	})
+	if r.Exits[0] != 0 || r.Exits[1] != 0 {
+		t.Fatalf("%s", r.Dump())
+	}
+	if got := strings.TrimSpace(r.File("f.stat")); got != "nobody:nogroup 755" {
+		t.Errorf("directory owner/mode = %q", got)
+	}
+}

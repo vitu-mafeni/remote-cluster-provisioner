@@ -173,6 +173,26 @@ if [ ! -e "${CNLAB_CGROUP_CONTROLLERS:-/sys/fs/cgroup/cgroup.controllers}" ]; th
 fi`
 }
 
+// sharedStoragePhases returns the final worker phase that mounts the control plane's
+// shared checkpoint directory (none when the join command has no usable control-plane
+// host). Its index is WorkerPhaseSharedStorage.
+func sharedStoragePhases(joinCmd string) []ProvisionPhase {
+	snippet := CheckpointStorageMountSnippet(NFSServerFromJoinCommand(joinCmd), "sudo")
+	if snippet == "" {
+		return nil
+	}
+	return []ProvisionPhase{{Name: "Shared Storage", Steps: []string{snippet}}}
+}
+
+// checkpointExportStep creates the shared checkpoint directory on the control plane
+// (idempotent). It lives under the /srv/nfs/k8s export, so it needs no export line of
+// its own; workers also create it themselves when an older control plane lacks it.
+func checkpointExportStep() string {
+	return fmt.Sprintf(`sudo mkdir -p %[1]s
+sudo chown nobody:nogroup %[1]s
+sudo chmod 755 %[1]s`, CheckpointNFSExport)
+}
+
 // kubeadmInitConfig renders the multi-document kubeadm config of the control
 // plane: InitConfiguration, ClusterConfiguration, KubeletConfiguration and
 // KubeProxyConfiguration. clean is the cleaned Kubernetes version (e.g. "1.35.0").
@@ -323,6 +343,10 @@ const (
 	WorkerPhaseGPUCDI      = 6
 	WorkerPhaseCRIORestart = 7
 	WorkerPhaseJoin        = 8
+	// WorkerPhaseSharedStorage mounts the control plane's shared checkpoint NFS
+	// directory. It is the LAST phase so the numbering of the earlier ones (stored
+	// as progress on in-flight provisioning) is unchanged, and it never fails.
+	WorkerPhaseSharedStorage = 9
 )
 
 // crioCDIDropInSteps returns the steps that enable CDI in CRI-O (the NVIDIA
@@ -639,6 +663,10 @@ sudo chmod 755 /srv/nfs/k8s
 grep -qxF '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' /etc/exports || \
   echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
 sudo exportfs -ra`,
+
+			// The shared checkpoint directory every worker mounts (it lives under the
+			// /srv/nfs/k8s export above, so it needs no export line of its own).
+			checkpointExportStep(),
 
 			// Second, separate export for Enterprise Gateway's kernelspecs (see
 			// EGKernelspecsExportPath). Kept as its own always-run, self-idempotent
@@ -1118,6 +1146,7 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 			pkgruntime.CNIPluginsInstallScript(),
 		}, joinWorkerStepsFor(joinCmd, clean)...)},
 	}
+	phases = append(phases, sharedStoragePhases(joinCmd)...)
 
 	// A provisioning run that restarts from an early phase (the phase-progress
 	// annotation was lost, or the controller restarted right after a successful

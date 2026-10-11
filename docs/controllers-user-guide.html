@@ -1416,6 +1416,29 @@ ssh ubuntu@&lt;cp-ip&gt; 'wg show wg0'
   after <code>password</code>/<code>secret</code>/<code>token</code>/<code>key</code> style keys). Because the rule is deliberately broad, a
   diagnostic such as <code>secret: &lt;word&gt;</code> may lose the word that follows it.</li>
 </ul>
+<p><strong>Shared checkpoint storage (every worker)</strong> — each worker node mounts the control plane's <code>/srv/nfs/k8s/checkpoint-storage</code> export at <code>/shared-pvc/checkpoint-storage</code> once it has joined. It applies to every way a worker is created: the AWS and GCP bootstrap, the on-prem <code>NodeProvision</code>, and <code>RemoteCluster</code> workers. The steps are the manual ones —</p>
+<pre><code class="language-bash">sudo apt-get update &amp;&amp; sudo apt-get install -y nfs-common
+sudo mkdir -p /shared-pvc/checkpoint-storage
+sudo mount -t nfs &lt;control-plane-ip&gt;:/srv/nfs/k8s/checkpoint-storage /shared-pvc/checkpoint-storage
+</code></pre>
+<p>— where <code>&lt;control-plane-ip&gt;</code> is the host of the cluster's join command (the VPN IP, or the private IP without a VPN: the address the node already reaches the control plane on). Details:</p>
+<ul>
+<li><em>Idempotent and persistent.</em> Nothing is remounted if the path is already mounted, and an
+<code>/etc/fstab</code> entry (<code>nfs defaults,_netdev,nofail,x-systemd.automount</code>) is written, replacing any
+earlier entry for the same mount point and leaving other lines alone — so the mount comes back
+after a reboot (the GCE startup script exits early on reboot) even if the tunnel is not up yet, and
+a node re-created from an image of another cluster does not keep a stale server.</li>
+<li><em>Never fails the node.</em> The mount is retried (5 time-bounded attempts) after the join; if it still
+cannot be mounted the node keeps going and the log shows <code>WARNING: could not mount …</code> (the
+<code>fstab</code> entry keeps retrying at boot). Check that the control plane's firewall / security group
+allows NFS (TCP/UDP 2049, and 111 for NFSv3) from the workers.</li>
+<li><em>Control plane.</em> The NFS phase of a new control plane creates the directory under the existing
+<code>/srv/nfs/k8s</code> export. A control plane provisioned earlier lacks it: the worker creates it through
+the parent export (<code>no_root_squash</code>) the first time it mounts.</li>
+<li><em>Where.</em> AWS/GCP: after the join in the bootstrap script (<code>/var/log/node-bootstrap.log</code>);
+on-prem <code>NodeProvision</code>: a step after the kubelet restart; <code>RemoteCluster</code> workers: a final
+&quot;Shared Storage&quot; phase (so the numbering of earlier phases is unchanged).</li>
+</ul>
 <p><strong>Controller image</strong> — the published image is <strong>no longer obfuscated</strong>. Obfuscation (garble)
 is opt-in at build time with <code>--build-arg OBFUSCATE=true</code> (or the <code>OBFUSCATE</code> repository variable
 for the publish workflow) and makes crash traces much harder to read.</p>
