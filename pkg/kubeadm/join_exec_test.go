@@ -14,7 +14,9 @@ const testJoinCmd = "kubeadm join 10.8.0.1:6443 --token abcdef.0123456789abcdef 
 
 type joinEnv struct {
 	*sshtest.Stubs
-	conf string // stand-in for /etc/kubernetes/kubelet.conf
+	conf    string // stand-in for /etc/kubernetes/kubelet.conf
+	cgroup  string // stand-in for /sys/fs/cgroup/cgroup.controllers (exists = cgroups v2)
+	patches string // stand-in for the kubeadm patch directory
 }
 
 func newJoinEnv(t *testing.T) *joinEnv {
@@ -23,7 +25,13 @@ func newJoinEnv(t *testing.T) *joinEnv {
 		t.Skip("bash not available")
 	}
 	s := sshtest.NewStubs(t)
-	j := &joinEnv{Stubs: s, conf: filepath.Join(t.TempDir(), "kubelet.conf")}
+	j := &joinEnv{Stubs: s, conf: filepath.Join(t.TempDir(), "kubelet.conf"),
+		cgroup: filepath.Join(t.TempDir(), "cgroup.controllers"), patches: filepath.Join(t.TempDir(), "patches")}
+	// Hermetic default: a cgroups v2 host (the probe file exists), so nothing
+	// depends on, or writes outside of, the machine running the tests.
+	if err := os.WriteFile(j.cgroup, []byte("cpu memory\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	s.Write("kubeadm", `#!/bin/bash
 echo "kubeadm $1" >> "$FAKE_LOG/kubeadm.calls"
 case "$1" in
@@ -54,7 +62,8 @@ exit 1
 }
 
 func (j *joinEnv) env(extra ...string) []string {
-	return j.Env(append([]string{"CNLAB_KUBELET_CONF=" + j.conf}, extra...)...)
+	return j.Env(append([]string{"CNLAB_KUBELET_CONF=" + j.conf,
+		"CNLAB_CGROUP_CONTROLLERS=" + j.cgroup, "CNLAB_PATCH_DIR=" + j.patches}, extra...)...)
 }
 
 // runSteps executes steps the way the SSH runner does (one `bash -s` per step,

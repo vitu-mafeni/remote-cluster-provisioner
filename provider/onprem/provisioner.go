@@ -520,8 +520,7 @@ fi`); rerr != nil {
 	}
 
 	reportStep("running kubeadm join (may take several minutes — pulling images and bootstrapping TLS)")
-	// Append --cri-socket to use CRI-O instead of defaulting to containerd
-	joinCmd := fmt.Sprintf("sudo timeout 600 %s --cri-socket=unix:///var/run/crio/crio.sock", strings.TrimSpace(netNodeConfig.Status.ClusterJoinCommand))
+	joinCmd := joinNodeCommand(clean, netNodeConfig.Status.ClusterJoinCommand)
 	if rerr := runStep("kubeadm join", 1, 1, joinCmd); rerr != nil {
 		return fail(rerr)
 	}
@@ -1407,4 +1406,17 @@ func withInsecureRegistries(steps []string, hosts []string) []string {
 		return append(steps, s)
 	}
 	return steps
+}
+
+// joinNodeCommand returns the shell command of the on-prem join step: the
+// control plane's `kubeadm join ...` with --cri-socket appended so CRI-O is used
+// instead of defaulting to containerd, run under a 10-minute timeout. On a
+// cgroups v1 host (e.g. Ubuntu 20.04) running Kubernetes >= 1.35 it is preceded
+// by kubeadm.CgroupV1JoinSnippet, which makes the join skip the SystemVerification
+// preflight and set failCgroupV1=false for the kubelet — the same handling the
+// control-plane init and the cloud bootstrap use. version is the cleaned
+// Kubernetes version (e.g. "1.35.0").
+func joinNodeCommand(version, joinCommand string) string {
+	return kubeadm.CgroupV1JoinSnippet(version, "sudo") + "\n" +
+		fmt.Sprintf("sudo timeout 600 %s $CGROUP_V1_JOIN_ARGS --cri-socket=unix:///var/run/crio/crio.sock", strings.TrimSpace(joinCommand))
 }

@@ -250,6 +250,7 @@ type templateData struct {
 	RuntimeCredentials   string // bash export block; Token value must never be logged
 	RuntimeInstallScript string // rendered by pkgruntime.InstallScript
 	NodeJoinedFunc       string // bash function node_already_joined (kubeadm.NodeAlreadyJoinedFunc)
+	CgroupV1JoinSnippet  string // defines CGROUP_V1_JOIN_ARGS (kubeadm.CgroupV1JoinSnippet)
 	NodeIPScript         string // NoVPN node-IP lookup; trusted controller text, see CloudInitParams.NodeIPScript
 	InstanceIDScript     string // current_instance_id body; trusted controller text, see CloudInitParams.InstanceIDScript
 	// InsecureRegistriesScript is the registries.conf.d drop-in writer
@@ -335,6 +336,7 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 		RuntimeCredentials:   runtimeCreds,
 		RuntimeInstallScript: pkgruntime.InstallScript(runtimeCfg),
 		NodeJoinedFunc:       kubeadm.NodeAlreadyJoinedFunc,
+		CgroupV1JoinSnippet:  kubeadm.CgroupV1JoinSnippet(p.KubernetesVersion, ""),
 		NodeIPScript:         nodeIPScript(p),
 		InstanceIDScript:     instanceIDScript(p),
 
@@ -419,18 +421,39 @@ current_instance_id() {
 {{.InstanceIDScript}}}
 
 # kubelet_client_cn prints the CN of kubelet.conf's client certificate
-# ("system:node:<name>"), or nothing when it cannot be determined.
+# ("system:node:<name>"), or nothing when it cannot be determined. $1 is the node
+# name this boot expects. It uses openssl when present; otherwise it looks for this
+# node's identity in the decoded certificate (the CN is a DER string preceded by its
+# length byte, so the exact "<len>system:node:<name>" bytes are matched rather than
+# a pattern, which cannot tell where the string ends). A minimal custom image
+# without openssl is therefore still recognised. When the certificate holds a
+# node identity that is NOT $1 the placeholder "system:node:?" is printed.
 kubelet_client_cn() {
-  local kc="${CNLAB_KUBELET_CONF:-$K8S_DIR/kubelet.conf}" pem="" data=""
+  local want="${1:-}" kc="${CNLAB_KUBELET_CONF:-$K8S_DIR/kubelet.conf}" pem="" data="" txt=""
+  local hex="" marker="73797374656d3a6e6f64653a" want_hex="" len_hex=""
   [[ -f "$kc" ]] || return 0
-  command -v openssl >/dev/null 2>&1 || return 0
   pem="$(awk '$1=="client-certificate:" {print $2; exit}' "$kc")"
   data="$(awk '$1=="client-certificate-data:" {print $2; exit}' "$kc")"
   if [[ -n "$pem" && -f "$pem" ]]; then
-    openssl x509 -in "$pem" -noout -subject -nameopt RFC2253 2>/dev/null
+    txt="$(cat "$pem")"
   elif [[ -n "$data" ]]; then
-    printf '%s' "$data" | base64 -d 2>/dev/null | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null
-  fi | grep -o 'CN=[^,]*' | head -1 | cut -d= -f2-
+    txt="$(printf '%s' "$data" | base64 -d 2>/dev/null)"
+  fi
+  [[ -n "$txt" ]] || return 0
+  txt="$(printf '%s\n' "$txt" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' | head -n 200)"
+  if command -v openssl >/dev/null 2>&1; then
+    printf '%s\n' "$txt" | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null | grep -o 'CN=[^,]*' | head -1 | cut -d= -f2-
+    return 0
+  fi
+  hex="$(printf '%s\n' "$txt" | sed '/^-----/d' | base64 -d 2>/dev/null | od -An -v -tx1 | tr -d ' \n')"
+  case "$hex" in *"$marker"*) ;; *) return 0 ;; esac   # no node identity in it: no judgement
+  want_hex="$(printf 'system:node:%s' "$want" | od -An -v -tx1 | tr -d ' \n')"
+  len_hex="$(printf '%02x' $(( ${#want_hex} / 2 )))"
+  if [[ -n "$want" && "$hex" == *"${len_hex}${want_hex}"* ]]; then
+    printf 'system:node:%s\n' "$want"
+  else
+    printf 'system:node:?\n'
+  fi
 }
 
 # stale_node_state succeeds, setting STALE_REASON, when this disk carries the
@@ -444,10 +467,11 @@ stale_node_state() {
     STALE_REASON="the disk was bootstrapped by instance ${rec}, this is ${cur}"
     return 0
   fi
-  cn="$(kubelet_client_cn || true)"
   want="${NODE_NAME:-$(hostname)}"
   want="${want,,}"
+  cn="$(kubelet_client_cn "$want" || true)"
   if [[ -n "$cn" && "${cn,,}" != "system:node:${want}" ]]; then
+    [[ "$cn" == "system:node:?" ]] && cn="another node"
     STALE_REASON="kubelet.conf belongs to ${cn}, this node is ${want}"
     return 0
   fi
@@ -799,6 +823,11 @@ report "Joining cluster"
 {{.NodeJoinedFunc}}
 JOIN_CMD="$(printf '%s' '{{.JoinCommandB64}}' | base64 -d)"
 
+# cgroups v1 hosts (e.g. Ubuntu 20.04) with Kubernetes >= 1.35: the join needs
+# failCgroupV1=false and the SystemVerification preflight skipped (defines
+# CGROUP_V1_JOIN_ARGS; empty on cgroups v2 or older Kubernetes).
+{{.CgroupV1JoinSnippet}}
+
 # kubeadm's own preflight check for the cluster-info ConfigMap uses a short
 # (~10s) internal timeout, which is too tight for a worker whose WireGuard
 # tunnel may not have finished its handshake/routing yet at boot — that
@@ -824,7 +853,7 @@ else
   # only after CRI-O is proven healthy. --cri-socket prevents kubeadm from probing
   # an unintended container runtime.
   for attempt in 1 2 3 4 5; do
-    if bash -c "$JOIN_CMD --cri-socket=unix://${CRIO_SOCKET}"; then
+    if bash -c "$JOIN_CMD $CGROUP_V1_JOIN_ARGS --cri-socket=unix://${CRIO_SOCKET}"; then
       report "Cluster join succeeded"
       break
     fi

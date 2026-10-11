@@ -785,6 +785,14 @@ instance of the same name that belongs to something else is never adopted or del
   config) before bootstrapping. A reboot of the same node is never reset, and nodes bootstrapped by
   older versions are recognised by their kubelet identity. Before this check existed, such a disk
   stopped at "Bootstrap already completed; nothing to do" and the node never registered.
+- **Ubuntu 20.04 / cgroups v1.** Kubernetes ≥ 1.35 refuses cgroups v1 hosts unless `failCgroupV1` is
+  `false` ("cgroups v1 support is deprecated … FailCgroupV1"), which includes Ubuntu 20.04. Every way a
+  node is created handles it the same way on a cgroups v1 host: the control-plane `kubeadm init` writes
+  `failCgroupV1: false` into the KubeletConfiguration, and every worker join — the AWS and GCP
+  bootstrap, the on-prem `NodeProvision`, and `RemoteCluster` workers over SSH — runs
+  `kubeadm join --ignore-preflight-errors=SystemVerification --patches=<dir>` with a kubelet patch
+  setting `failCgroupV1: false`. cgroups v2 hosts (Ubuntu 22.04+) and Kubernetes < 1.35 are
+  unchanged.
 - **Recommended cleanup before imaging**: `sudo kubeadm reset -f`, `sudo rm -f /var/lib/node-bootstrap-*`,
   `sudo cloud-init clean --logs` and `sudo truncate -s 0 /etc/machine-id` (so every node gets its own
   machine id). Do not bake in VPN keys or registry tokens.
@@ -1136,6 +1144,7 @@ INFO  RemoteCluster cleanup complete
 | GCP node stuck in `Bootstrapping`; no `/var/log/node-bootstrap.log`; cloud-init shows no user-data | GCP runs the bootstrap from `startup-script` metadata via the Google guest agent, not cloud-init; a custom image without the guest environment never runs it | Install/enable `google-guest-agent` in the image; check `sudo journalctl -u google-startup-scripts.service` |
 | Node booted from a custom image/snapshot of a joined node never registers; log says `Bootstrap already completed; nothing to do` | The image carried the old node's completion marker and kubelet identity | Use a controller version with the image-state reset (it detects and clears inherited state); see "Preparing a custom image or snapshot" in [§5.4](#54-nodeprovision-on-google-cloud-gcp) |
 | `opening SSH connection for credential sync … dial tcp <ip>:0: connection refused` | `spec.sshPort` is unset on cloud nodes and was dialled as port 0 | Fixed: the port now defaults to 22 |
+| `kubeadm join` (or `init`) fails with `[ERROR SystemVerification]: cgroups v1 support is deprecated …` | The node runs cgroups v1 (e.g. Ubuntu 20.04) with Kubernetes ≥ 1.35 | Use a controller version with the cgroups v1 handling (all paths apply `failCgroupV1: false` and skip that preflight); or use Ubuntu 22.04+ (cgroups v2) |
 | Registry pull returns `unauthorized` | Registry credentials missing/empty in the cluster's shared config | Apply the registry credentials Secret (or re-apply the sample, which includes it) |
 | Networking plugins missing after cluster install | An install step was interrupted | Manually install the CNI plugins bundle (`v1.5.1`) to `/opt/cni/bin` on the affected node |
 | GitOps platform resources not appearing / stuck | The platform hasn't synced the new cluster's repository yet, or a stale resource exists from a previous attempt | Check your Nephio/Porch resources; delete stale ones to force re-creation |

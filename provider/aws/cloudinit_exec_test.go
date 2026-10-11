@@ -12,10 +12,14 @@ import (
 
 // joinSection returns the kubeadm-join part of the rendered bootstrap script (the
 // span between the BEGIN/END markers) so it can be EXECUTED in isolation.
-func joinSection(t *testing.T) string {
+func joinSection(t *testing.T) string { return joinSectionFor(t, "1.35.0") }
+
+// joinSectionFor is joinSection for a Kubernetes version.
+func joinSectionFor(t *testing.T, version string) string {
 	t.Helper()
 	p := baseParams()
 	p.NoVPN = true
+	p.KubernetesVersion = version
 	script, err := renderBootstrapScript(p)
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +34,10 @@ func joinSection(t *testing.T) string {
 
 type joinRun struct {
 	*sshtest.Stubs
-	conf string
+	conf    string
+	cgroup  string // stand-in for /sys/fs/cgroup/cgroup.controllers (exists = cgroups v2)
+	patches string // stand-in for the kubeadm patch directory
+	version string // Kubernetes version the join section is rendered for ("" = 1.35.0)
 }
 
 func newJoinRun(t *testing.T) *joinRun {
@@ -54,15 +61,27 @@ esac
 	s.Write("systemctl", "#!/bin/bash\n[ \"$1\" = is-active ]\n")
 	s.Write("curl", "#!/bin/bash\nexit 0\n")
 	s.Write("sleep", "#!/bin/bash\n:\n")
-	return &joinRun{Stubs: s, conf: filepath.Join(t.TempDir(), "kubelet.conf")}
+	j := &joinRun{Stubs: s, conf: filepath.Join(t.TempDir(), "kubelet.conf"),
+		cgroup: filepath.Join(t.TempDir(), "cgroup.controllers"), patches: filepath.Join(t.TempDir(), "patches")}
+	// Hermetic default: a cgroups v2 host, so nothing depends on or writes outside
+	// the machine running the tests.
+	if err := os.WriteFile(j.cgroup, []byte("cpu memory\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return j
 }
 
 func (j *joinRun) run(t *testing.T, extra ...string) (string, error) {
 	t.Helper()
 	prelude := "set -Eeuo pipefail\nreport() { echo \"$*\"; }\nrestart_crio_and_wait() { echo restart >> \"$FAKE_LOG/restart.calls\"; }\nCRIO_SOCKET=/var/run/crio/crio.sock\n"
 	cmd := exec.Command("bash", "-s")
-	cmd.Env = j.Env(append([]string{"CNLAB_KUBELET_CONF=" + j.conf}, extra...)...)
-	cmd.Stdin = strings.NewReader(prelude + joinSection(t))
+	cmd.Env = j.Env(append([]string{"CNLAB_KUBELET_CONF=" + j.conf,
+		"CNLAB_CGROUP_CONTROLLERS=" + j.cgroup, "CNLAB_PATCH_DIR=" + j.patches}, extra...)...)
+	version := j.version
+	if version == "" {
+		version = "1.35.0"
+	}
+	cmd.Stdin = strings.NewReader(prelude + joinSectionFor(t, version))
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

@@ -118,19 +118,160 @@ func ParseKubernetesVersion(v string) (clean, repoVersion string, err error) {
 	return clean, parts[0] + "." + parts[1], nil
 }
 
-func cgroupV1CompatibilitySettings(version string) (configStep, preflightArg string) {
+// cgroupV1Applies reports whether a kubelet of this Kubernetes version refuses to
+// run on a cgroups v1 host unless failCgroupV1 is false (Kubernetes >= 1.35).
+func cgroupV1Applies(version string) bool {
 	parts := strings.Split(version, ".")
 	if len(parts) < 2 {
-		return "", ""
+		return false
 	}
 	major, majorErr := strconv.Atoi(parts[0])
 	minor, minorErr := strconv.Atoi(parts[1])
-	if majorErr != nil || minorErr != nil || (major < 1 || (major == 1 && minor < 35)) {
+	return majorErr == nil && minorErr == nil && (major > 1 || (major == 1 && minor >= 35))
+}
+
+func cgroupV1CompatibilitySettings(version string) (configStep, preflightArg string) {
+	if !cgroupV1Applies(version) {
 		return "", ""
 	}
 	return `if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then
   sudo sed -i '/^featureGates:/i failCgroupV1: false' /tmp/kubeadm-config.yaml
 fi`, ` $(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)`
+}
+
+// CgroupV1JoinSnippet returns bash that defines CGROUP_V1_JOIN_ARGS, the extra
+// `kubeadm join` arguments a WORKER needs on a cgroups v1 host (e.g. Ubuntu
+// 20.04) running Kubernetes >= 1.35 — the join counterpart of the init handling in
+// cgroupV1CompatibilitySettings. Without them the join fails kubeadm's
+// SystemVerification preflight ("cgroups v1 support is deprecated ..."), and even
+// past it the kubelet refuses to start unless failCgroupV1 is false. The
+// arguments are:
+//
+//	--ignore-preflight-errors=SystemVerification
+//	--patches=<dir>   a kubeletconfiguration patch setting failCgroupV1: false
+//
+// so the worker's kubelet config is correct whatever the cluster's kubelet-config
+// ConfigMap says. On cgroups v2 hosts, or for Kubernetes < 1.35, the variable is
+// empty. sudo ("" or "sudo") prefixes the privileged commands. CNLAB_CGROUP_CONTROLLERS
+// and CNLAB_PATCH_DIR override the probed file and the patch directory (tests only).
+func CgroupV1JoinSnippet(version, sudo string) string {
+	if !cgroupV1Applies(version) {
+		return `CGROUP_V1_JOIN_ARGS=""`
+	}
+	if sudo != "" {
+		sudo += " "
+	}
+	return `CGROUP_V1_JOIN_ARGS=""
+if [ ! -e "${CNLAB_CGROUP_CONTROLLERS:-/sys/fs/cgroup/cgroup.controllers}" ]; then
+  # cgroups v1 host: kubelet >= 1.35 needs failCgroupV1=false and kubeadm's
+  # SystemVerification preflight must be skipped.
+  CGROUP_V1_PATCH_DIR="${CNLAB_PATCH_DIR:-/var/lib/node-bootstrap-kubeadm-patches}"
+  ` + sudo + `mkdir -p "$CGROUP_V1_PATCH_DIR"
+  printf 'failCgroupV1: false\n' | ` + sudo + `tee "$CGROUP_V1_PATCH_DIR/kubeletconfiguration+merge.yaml" >/dev/null
+  CGROUP_V1_JOIN_ARGS="--ignore-preflight-errors=SystemVerification --patches=$CGROUP_V1_PATCH_DIR"
+  echo "cgroups v1 host: joining with failCgroupV1=false and SystemVerification ignored"
+fi`
+}
+
+// kubeadmInitConfig renders the multi-document kubeadm config of the control
+// plane: InitConfiguration, ClusterConfiguration, KubeletConfiguration and
+// KubeProxyConfiguration. clean is the cleaned Kubernetes version (e.g. "1.35.0").
+func kubeadmInitConfig(nodeIP, clean, clusterName string) string {
+	cfg := fmt.Sprintf(`
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: %s
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///var/run/crio/crio.sock
+  imagePullPolicy: IfNotPresent
+  imagePullSerial: true
+  taints:
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/control-plane
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: "v%s"
+clusterName: %s
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+  dnsDomain: cluster.local
+controlPlaneEndpoint: ""
+apiServer:
+  extraArgs:
+    - name: runtime-config
+      value: "resource.k8s.io/v1beta1=true"
+    - name: feature-gates
+      value: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
+controllerManager:
+  extraArgs:
+    - name: feature-gates
+      value: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
+scheduler:
+  extraArgs:
+    - name: feature-gates
+      value: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+maxPods: 200
+maxParallelImagePulls: 5
+serializeImagePulls: false
+cgroupDriver: systemd
+containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
+featureGates:
+  DynamicResourceAllocation: true
+	DRAConsumableCapacity: true
+runtimeRequestTimeout: "15m"
+imageGCHighThresholdPercent: 95
+imageGCLowThresholdPercent: 90
+evictionHard:
+  imagefs.available: "15%%"
+  memory.available: "500Mi"
+  nodefs.available: "10%%"
+  nodefs.inodesFree: "5%%"
+evictionPressureTransitionPeriod: 0s
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: ipvs
+`, nodeIP, clean, yamlString(clusterName))
+	return normalizeKubeadmConfig(cfg)
+}
+
+// kubeadmInitSteps returns the shell steps of the "kubeadm Init" phase:
+// write the config (plus the cgroups v1 adjustment of it), check CRI-O, run
+// `kubeadm init` (guarded by `test -f admin.conf`, so it is safe to retry) with the
+// cgroups v1 preflight argument, and set up the admin kubeconfig.
+func kubeadmInitSteps(kubeadmConfig, cgroupV1ConfigStep, cgroupV1PreflightArg string) []string {
+	return []string{
+		`sudo mkdir -p /var/lib/kubelet /etc/containers`,
+		fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF\n%s", kubeadmConfig, cgroupV1ConfigStep),
+		`sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
+  || { sudo systemctl restart crio && sleep 5 && \
+       sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
+       || { sudo journalctl -xeu crio.service --no-pager >&2; false; }; }`,
+		`test -f /etc/kubernetes/admin.conf || ( \
+sudo kubeadm init --config /tmp/kubeadm-config.yaml` + cgroupV1PreflightArg + `; RC=$?; \
+if [ $RC -ne 0 ]; then \
+  echo "=== crictl ps -a ===" >&2; \
+  sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a >&2 2>&1 || true; \
+  CIDS=$(sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a -q 2>/dev/null | head -6); \
+  for CID in $CIDS; do \
+    echo "=== container logs: $CID ===" >&2; \
+    sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock logs --tail=50 "$CID" >&2 2>&1 || true; \
+  done; \
+  echo "=== kubelet journal ===" >&2; \
+  sudo journalctl -xeu kubelet --no-pager -n 80 >&2 2>&1 || true; \
+fi; \
+exit $RC )`,
+		"mkdir -p $HOME/.kube",
+		"sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config",
+		"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
+	}
 }
 
 func normalizeKubeadmConfig(config string) string {
@@ -229,7 +370,12 @@ func insecureRegistriesConfStep(sw infrav1.SoftwareConfig) (string, error) {
 // of the API Server ... context deadline exceeded". Explicitly waiting for
 // the endpoint to answer first, then retrying the join itself a few times,
 // converges far faster than relying on an outer reconcile retry.
-func joinWorkerSteps(joinCmd string) []string {
+func joinWorkerSteps(joinCmd string) []string { return joinWorkerStepsFor(joinCmd, "") }
+
+// joinWorkerStepsFor is joinWorkerSteps for a worker running Kubernetes version
+// (cleaned, e.g. "1.35.0"): on a cgroups v1 host with Kubernetes >= 1.35 the join
+// carries CgroupV1JoinSnippet's arguments. An empty version adds nothing.
+func joinWorkerStepsFor(joinCmd, version string) []string {
 	apiEndpoint := JoinEndpoint(joinCmd)
 
 	var steps []string
@@ -252,8 +398,9 @@ if node_already_joined %[2]s; then
   echo "Node is already joined to the cluster (kubelet healthy, API server reachable); skipping kubeadm join"
   exit 0
 fi
+%[4]s
 for attempt in 1 2 3 4 5; do
-  if sudo %[1]s --cri-socket=unix:///var/run/crio/crio.sock; then
+  if sudo %[1]s $CGROUP_V1_JOIN_ARGS --cri-socket=unix:///var/run/crio/crio.sock; then
     echo "kubeadm join succeeded"
     break
   fi
@@ -272,7 +419,7 @@ for attempt in 1 2 3 4 5; do
   # reached when the node is NOT healthily joined).
   sudo kubeadm reset --force --cri-socket=unix:///var/run/crio/crio.sock >/dev/null 2>&1 || true
   sleep $((attempt * 15))
-done`, joinCmd, sshhelper.ShellQuote(apiEndpoint), NodeAlreadyJoinedFunc))
+done`, joinCmd, sshhelper.ShellQuote(apiEndpoint), NodeAlreadyJoinedFunc, CgroupV1JoinSnippet(version, "sudo")))
 	return steps
 }
 
@@ -384,69 +531,7 @@ func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteClu
 	}
 	cgroupV1ConfigStep, cgroupV1PreflightArg := cgroupV1CompatibilitySettings(clean)
 
-	kubeadmConfig := fmt.Sprintf(`
-apiVersion: kubeadm.k8s.io/v1beta4
-kind: InitConfiguration
-localAPIEndpoint:
-  advertiseAddress: %s
-  bindPort: 6443
-nodeRegistration:
-  criSocket: unix:///var/run/crio/crio.sock
-  imagePullPolicy: IfNotPresent
-  imagePullSerial: true
-  taints:
-    - effect: NoSchedule
-      key: node-role.kubernetes.io/control-plane
----
-apiVersion: kubeadm.k8s.io/v1beta4
-kind: ClusterConfiguration
-kubernetesVersion: "v%s"
-clusterName: %s
-networking:
-  podSubnet: "10.244.0.0/16"
-  serviceSubnet: "10.96.0.0/12"
-  dnsDomain: cluster.local
-controlPlaneEndpoint: ""
-apiServer:
-  extraArgs:
-    - name: runtime-config
-      value: "resource.k8s.io/v1beta1=true"
-    - name: feature-gates
-      value: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
-controllerManager:
-  extraArgs:
-    - name: feature-gates
-      value: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
-scheduler:
-  extraArgs:
-    - name: feature-gates
-      value: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
----
-apiVersion: kubelet.config.k8s.io/v1beta1
-kind: KubeletConfiguration
-maxPods: 200
-maxParallelImagePulls: 5
-serializeImagePulls: false
-cgroupDriver: systemd
-containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
-featureGates:
-  DynamicResourceAllocation: true
-	DRAConsumableCapacity: true
-runtimeRequestTimeout: "15m"
-imageGCHighThresholdPercent: 95
-imageGCLowThresholdPercent: 90
-evictionHard:
-  imagefs.available: "15%%"
-  memory.available: "500Mi"
-  nodefs.available: "10%%"
-  nodefs.inodesFree: "5%%"
-evictionPressureTransitionPeriod: 0s
----
-apiVersion: kubeproxy.config.k8s.io/v1alpha1
-kind: KubeProxyConfiguration
-mode: ipvs
-`, nodeIP, clean, yamlString(cluster.Spec.ClusterName))
-	kubeadmConfig = normalizeKubeadmConfig(kubeadmConfig)
+	kubeadmConfig := kubeadmInitConfig(nodeIP, clean, cluster.Spec.ClusterName)
 
 	// Mirrors the worker-join labeling logic below (see labelAndTaintCmd) so a
 	// single-node ("one box") cluster — where the control-plane node is also
@@ -658,31 +743,7 @@ printf '[Unit]\nAfter=crio.service\nRequires=crio.service\n' \
 
 		// ── Phase 7: kubeadm init ─────────────────────────────────────────────────────
 		// kubeadm init is guarded by `test -f admin.conf` so it is safe to retry.
-		{Name: "kubeadm Init", Steps: []string{
-			`sudo mkdir -p /var/lib/kubelet /etc/containers`,
-			fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF\n%s", kubeadmConfig, cgroupV1ConfigStep),
-			`sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
-  || { sudo systemctl restart crio && sleep 5 && \
-       sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
-       || { sudo journalctl -xeu crio.service --no-pager >&2; false; }; }`,
-			`test -f /etc/kubernetes/admin.conf || ( \
-sudo kubeadm init --config /tmp/kubeadm-config.yaml` + cgroupV1PreflightArg + `; RC=$?; \
-if [ $RC -ne 0 ]; then \
-  echo "=== crictl ps -a ===" >&2; \
-  sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a >&2 2>&1 || true; \
-  CIDS=$(sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a -q 2>/dev/null | head -6); \
-  for CID in $CIDS; do \
-    echo "=== container logs: $CID ===" >&2; \
-    sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock logs --tail=50 "$CID" >&2 2>&1 || true; \
-  done; \
-  echo "=== kubelet journal ===" >&2; \
-  sudo journalctl -xeu kubelet --no-pager -n 80 >&2 2>&1 || true; \
-fi; \
-exit $RC )`,
-			"mkdir -p $HOME/.kube",
-			"sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config",
-			"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
-		}},
+		{Name: "kubeadm Init", Steps: kubeadmInitSteps(kubeadmConfig, cgroupV1ConfigStep, cgroupV1PreflightArg)},
 
 		// ── Phase 8: Post-init ───────────────────────────────────────────────────────
 		{Name: "Post-Init", Steps: []string{
@@ -1055,7 +1116,7 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 			// plugins bundle here so portmap is already present before the
 			// flannel pod lands. Idempotent: skipped once portmap is present.
 			pkgruntime.CNIPluginsInstallScript(),
-		}, joinWorkerSteps(joinCmd)...)},
+		}, joinWorkerStepsFor(joinCmd, clean)...)},
 	}
 
 	// A provisioning run that restarts from an early phase (the phase-progress
