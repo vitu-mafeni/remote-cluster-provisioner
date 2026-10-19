@@ -251,6 +251,7 @@ type templateData struct {
 	RuntimeInstallScript string // rendered by pkgruntime.InstallScript
 	NodeJoinedFunc       string // bash function node_already_joined (kubeadm.NodeAlreadyJoinedFunc)
 	CgroupV1JoinSnippet  string // defines CGROUP_V1_JOIN_ARGS (kubeadm.CgroupV1JoinSnippet)
+	LonghornPackages     string // space-separated apt packages Longhorn needs (kubeadm.LonghornPackagesArg)
 	// CheckpointStorageSnippet mounts the control plane's shared checkpoint NFS
 	// directory (kubeadm.CheckpointStorageMountSnippet); empty when the join
 	// command has no usable control-plane host.
@@ -341,6 +342,7 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 		RuntimeInstallScript:     pkgruntime.InstallScript(runtimeCfg),
 		NodeJoinedFunc:           kubeadm.NodeAlreadyJoinedFunc,
 		CgroupV1JoinSnippet:      kubeadm.CgroupV1JoinSnippet(p.KubernetesVersion, ""),
+		LonghornPackages:         kubeadm.LonghornPackagesArg(),
 		CheckpointStorageSnippet: kubeadm.CheckpointStorageMountSnippet(kubeadm.NFSServerFromJoinCommand(p.JoinCommand), ""),
 		NodeIPScript:             nodeIPScript(p),
 		InstanceIDScript:         instanceIDScript(p),
@@ -634,6 +636,10 @@ dpkg --configure -a
 apt_update
 apt_install ca-certificates curl gnupg apt-transport-https lsof jq \
   {{if not .NoVPN}}wireguard {{end}}iproute2 socat conntrack
+
+# Longhorn node prerequisites: open-iscsi (iscsid), NFS client, cryptsetup, dmsetup.
+apt_install {{.LonghornPackages}}
+systemctl enable --now iscsid
 
 {{if .NoVPN}}report "VPN disabled; using the instance private IP as the node IP"
 {{.NodeIPScript}}{{else}}report "Configuring WireGuard"

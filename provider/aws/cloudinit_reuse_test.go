@@ -74,3 +74,18 @@ func TestRenderBootstrapScriptExportedMatchesInternalAndValidates(t *testing.T) 
 		t.Error("invalid parameters must be rejected")
 	}
 }
+
+func TestRenderBootstrapScript_InstallsLonghornPrerequisites(t *testing.T) {
+	script, err := renderBootstrapScript(baseParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"apt_install open-iscsi nfs-common cryptsetup dmsetup",
+		"systemctl enable --now iscsid",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("bootstrap script must contain %q", want)
+		}
+	}
+}

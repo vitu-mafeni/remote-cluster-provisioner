@@ -322,10 +322,13 @@ net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
 			},
 		},
 		{
-			label: "installing base packages (apt-get update, curl, gnupg)",
+			label: "installing base packages (apt-get update, curl, gnupg, Longhorn prerequisites)",
 			cmds: []string{
 				"sudo apt-get update",
 				"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg apt-transport-https",
+				// Longhorn node prerequisites: open-iscsi + iscsid, NFS client, cryptsetup, dmsetup.
+				"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y " + kubeadm.LonghornPackagesArg(),
+				"sudo systemctl enable --now iscsid",
 			},
 		},
 		wgGroup,

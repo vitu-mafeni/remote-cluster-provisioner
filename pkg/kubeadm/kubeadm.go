@@ -720,6 +720,9 @@ fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 		{Name: "APT Repos", Steps: []string{
 			"sudo apt-get update",
 			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates software-properties-common curl gnupg apt-transport-https",
+			// Longhorn node prerequisites: open-iscsi + iscsid, NFS client, cryptsetup, dmsetup.
+			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y " + LonghornPackagesArg(),
+			"sudo systemctl enable --now iscsid",
 			"sudo install -m 0755 -d /etc/apt/keyrings",
 			"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
 			fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
@@ -916,14 +919,14 @@ EOF`,
 //   - nfs.path          → /srv/nfs/k8s
 //   - storageClass.defaultClass → true  (replaces false, or inserts if absent)
 func installNFSProvisioner(client *sshhelper.Client, nfsServerIP string) error {
-	log.Printf("Installing NFS provisioner (server: %s)", nfsServerIP)
+	log.Printf("Installing longhorn provisioner (server: %s)", nfsServerIP)
 
-	nfsDir := "/tmp/catalog/workloads/ml-platform/nfs-provisioner"
+	nfsDir := "/tmp/catalog/workloads/ml-platform/longhorn"
 
 	steps := []string{
 		// HelmRelease resources target the storage namespace.
 		"kubectl create namespace storage 2>/dev/null || true",
-		"sudo mkdir -p /srv/nfs/k8s 2>/dev/null || true",
+		// "sudo mkdir -p /srv/nfs/k8s 2>/dev/null || true",
 
 		// Patch every YAML file in the provisioner directory in-place.
 		//
@@ -933,14 +936,14 @@ func installNFSProvisioner(client *sshhelper.Client, nfsServerIP string) error {
 		//       sed receives single \  (used as sed command prefix, e.g. a\ or \| address)
 		//   \\n in raw string = \\ + n
 		//       shell collapses \\ → \, n stays → sed receives \n (newline in append text)
-		fmt.Sprintf(`for f in %s/*.yaml %s/*.yml; do \
-  [ -f "$f" ] || continue; \
-  sed -i "s/server: .*/server: %s/" "$f"; \
-  sed -i "s|path: .*|path: /srv/nfs/k8s|" "$f"; \
-  sed -i "s/defaultClass: false/defaultClass: true/" "$f"; \
-  grep -q "defaultClass" "$f" || \
-    sed -i "\|path: /srv/nfs/k8s|a\\    storageClass:\\n      defaultClass: true" "$f"; \
-done`, nfsDir, nfsDir, nfsServerIP),
+		// 		fmt.Sprintf(`for f in %s/*.yaml %s/*.yml; do \
+		//   [ -f "$f" ] || continue; \
+		//   sed -i "s/server: .*/server: %s/" "$f"; \
+		//   sed -i "s|path: .*|path: /srv/nfs/k8s|" "$f"; \
+		//   sed -i "s/defaultClass: false/defaultClass: true/" "$f"; \
+		//   grep -q "defaultClass" "$f" || \
+		//     sed -i "\|path: /srv/nfs/k8s|a\\    storageClass:\\n      defaultClass: true" "$f"; \
+		// done`, nfsDir, nfsDir, nfsServerIP),
 
 		fmt.Sprintf("kubectl apply -f %s/", nfsDir),
 	}
@@ -948,11 +951,11 @@ done`, nfsDir, nfsDir, nfsServerIP),
 	for i, cmd := range steps {
 		output, err := runStep(client, cmd)
 		if err != nil {
-			return sshhelper.StepError(fmt.Sprintf("nfs provisioner install step %d/%d", i+1, len(steps)), err, output)
+			return sshhelper.StepError(fmt.Sprintf("longhorn provisioner install step %d/%d", i+1, len(steps)), err, output)
 		}
 	}
 
-	log.Printf("NFS provisioner installed successfully")
+	log.Printf("Longhorn provisioner installed successfully")
 	return nil
 }
 
@@ -1080,8 +1083,10 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 		{Name: "APT Repos", Steps: []string{
 			"sudo apt-get update",
 			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg apt-transport-https",
-			// nfs-common: kernel NFS client + mount.nfs so the node can mount NFS volumes.
-			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common",
+			// Longhorn node prerequisites: open-iscsi + iscsid, NFS client (nfs-common:
+			// mount.nfs for NFS volumes), cryptsetup, dmsetup.
+			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y " + LonghornPackagesArg(),
+			"sudo systemctl enable --now iscsid",
 			"sudo install -m 0755 -d /etc/apt/keyrings",
 			"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
 			fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),

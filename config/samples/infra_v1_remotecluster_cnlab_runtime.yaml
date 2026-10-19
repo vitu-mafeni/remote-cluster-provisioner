@@ -16,7 +16,7 @@ metadata:
 type: Opaque
 stringData:
   username: "vitu-mafeni"
-  token: "ghp_tzldwRXEXAMPLEBT3H22Bf"  # packages:read scope minimum
+  token: "ghp_tzldwRXWTYEXAMPLEST3H22Bf"  # packages:read scope minimum
 
 ---
 
@@ -86,7 +86,8 @@ spec:
         # Image repository path. Default: vitu-mafeni/cnlab-runtime
         repository: "vitu-mafeni/cnlab-runtime"
         # Artifact version tag. Default: 1.0.0-beta
-        version: "1.0.2-beta"
+        version: "1.0.2"
+        osVariant: auto
         # ORAS CLI version used to pull the artifact. Default: 1.3.2
         orasVersion: "1.3.2"
         # Secret containing "username" and "token" for registry auth.
@@ -129,13 +130,13 @@ spec:
         - key: CREDENTIAL_KEY              # Fernet key — generate once, never rotate without migrating data
           value: "AQJL23-VxrSDvFzN-boWATO_lZccptMvQEQXosSVOv4="
         - key: GHCR_DOCKERCONFIGJSON       # raw JSON (not base64) — see generation command above
-          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldwRXWTY9EXAMPLE6SFgEBT3H22Bf","auth":"dml0dS1tYWZlEXAMPLEUU9memk0aHV6a0lTNlNGZ0VCVDNIMjJCZg=="}}}'
+          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldwRXWTEXAMPLESS6SFgEBT3H22Bf","auth":"dml0dS1tYWZlbmk6Z2hwEXAMPLESmk0aHV6a0lTNlNGZ0VCVDNIMjJCZg=="}}}'
 
         # ── Image tags (required — whatever you built and pushed to GHCR) ──────
         - key: QUOTA_API_IMAGE
-          value: "ghcr.io/vitu-mafeni/quota-api:0.1.0-fluidcr"
+          value: "ghcr.io/vitu-mafeni/quota-api:0.1.0-storage"
         - key: FRONTEND_IMAGE
-          value: "ghcr.io/vitu-mafeni/ml-platform-frontend:0.1.0-fluidcr"
+          value: "ghcr.io/vitu-mafeni/ml-platform-frontend:0.1.0-storage"
 
         # ── Network overrides (optional — auto-computed from spec.host) ────────
         - key: JUPYTERHUB_PUBLIC_URL
@@ -185,7 +186,7 @@ spec:
         #   value: "<your-robot-account-token>"
 
         - key: CHECKPOINT_API_URL
-          value: "http://192.168.3.234:30829"
+          value: ""
 
         # ── Idle GPU reclamation (optional — default is admin-UI / DB managed) ─
         # Uncomment RECLAMATION_POLICY_SOURCE first to switch to env-driven policy.
@@ -256,7 +257,9 @@ stringData:
     izXUrnyP2zG1AqpxMWo6n0ncmXOEGc/wvDEOCtAO/6K+xd1yM9CWcJfSpKP7eV+i
     V3xzpGodSV2kvOEok72+hcfj+YClmtNAZgk8Y9tMvG9hGkMh+PL5Hs2Tbs29DSJb
     cRZHaIs3w26CxIM8n5jxIwmQCgwKY+ISP9t6l/0axOOPwECpgOCQ3yWFeikmVKNe
-    EXAMPLEJKNSBX/PhNUF
+    xA/N894Ru/yG0JdJMIbcQJAUd7v53jZI/F2F7QvTLBJtM5zBoH1ycnidGGzPagIn
+    +WaRXxuEe2ZbHUu+EuOYLQSzo6OZKj+OV+CRMFs4sgyG7eYs1QO1TmwM1b6AfhTG
+    EXAMPLES
     tA2kHQN9OarIrbFI8Ib/GG5ifPszcqeTHx2zUzciTbG+2maytPBn9ux5mKtrvtQT
     6TpcDPIREuyrm1V69Ifj25zDDOYyNluLo4KuDBSjtlR+ep9p7veSadeeHClWzn65
     4whYT5uz0XPQQ7RfmvcyTQKBgAa+MlZsnb/81LZgzERE5mUULC73Ve6tzomZMceb
@@ -277,7 +280,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: EXAMPLEE
+  password: dckr_pat_gBvErEXAMPLESAaQ8TWo
 ---
 # ============================================================
 # RemoteCluster — GPU worker node
