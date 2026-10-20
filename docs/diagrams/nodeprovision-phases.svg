@@ -1,0 +1,64 @@
+<svg viewBox="0 0 1150 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="NodeProvision phase flow: a new resource is validated, then provisioned over SSH (on-prem) or via EC2 and cloud-init (AWS), joins the cluster, optionally pre-pulls images on GPU nodes, then becomes Ready; failures retry up to 5 times before requiring manual attention.">
+  <defs>
+    <marker id="npArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1150" height="470" fill="#ffffff"/>
+
+  <circle cx="40" cy="195" r="6" fill="#1a1a1a"/>
+  <path d="M46,195 L70,195" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+
+  <rect x="70" y="160" width="140" height="70" rx="10" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="140" y="200" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1a1a1a">Pending</text>
+
+  <path d="M210,195 L290,195" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+
+  <rect x="290" y="160" width="220" height="70" rx="10" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="400" y="190" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1a1a1a">Provisioning</text>
+  <text x="400" y="207" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">(SSH, or EC2 + cloud-init)</text>
+
+  <path d="M510,195 L590,195" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+
+  <rect x="590" y="160" width="170" height="70" rx="10" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="675" y="200" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1a1a1a">Joining cluster</text>
+
+  <path d="M760,195 L940,195" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+  <text x="850" y="182" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">otherwise</text>
+
+  <path d="M700,160 C700,60 850,60 940,75" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+  <text x="800" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">GPU node with images configured</text>
+
+  <rect x="940" y="40" width="180" height="70" rx="10" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="1030" y="70" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1a1a1a">Pre-pull images</text>
+  <text x="1030" y="87" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">(GPU nodes)</text>
+  <path d="M1030,110 L1015,160" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+
+  <rect x="940" y="160" width="150" height="70" rx="10" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="1015" y="200" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1a1a1a">Ready</text>
+
+  <path d="M1015,230 L1015,300" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+  <text x="1027" y="268" text-anchor="start" font-family="sans-serif" font-size="11" fill="#1a1a1a">you delete</text>
+  <text x="1027" y="282" text-anchor="start" font-family="sans-serif" font-size="11" fill="#1a1a1a">the resource</text>
+  <rect x="925" y="300" width="180" height="70" rx="10" fill="#1a1a1a" fill-opacity="0.06" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="1015" y="330" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1a1a1a">Deleting</text>
+  <text x="1015" y="347" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">(node, cloud instance, VPN peer removed)</text>
+
+  <rect x="400" y="320" width="200" height="70" rx="10" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="500" y="350" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1a1a1a">Failed</text>
+  <text x="500" y="367" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">(see status.message)</text>
+
+  <path d="M400,230 L400,280 L470,280 L470,320" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+  <path d="M675,230 L675,280 L560,280 L560,320" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+  <text x="500" y="270" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">provisioning or join fails</text>
+
+  <path d="M400,355 L40,355 L40,195 L70,195" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+  <text x="50" y="330" text-anchor="start" font-family="sans-serif" font-size="11" fill="#1a1a1a">retry, up to</text>
+  <text x="50" y="344" text-anchor="start" font-family="sans-serif" font-size="11" fill="#1a1a1a">5 attempts</text>
+
+  <path d="M500,390 L500,412" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#npArrow)"/>
+  <circle cx="500" cy="424" r="8" fill="none" stroke="#1a1a1a" stroke-width="1.5"/>
+  <circle cx="500" cy="424" r="3.5" fill="#1a1a1a"/>
+  <text x="520" y="428" text-anchor="start" font-family="sans-serif" font-size="11" fill="#1a1a1a">retry limit reached — needs your attention</text>
+</svg>

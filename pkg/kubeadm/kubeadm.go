@@ -110,6 +110,85 @@ const (
 	WorkerPhaseJoin        = 8
 )
 
+// insecureRegistriesConfStep returns a shell step that marks the registry
+// host:port of every private image reference in imagePrepulls as insecure
+// (plain HTTP) via a CRI-O registries.conf.d drop-in. This platform's
+// self-hosted registries (e.g. Harbor exposed through a NodePort on the
+// node's own LAN IP) are reached over plain HTTP, not TLS — without this,
+// CRI-O defaults to HTTPS and every pull fails with "server gave HTTP
+// response to HTTPS client". Returns "" (add nothing) when no image
+// reference has a qualified registry host to configure.
+func insecureRegistriesConfStep(imagePrepulls []infrav1.ImagePrepull) string {
+	seen := map[string]bool{}
+	var hosts []string
+	for _, ip := range imagePrepulls {
+		host, _, found := strings.Cut(ip.Image, "/")
+		if !found {
+			continue
+		}
+		// A bare Docker Hub org/user (e.g. "library", "vitu1") has no dot or
+		// colon and isn't a registry host — skip it so unqualified images
+		// don't misfire this check.
+		if !strings.ContainsAny(host, ".:") || seen[host] {
+			continue
+		}
+		seen[host] = true
+		hosts = append(hosts, host)
+	}
+	if len(hosts) == 0 {
+		return ""
+	}
+	fileName := strings.NewReplacer(".", "-", ":", "-").Replace
+	var b strings.Builder
+	b.WriteString("sudo mkdir -p /etc/containers/registries.conf.d\n")
+	for _, h := range hosts {
+		fmt.Fprintf(&b, "cat <<'EOF' | sudo tee /etc/containers/registries.conf.d/50-insecure-%s.conf > /dev/null\n"+
+			"[[registry]]\nlocation = \"%s\"\ninsecure = true\nEOF\n", fileName(h), h)
+	}
+	return b.String()
+}
+
+// joinWorkerSteps returns the shell steps that wait for the control-plane API
+// server to become reachable over the VPN tunnel, then run kubeadm join with
+// its own retry loop. kubeadm's own preflight check for the cluster-info
+// ConfigMap uses a short (~10s) internal timeout, which is too tight for a
+// worker whose WireGuard tunnel may not have finished its handshake/routing
+// yet — that transient race is what produces "couldn't validate the identity
+// of the API Server ... context deadline exceeded". Explicitly waiting for
+// the endpoint to answer first, then retrying the join itself a few times,
+// converges far faster than relying on an outer reconcile retry.
+func joinWorkerSteps(joinCmd string) []string {
+	apiEndpoint := ""
+	fields := strings.Fields(joinCmd)
+	for i, f := range fields {
+		if f == "join" && i+1 < len(fields) {
+			apiEndpoint = fields[i+1]
+			break
+		}
+	}
+
+	var steps []string
+	if apiEndpoint != "" {
+		steps = append(steps, fmt.Sprintf(`echo "Waiting for control-plane API server %[1]s to become reachable over the VPN tunnel..."
+for i in $(seq 1 60); do
+  curl -sk --connect-timeout 3 --max-time 5 "https://%[1]s/healthz" -o /dev/null && { echo "Control-plane API server reachable"; break; }
+  sleep 5
+done`, apiEndpoint))
+	}
+	steps = append(steps, fmt.Sprintf(`for attempt in 1 2 3 4 5; do
+  if sudo %s --cri-socket=unix:///var/run/crio/crio.sock; then
+    echo "kubeadm join succeeded"
+    break
+  fi
+  if [ "$attempt" = "5" ]; then
+    echo "ERROR: kubeadm join failed after 5 attempts" >&2
+    exit 1
+  fi
+  sleep $((attempt * 15))
+done`, joinCmd))
+	return steps
+}
+
 func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster, startPhase int, onPhaseComplete func(int), runtimeCfg pkgruntime.Config) (string, error) {
 	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
 
@@ -181,6 +260,28 @@ kind: KubeProxyConfiguration
 mode: ipvs
 `, tunIP, clean, cluster.Spec.ClusterName)
 
+	// Mirrors the worker-join labeling logic below (see labelAndTaintCmd) so a
+	// single-node ("one box") cluster — where the control-plane node is also
+	// the only compute node — gets the same gpu=on label and PreferNoSchedule
+	// taint a GPU worker would, instead of only the bare hardware-type label.
+	var postInitLabelCmd string
+	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+		postInitLabelCmd = fmt.Sprintf(
+			"kubectl label nodes --all hardware-type=%s gpu=on ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite && kubectl taint nodes --all hardware-type=gpu:PreferNoSchedule --overwrite",
+			cluster.Spec.NodeInfo.HardwareType,
+		)
+	} else {
+		postInitLabelCmd = fmt.Sprintf(
+			"kubectl label nodes --all hardware-type=%s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite",
+			cluster.Spec.NodeInfo.HardwareType,
+		)
+	}
+
+	crioInstallSteps := pkgruntime.InstallSteps(runtimeCfg)
+	if s := insecureRegistriesConfStep(cluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls); s != "" {
+		crioInstallSteps = append(crioInstallSteps, s)
+	}
+
 	phases := []ProvisionPhase{
 		// ── Phase 0: Cleanup ─────────────────────────────────────────────────────────
 		// Only runs on a fresh start (startPhase == 0).  Skipped on retries so that
@@ -197,6 +298,13 @@ mode: ipvs
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
 			"sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
+			// kubeadm reset does NOT remove CNI-created virtual interfaces. A stale
+			// flannel.1 (VXLAN) or cni0 (bridge) left over from a previous
+			// init/reset cycle causes the next flanneld to fail with
+			// "failed to set interface flannel.1 to UP state: address already in use".
+			"sudo ip link delete flannel.1 2>/dev/null || true",
+			"sudo ip link delete cni0 2>/dev/null || true",
+			"sudo ip link delete kube-ipvs0 2>/dev/null || true",
 			// Remove cnlab-runtime so the CRI-O Install phase always performs a
 			// fresh install. dpkg --remove keeps config files in /etc/ but removes
 			// all binaries, ensuring crio/criu are reinstalled from the OCI artifact.
@@ -205,31 +313,39 @@ mode: ipvs
 
 		// ── Phase 1: NFS server ──────────────────────────────────────────────────────
 		{Name: "NFS Server", Steps: []string{
-			// Idempotent: skip install and chown if nfs-kernel-server is already active.
+			// Package install/enable is gated on nfs-kernel-server not already
+			// being active — fine to skip since that only concerns the service
+			// itself. The /srv/nfs/k8s export below must NOT be nested inside
+			// this guard: on a node where nfs-kernel-server is already active
+			// for an unrelated, pre-existing export (e.g. a KubeVirt NFS setup
+			// that predates this provisioner running), the guard would be false
+			// and our own /srv/nfs/k8s directory/export would silently never be
+			// created, leaving kubelet's later NFS mounts to fail with "access
+			// denied by server" since the path was never in /etc/exports at all.
 			`if ! systemctl is-active --quiet nfs-kernel-server; then
   sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
   sudo flock /var/lib/dpkg/lock-frontend -w 60 true 2>/dev/null || true
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server nfs-common
-  sudo mkdir -p /srv/nfs/k8s
-  sudo chown nobody:nogroup /srv/nfs/k8s
-  sudo chmod 755 /srv/nfs/k8s
-  echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports
-  sudo exportfs -ra
   sudo systemctl enable --now nfs-kernel-server
 else
-  echo "nfs-kernel-server already active, skipping"
-fi`,
+  echo "nfs-kernel-server already active, skipping install/enable"
+fi
+sudo mkdir -p /srv/nfs/k8s
+sudo chown nobody:nogroup /srv/nfs/k8s
+sudo chmod 755 /srv/nfs/k8s
+grep -qxF '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' /etc/exports || \
+  echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
+sudo exportfs -ra`,
 
 			// Second, separate export for Enterprise Gateway's kernelspecs (see
 			// EGKernelspecsExportPath). Kept as its own always-run, self-idempotent
-			// step — NOT nested inside the "if ! systemctl is-active" guard above —
-			// so a resumed/retried run (nfs-kernel-server already active from a
-			// prior attempt) still adds this export rather than being skipped along
-			// with the whole block. Appends to /etc/exports (tee -a) rather than
+			// step so a resumed/retried run still adds this export rather than
+			// being skipped. Appends to /etc/exports (tee -a) rather than
 			// overwriting it, since the step above already wrote the /srv/nfs/k8s
 			// line to that file.
 			fmt.Sprintf(`sudo mkdir -p %[1]s /srv/nfs/k8s
+sudo chown 1000:1000 %[1]s
 sudo chmod 755 %[1]s /srv/nfs/k8s
 grep -qxF '%[1]s *(rw,sync,no_subtree_check,no_root_squash)' /etc/exports || \
   echo '%[1]s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
@@ -284,7 +400,7 @@ fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 		}},
 
 		// ── Phase 4: CRI-O Install ──────────────────────────────────────────────────
-		{Name: "CRI-O Install", Steps: pkgruntime.InstallSteps(runtimeCfg)},
+		{Name: "CRI-O Install", Steps: crioInstallSteps},
 
 		// ── Phase 5: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
@@ -312,7 +428,7 @@ fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 
 		// ── Phase 6: Kubernetes components ───────────────────────────────────────────
 		{Name: "K8s Install", Steps: []string{
-			fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages", clean, clean, clean),
+			fmt.Sprintf("sudo DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=%s-* kubeadm=%s-* kubectl=%s-* --allow-change-held-packages --allow-downgrades", clean, clean, clean),
 			"sudo apt-mark hold kubelet kubeadm kubectl",
 			"sudo systemctl enable kubelet",
 			"sudo systemctl stop kubelet 2>/dev/null || true",
@@ -354,13 +470,73 @@ exit $RC )`,
 		// ── Phase 8: Post-init ───────────────────────────────────────────────────────
 		{Name: "Post-Init", Steps: []string{
 			"kubectl taint nodes --all node-role.kubernetes.io/control-plane- || kubectl taint nodes --all node-role.kubernetes.io/master- || true",
-			fmt.Sprintf("kubectl label nodes --all hardware-type=%s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite", cluster.Spec.NodeInfo.HardwareType),
+			postInitLabelCmd,
 		}},
 
 		// ── Phase 9: CNI ─────────────────────────────────────────────────────────────
+		// This phase re-runs in full on every retry until "kubectl wait" below
+		// succeeds (it is not itself split into sub-steps that can be marked
+		// done independently). Every mutation here MUST therefore be a no-op
+		// when already applied, and the DaemonSet must only be bounced when a
+		// change actually happened this run — otherwise a slow-to-converge
+		// cluster gets its CNI pod killed and recreated on every ~30-60s
+		// retry, which prevents the node from ever holding a stable Ready
+		// state long enough to satisfy the wait.
 		{Name: "CNI", Steps: []string{
+			// Flannel's cni-conf.json chains the "flannel" plugin (installed by
+			// flannel's own init container) with the standard "portmap" plugin,
+			// which flannel does NOT ship. Without it CRI-O rejects the whole
+			// conflist as invalid ("failed to find plugin portmap in path
+			// [/opt/cni/bin/]") and reports NetworkPluginNotReady forever, even
+			// though the conflist file is present on disk. Install the standard
+			// CNI plugins bundle so portmap (and friends) exist before flannel
+			// comes up. Idempotent: skipped once portmap is already present.
+			`if [ ! -x /opt/cni/bin/portmap ]; then
+  ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+  CNI_PLUGINS_VERSION=v1.5.1
+  curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${ARCH}-${CNI_PLUGINS_VERSION}.tgz" -o /tmp/cni-plugins.tgz
+  sudo mkdir -p /opt/cni/bin
+  sudo tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin
+  rm -f /tmp/cni-plugins.tgz
+fi`,
 			"kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml",
-			`kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface=wg0"}]'`,
+			// `kubectl apply` above resets the DaemonSet's args to the upstream
+			// manifest (which has no --iface=wg0) on every run, so this check
+			// will legitimately re-fire once per retry until the CNI phase
+			// finally completes — but only bounces the daemonset when the flag
+			// is genuinely missing, not unconditionally.
+			`CHANGED=0
+kubectl -n kube-flannel get daemonset kube-flannel-ds -o jsonpath='{.spec.template.spec.containers[0].args}' | grep -q -- '--iface=wg0' || {
+  kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface=wg0"}]'
+  CHANGED=1
+}
+# Flannel's VXLAN backend defaults to UDP port 8472, which collides with
+# other VXLAN users already on the host network namespace (e.g.
+# Cilium-managed LXD/Incus containers on bare-metal nodes bind
+# 0.0.0.0:8472 for cilium_vxlan), causing "failed to set interface
+# flannel.1 to UP state: address already in use". Pin flannel to a
+# distinct port so its VXLAN socket bind never contends with a
+# pre-existing one. Network below matches the podSubnet configured in
+# kubeadmConfig above. Only rewritten (and the daemonset only bounced) if
+# not already configured, so a healthy flannel pod is left alone on retry.
+kubectl -n kube-flannel get configmap kube-flannel-cfg -o jsonpath='{.data.net-conf\.json}' | grep -q '"Port": 8473' || {
+  cat <<'EOF' > /tmp/net-conf.json
+{
+  "Network": "10.244.0.0/16",
+  "Backend": {
+    "Type": "vxlan",
+    "Port": 8473
+  }
+}
+EOF
+  kubectl -n kube-flannel create configmap kube-flannel-cfg \
+    --from-file=net-conf.json=/tmp/net-conf.json \
+    --dry-run=client -o json | kubectl -n kube-flannel patch configmap kube-flannel-cfg --type merge --patch-file=/dev/stdin
+  CHANGED=1
+}
+if [ "$CHANGED" = "1" ]; then
+  kubectl -n kube-flannel rollout restart daemonset kube-flannel-ds
+fi`,
 			"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
 			"kubectl wait --for=condition=Ready nodes --all --timeout=180s",
 		}},
@@ -393,7 +569,7 @@ EOF`,
 			// ClusterIssuer creation does not fail with "connection refused".
 			`kubectl -n cert-manager wait --for=condition=Available deployment/cert-manager-webhook --timeout=180s 2>/dev/null || true`,
 			`sleep 3`,
-			`kubectl apply -f /tmp/catalog/workloads/ml-platform/harbor/`,
+			// `kubectl apply -f /tmp/catalog/workloads/ml-platform/harbor/`,
 			// Pass 2: real apply. Capture output, print it, then fail only on
 			// actual server errors. Client-side "no matches for kind" errors for
 			// GCP-specific types (ApplyReplacements, RootSync, etc.) are expected
@@ -485,7 +661,13 @@ done`, nfsDir, nfsDir, nfsServerIP),
 }
 
 func getJoinCommand(client *sshhelper.Client) (string, error) {
-	output, err := sshhelper.Run(client, "sudo kubeadm token create --print-join-command --ttl 0")
+	// --kubeconfig is explicit rather than relying on kubeadm's default
+	// resolution: a stray KUBECONFIG env var on the target host (e.g. left
+	// over from an unrelated kubeadm/k8s setup that predates this cluster)
+	// silently redirects kubeadm at a different API server entirely, which
+	// surfaces as a confusing TLS SAN mismatch against the *correct*
+	// cluster's certificate rather than a connection failure.
+	output, err := sshhelper.Run(client, "sudo kubeadm token create --print-join-command --ttl 24h --kubeconfig=/etc/kubernetes/admin.conf")
 	if err != nil {
 		return "", fmt.Errorf("kubeadm token create failed: %w\nOutput: %s", err, output)
 	}
@@ -531,6 +713,11 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 		}
 	}
 
+	crioInstallSteps := pkgruntime.InstallSteps(runtimeCfg)
+	if s := insecureRegistriesConfStep(clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePrepulls); s != "" {
+		crioInstallSteps = append(crioInstallSteps, s)
+	}
+
 	phases := []ProvisionPhase{
 		// ── Phase 0: Cleanup ─────────────────────────────────────────────────────────
 		// Only runs on a fresh start; skipped on retries so kubeadm reset does not
@@ -545,6 +732,13 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 			"sudo systemctl stop crio 2>/dev/null || true",
 			"sudo kubeadm reset -f --cri-socket=unix:///var/run/crio/crio.sock 2>/dev/null || true",
 			"sudo rm -rf /etc/cni/net.d 2>/dev/null || true",
+			// kubeadm reset does NOT remove CNI-created virtual interfaces. A stale
+			// flannel.1 (VXLAN) or cni0 (bridge) left over from a previous
+			// init/join/reset cycle causes the next flanneld to fail with
+			// "failed to set interface flannel.1 to UP state: address already in use".
+			"sudo ip link delete flannel.1 2>/dev/null || true",
+			"sudo ip link delete cni0 2>/dev/null || true",
+			"sudo ip link delete kube-ipvs0 2>/dev/null || true",
 			"sudo dpkg --remove cnlab-runtime 2>/dev/null || true",
 		}},
 
@@ -575,7 +769,7 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 		}},
 
 		// ── Phase 3: CRI-O Install ──────────────────────────────────────────────────
-		{Name: "CRI-O Install", Steps: pkgruntime.InstallSteps(runtimeCfg)},
+		{Name: "CRI-O Install", Steps: crioInstallSteps},
 
 		// ── Phase 4: Start CRI-O ─────────────────────────────────────────────────────
 		{Name: "CRI-O Start", Steps: []string{
@@ -617,9 +811,24 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 		}},
 
 		// ── Phase 8: kubeadm join ─────────────────────────────────────────────────────
-		{Name: "kubeadm Join", Steps: []string{
-			fmt.Sprintf("sudo %s --cri-socket=unix:///var/run/crio/crio.sock", joinCmd),
-		}},
+		{Name: "kubeadm Join", Steps: append([]string{
+			// The cluster-wide flannel DaemonSet will schedule a pod onto this
+			// node once it joins. Its cni-conf.json chains the "flannel" plugin
+			// (installed by flannel's own init container) with the standard
+			// "portmap" plugin, which flannel does NOT ship — without it CRI-O
+			// rejects the whole conflist as invalid and this node's kubelet
+			// reports NetworkPluginNotReady forever. Install the standard CNI
+			// plugins bundle here so portmap is already present before the
+			// flannel pod lands. Idempotent: skipped once portmap is present.
+			`if [ ! -x /opt/cni/bin/portmap ]; then
+  ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+  CNI_PLUGINS_VERSION=v1.5.1
+  curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${ARCH}-${CNI_PLUGINS_VERSION}.tgz" -o /tmp/cni-plugins.tgz
+  sudo mkdir -p /opt/cni/bin
+  sudo tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin
+  rm -f /tmp/cni-plugins.tgz
+fi`,
+		}, joinWorkerSteps(joinCmd)...)},
 	}
 
 	if err := runPhases(client, phases, startPhase, onPhaseComplete); err != nil {

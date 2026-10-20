@@ -16,12 +16,12 @@ limitations under the License.
 */
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
-	"os/exec"
 	"strconv"
 	"strings"
 
@@ -29,6 +29,7 @@ import (
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
+	"golang.org/x/crypto/curve25519"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -63,6 +64,9 @@ func NewInClusterProvisioner(
 	// drift between the two sources never causes an IP collision.
 	// ============================================================
 
+	if netNodeConfig.Spec.VPNRange == nil || *netNodeConfig.Spec.VPNRange == "" {
+		return "", "", fmt.Errorf("NodeProvisionNetConfig has no vpnRange configured")
+	}
 	vpnNodeIP, err = allocateVPNIP(vpnServerClient,
 		*netNodeConfig.Spec.VPNRange,
 		netNodeConfig.Status.UsedIPAddresses,
@@ -592,32 +596,24 @@ func verifyVPNConnectivity(vpnServerClient *sshhelper.Client, vpnNodeIP string) 
 func GenerateWireGuardKeyPair() (string, string, error) { return generateWireGuardKeyPair() }
 
 func generateWireGuardKeyPair() (string, string, error) {
-
-	privateCmd := exec.Command("wg", "genkey")
-
-	var privateOut bytes.Buffer
-	privateCmd.Stdout = &privateOut
-
-	if err := privateCmd.Run(); err != nil {
+	// WireGuard keys are Curve25519 keys. Generate entirely in Go so the
+	// controller pod does not need the `wg` binary installed.
+	var privRaw [32]byte
+	if _, err := rand.Read(privRaw[:]); err != nil {
 		return "", "", fmt.Errorf("failed generating private key: %w", err)
 	}
+	// Curve25519 clamping (RFC 7748 §5)
+	privRaw[0] &= 248
+	privRaw[31] &= 127
+	privRaw[31] |= 64
 
-	privateKey := strings.TrimSpace(privateOut.String())
-
-	publicCmd := exec.Command(
-		"bash",
-		"-c",
-		fmt.Sprintf("echo '%s' | wg pubkey", privateKey),
-	)
-
-	var publicOut bytes.Buffer
-	publicCmd.Stdout = &publicOut
-
-	if err := publicCmd.Run(); err != nil {
-		return "", "", fmt.Errorf("failed generating public key: %w", err)
+	pubRaw, err := curve25519.X25519(privRaw[:], curve25519.Basepoint)
+	if err != nil {
+		return "", "", fmt.Errorf("failed deriving public key: %w", err)
 	}
 
-	publicKey := strings.TrimSpace(publicOut.String())
+	privateKey := base64.StdEncoding.EncodeToString(privRaw[:])
+	publicKey := base64.StdEncoding.EncodeToString(pubRaw)
 
 	return privateKey, publicKey, nil
 }
@@ -679,38 +675,32 @@ func GetNextAvailableIP(vpnRange string, usedIPs []string) (string, error) {
 	return getNextAvailableIP(vpnRange, usedIPs)
 }
 
-// getNextAvailableIP returns the next IP in vpnRange that is not in usedIPs.
+// getNextAvailableIP returns the lowest IP in vpnRange that is not in usedIPs.
+// It always scans from the start of the range so that released IPs are reused
+// rather than the range being exhausted prematurely.
 func getNextAvailableIP(vpnRange string, usedIPs []string) (string, error) {
-	lastUsedIP := ""
-	if len(usedIPs) > 0 {
-		lastUsedIP = usedIPs[len(usedIPs)-1]
-	}
-
 	ip, ipNet, err := net.ParseCIDR(vpnRange)
 	if err != nil {
 		return "", fmt.Errorf("invalid VPN range: %w", err)
 	}
 
-	var nextIP net.IP
-	if lastUsedIP != "" {
-		nextIP = net.ParseIP(lastUsedIP)
-		if nextIP == nil {
-			return "", fmt.Errorf("invalid last used IP: %s", lastUsedIP)
-		}
-	} else {
-		nextIP = ip
+	// Build a lookup set for O(1) membership test.
+	used := make(map[string]struct{}, len(usedIPs))
+	for _, u := range usedIPs {
+		used[u] = struct{}{}
 	}
 
-	for {
-		nextIP = incrementIP(nextIP)
-		if !ipNet.Contains(nextIP) {
-			return "", fmt.Errorf("no available IPs in VPN range")
+	// Scan from the network address upward; skip the network (.0) and broadcast
+	// addresses automatically because they won't be in usedIPs but ipNet.Contains
+	// returns true for them — the Contains check below lets us skip them safely.
+	next := incrementIP(ip.To4())
+	for ipNet.Contains(next) {
+		if _, taken := used[next.String()]; !taken {
+			return next.String(), nil
 		}
-		nextIPStr := nextIP.String()
-		if !contains(usedIPs, nextIPStr) {
-			return nextIPStr, nil
-		}
+		next = incrementIP(next)
 	}
+	return "", fmt.Errorf("no available IPs in VPN range %s", vpnRange)
 }
 
 func contains(usedIPs []string, nextIPStr string) bool {

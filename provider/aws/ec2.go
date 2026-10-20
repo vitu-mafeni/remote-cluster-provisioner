@@ -161,13 +161,18 @@ func ProvisionEC2Node(
 	name := nodeProvision.Name
 	log.Printf("[INFO] NodeProvision/%s: AWS validation successful", name)
 
+	if netNodeConfig.Spec.VPNRange == nil || *netNodeConfig.Spec.VPNRange == "" {
+		return nil, fmt.Errorf("NodeProvisionNetConfig has no vpnRange configured")
+	}
+	vpnRange := *netNodeConfig.Spec.VPNRange
+
 	// ── Allocate VPN IP ────────────────────────────────────────────────────
 	// AllocateVPNIP cross-checks both the CR's UsedIPAddresses and the live
 	// WireGuard peer list on the server, so the chosen IP is guaranteed free
 	// in both sources even if they have drifted.
 	vpnIP, err := onprem.AllocateVPNIP(
 		vpnServerClient,
-		*netNodeConfig.Spec.VPNRange,
+		vpnRange,
 		netNodeConfig.Status.UsedIPAddresses,
 	)
 	if err != nil {
@@ -185,7 +190,7 @@ func ProvisionEC2Node(
 	wgConfig, err := onprem.BuildClientWGConfig(
 		vpnServerClient,
 		vpnIP,
-		*netNodeConfig.Spec.VPNRange,
+		vpnRange,
 		netNodeConfig.Spec.VPNServerPublicConfig.PublicIP,
 		parsePort(netNodeConfig.Spec.VPNServerPublicConfig.VPNPort, 51820),
 		privateKey,
@@ -298,8 +303,22 @@ func WaitForInstanceRunning(
 	}
 
 	inst := out.Reservations[0].Instances[0]
-	if inst.State == nil || inst.State.Name != types.InstanceStateNameRunning {
-		return "", "", nil // caller should requeue
+	if inst.State == nil {
+		return "", "", nil // state not yet reported, caller should requeue
+	}
+	switch inst.State.Name {
+	case types.InstanceStateNameRunning:
+		// fall through to read IP addresses below
+	case types.InstanceStateNameTerminated, types.InstanceStateNameStopped,
+		types.InstanceStateNameStopping, types.InstanceStateNameShuttingDown:
+		// These states are never followed by Running again (barring an explicit
+		// StartInstances call this controller never makes) — surface an error so
+		// the caller fails the NodeProvision instead of polling forever.
+		return "", "", fmt.Errorf("instance %s entered terminal state %q and will never become running",
+			instanceID, inst.State.Name)
+	default:
+		// e.g. Pending — still launching, caller should requeue
+		return "", "", nil
 	}
 
 	private := awssdk.ToString(inst.PrivateIpAddress)
@@ -409,6 +428,9 @@ func ensureDefaultVPC(ctx context.Context, client *ec2.Client, region string) (s
 	created, err := client.CreateDefaultVpc(ctx, &ec2.CreateDefaultVpcInput{})
 	if err != nil {
 		return "", fmt.Errorf("creating default VPC in %s: %w", region, err)
+	}
+	if created.Vpc == nil {
+		return "", fmt.Errorf("CreateDefaultVpc returned nil Vpc in %s", region)
 	}
 	return awssdk.ToString(created.Vpc.VpcId), nil
 }

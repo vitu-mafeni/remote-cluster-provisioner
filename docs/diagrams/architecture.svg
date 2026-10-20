@@ -1,0 +1,87 @@
+<svg viewBox="0 0 1000 650" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Overall architecture: the management cluster's bootstrap controller installs control-plane and worker nodes over SSH and writes shared config to the remote cluster; the remote cluster's scale-out controller reads that config to add more nodes and refreshes tokens against its own Kubernetes API; both controllers register VPN peers on the WireGuard server.">
+  <defs>
+    <marker id="archArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1000" height="650" fill="#ffffff"/>
+
+  <rect x="20" y="30" width="440" height="220" rx="14" fill="#1a1a1a" fill-opacity="0.05" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="40" y="56" font-family="sans-serif" font-size="13" font-weight="700" fill="#1a1a1a">MANAGEMENT CLUSTER</text>
+
+  <rect x="50" y="90" width="170" height="70" rx="8" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="135" y="120" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">Cluster bootstrap</text>
+  <text x="135" y="137" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">controller</text>
+
+  <rect x="250" y="90" width="170" height="70" rx="8" fill="#3b6fb4" fill-opacity="0.25" stroke="#3b6fb4" stroke-width="1.5"/>
+  <text x="335" y="120" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">GitOps platform</text>
+  <text x="335" y="137" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">(Nephio / Porch)</text>
+
+  <path d="M220,125 L250,125" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
+  <circle cx="235" cy="125" r="11" fill="#c0392b" stroke="#c0392b"/>
+  <text x="235" y="129" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">4</text>
+  <text x="235" y="182" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">deploy platform stack</text>
+
+  <rect x="540" y="30" width="440" height="220" rx="14" fill="#1a1a1a" fill-opacity="0.05" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="560" y="56" font-family="sans-serif" font-size="13" font-weight="700" fill="#1a1a1a">REMOTE / WORKLOAD CLUSTER</text>
+
+  <rect x="570" y="90" width="180" height="70" rx="8" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="660" y="120" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">NodeProvisionNetConfig</text>
+  <text x="660" y="137" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">(shared config)</text>
+
+  <rect x="770" y="90" width="180" height="70" rx="8" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="860" y="120" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">Cluster scale-out</text>
+  <text x="860" y="137" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">controller</text>
+
+  <path d="M750,125 L770,125" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
+  <circle cx="760" cy="125" r="11" fill="#c0392b" stroke="#c0392b"/>
+  <text x="760" y="129" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">3</text>
+  <text x="760" y="182" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">reads config</text>
+
+  <path d="M150,160 L150,200 L660,200 L660,160" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
+  <circle cx="405" cy="200" r="11" fill="#c0392b" stroke="#c0392b"/>
+  <text x="405" y="204" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">2</text>
+  <text x="405" y="222" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">write shared config</text>
+
+  <rect x="630" y="320" width="260" height="50" rx="8" fill="#1a1a1a" fill-opacity="0.09" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="760" y="350" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">Cluster's own Kubernetes API</text>
+
+  <path d="M910,160 L910,270 L850,270 L850,320" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
+  <circle cx="910" cy="195" r="11" fill="#c0392b" stroke="#c0392b"/>
+  <text x="910" y="199" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">6</text>
+  <text x="880" y="292" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">refresh token,</text>
+  <text x="880" y="306" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">label nodes</text>
+
+  <rect x="60" y="400" width="260" height="70" rx="8" fill="#1a1a1a" fill-opacity="0.06" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="190" y="430" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">Control-plane node</text>
+  <text x="190" y="447" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">installed via SSH</text>
+
+  <rect x="380" y="400" width="260" height="70" rx="8" fill="#1a1a1a" fill-opacity="0.06" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="510" y="430" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">Worker node</text>
+  <text x="510" y="447" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">joined to the cluster</text>
+
+  <path d="M120,160 L120,380" stroke="#1a1a1a" stroke-width="1.5" fill="none"/>
+  <path d="M120,380 Q120,400 160,400" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
+  <path d="M120,380 L460,380 Q470,380 470,390 L470,400" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
+  <circle cx="120" cy="380" r="11" fill="#c0392b" stroke="#c0392b"/>
+  <text x="120" y="384" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">1</text>
+  <text x="120" y="365" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">install / join</text>
+
+  <path d="M860,160 L860,230 L565,230 L565,400" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
+  <circle cx="860" cy="195" r="11" fill="#c0392b" stroke="#c0392b"/>
+  <text x="860" y="199" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#ffffff">5</text>
+  <text x="860" y="178" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">SSH / cloud-init</text>
+
+  <rect x="370" y="560" width="260" height="60" rx="8" fill="#1a1a1a" fill-opacity="0.06" stroke="#1a1a1a" stroke-width="1.5"/>
+  <text x="500" y="595" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#1a1a1a">WireGuard VPN server</text>
+
+  <path d="M190,470 L190,540 L430,540 L430,560" stroke="#1a1a1a" stroke-width="1.3" stroke-dasharray="4 4" fill="none" marker-end="url(#archArrow)"/>
+  <path d="M510,470 L510,560" stroke="#1a1a1a" stroke-width="1.3" stroke-dasharray="4 4" fill="none" marker-end="url(#archArrow)"/>
+  <text x="290" y="530" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">VPN tunnel</text>
+
+  <path d="M70,160 L10,160 L10,595 L370,595" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
+  <path d="M940,160 L990,160 L990,595 L630,595" stroke="#1a1a1a" stroke-width="1.5" fill="none" marker-end="url(#archArrow)"/>
+  <text x="15" y="510" text-anchor="start" font-family="sans-serif" font-size="11" fill="#1a1a1a">register / remove peer</text>
+  <text x="985" y="510" text-anchor="end" font-family="sans-serif" font-size="11" fill="#1a1a1a">register / remove peer</text>
+</svg>

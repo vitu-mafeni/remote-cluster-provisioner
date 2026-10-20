@@ -89,11 +89,13 @@ spec:
         resources:
           limits:
             cpu: 500m
-            memory: 128Mi
+            memory: 384Mi
           requests:
             cpu: 10m
-            memory: 64Mi
+            memory: 128Mi
         volumeMounts: []
       volumes: []
       serviceAccountName: controller-manager
-      terminationGracePeriodSeconds: 10
+      # Allow background SSH goroutines to receive context cancellation and
+      # close connections cleanly before the process is SIGKILLed.
+      terminationGracePeriodSeconds: 60

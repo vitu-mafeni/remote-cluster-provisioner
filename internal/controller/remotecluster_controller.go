@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -35,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,6 +47,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	mlv1alpha1 "dcn.ssu.ac.kr/infra/api/ml/v1alpha1"
 	infrav1 "dcn.ssu.ac.kr/infra/api/v1"
 	"dcn.ssu.ac.kr/infra/pkg/kubeadm"
 	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
@@ -118,6 +121,29 @@ const (
 	// annotationJoinTokenRefreshedAt records the RFC3339 timestamp of the last
 	// successful kubeadm token refresh so the controller knows when to renew again.
 	annotationJoinTokenRefreshedAt = "infra.dcn.ssu.ac.kr/join-token-refreshed-at"
+	// annotationCnlabCredentialsHash is the SHA-256 hex digest of the cnlab-runtime
+	// registry username+token last synced to the remote cluster.  When this differs
+	// from the current secret, the controller re-pushes the secret and patches
+	// NodeProvisionNetConfig — including on clusters provisioned before credentials
+	// were added — so every cluster stays able to pull runtime updates autonomously.
+	annotationCnlabCredentialsHash = "infra.dcn.ssu.ac.kr/cnlab-credentials-hash"
+	// annotationNetConfigSyncHash is the SHA-256 hex digest of every
+	// NodeProvisionNetConfig spec field this controller keeps in sync from a
+	// RemoteCluster (clusterName, vpnRange, vpnServerPublicConfig,
+	// softwareConfig minus cnlabRuntime, which has its own credential-aware
+	// sync path) — see desiredNodeProvisionNetConfigFields, the single source
+	// of truth both the local and remote sync paths patch from. When this
+	// differs from the current spec, the controller re-patches the remote
+	// cluster's NodeProvisionNetConfig — this is what heals a remote push
+	// missed at controller-restart time (e.g. the remote cluster was
+	// unreachable then), or left incomplete by an earlier partial sync, on
+	// the next successful reconcile — without waiting for another restart or
+	// a worker-join event.
+	annotationNetConfigSyncHash = "infra.dcn.ssu.ac.kr/netconfig-sync-hash"
+	// annotationCoreVariantsCreated marks that core PackageVariants have been
+	// applied so the overlay step can proceed without blocking the reconcile
+	// worker thread with a sleep.
+	annotationCoreVariantsCreated = "infra.dcn.ssu.ac.kr/core-variants-created"
 
 	// tokenRefreshInterval is how often to rotate the kubeadm bootstrap token.
 	// kubeadm tokens expire after 24 h by default; refresh 1 h before expiry.
@@ -149,6 +175,21 @@ const (
 	// control-plane init goroutine.  kubeadm init + CNI setup typically takes
 	// 5-15 minutes, so 30 s gives reasonable responsiveness without hammering.
 	controlPlanePollInterval = 30 * time.Second
+
+	// maxProvisionRetries is the number of consecutive provisioning failures
+	// allowed before the controller stops retrying and leaves the RemoteCluster
+	// in a terminal Failed state requiring manual intervention.
+	maxProvisionRetries = 5
+
+	// maxCnlabSyncRetries is the number of consecutive SSH failures allowed when
+	// pushing cnlab-runtime credentials to the remote cluster before the controller
+	// stops retrying and surfaces an error condition on the RemoteCluster resource.
+	// The VPN link to the remote cluster may be down.
+	maxCnlabSyncRetries = 5
+
+	// cnlabSyncConditionType is the Condition type recorded on the RemoteCluster
+	// when the credential sync has reached the retry limit.
+	cnlabSyncConditionType = "CnlabCredentialSyncFailed"
 )
 
 // packageVariantGVK is the GVK for Porch PackageVariant resources.
@@ -161,6 +202,7 @@ var packageVariantGVK = schema.GroupVersionKind{
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infra.dcn.ssu.ac.kr,resources=remoteclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=ml.dcn.ssu.ac.kr,resources=nodeprovisionnetconfigs,verbs=get;list;watch;create;update;patch
 
 func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -242,18 +284,58 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				}
 			}
 
+			// Keep a local (management-cluster) NodeProvisionNetConfig in sync with
+			// this cluster's VPN config on every Ready-phase reconcile — independent
+			// of annotationNodeProvisionCreated above, which only gates the one-time
+			// SSH-based apply to the *remote* cluster. Without this, the local copy
+			// that ml-nodeprovision reads from (e.g. to VPN-connect newly-created AWS
+			// EC2 workers) has no source of truth at all and must be hand-authored,
+			// which is exactly how it can silently end up with an empty
+			// vpnSshCredentialsRef even though RemoteCluster.Spec.VPNConfig is correct.
+			if err := r.ensureLocalNodeProvisionNetConfig(ctx, cluster, cluster); err != nil {
+				log.Error(err, "syncing local NodeProvisionNetConfig (non-fatal)")
+			}
+
 			// Refresh the kubeadm bootstrap token when due — best-effort, never
 			// blocks PackageVariant creation.  Always fall through so that a
 			// freshly-Ready cluster reaches reconcilePackageVariants on the same
 			// reconcile that the token is first refreshed.
 			if needsTokenRefresh(cluster) {
+				log.Info("Kubeadm bootstrap token due for refresh")
 				if _, err := r.refreshJoinToken(ctx, cluster); err != nil {
 					log.Error(err, "refreshing join token (non-fatal)")
 				}
+			} else if ts, ok := cluster.Annotations[annotationJoinTokenRefreshedAt]; ok {
+				if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					log.Info("Kubeadm bootstrap token still valid",
+						"refreshedAt", t.Format(time.RFC3339),
+						"nextRefreshIn", time.Until(t.Add(tokenRefreshInterval)).Round(time.Minute).String())
+				}
+			} else {
+				log.Info("Kubeadm bootstrap token has never been explicitly refreshed; will refresh now")
+			}
+
+			// Sync cnlab-runtime registry credentials to the remote cluster whenever
+			// they are added or rotated — including clusters provisioned before this
+			// feature existed (annotationCnlabCredentialsHash will be absent on them).
+			if err := r.syncCnlabCredentialsToRemote(ctx, cluster); err != nil {
+				log.Error(err, "syncing cnlab-runtime credentials to remote cluster (non-fatal)")
+			}
+
+			// Sync NodeProvisionNetConfig (clusterName, vpnRange, vpnServerPublicConfig,
+			// softwareConfig minus cnlabRuntime) to the remote cluster whenever it
+			// drifts from the last successfully-pushed value — including catching
+			// up a push that was missed at controller-restart time because the
+			// remote cluster was unreachable then, or left incomplete by an
+			// earlier partial sync. Unreachability here is expected/normal (the
+			// provisioned cluster is decoupled from this controller), so failures
+			// are logged and retried next reconcile, never escalated.
+			if err := r.syncNetConfigToRemote(ctx, cluster); err != nil {
+				log.Info("syncing NodeProvisionNetConfig to remote cluster — will retry next reconcile",
+					"reason", err.Error())
 			}
 
 			if cluster.Annotations[annotationPkgVariantsCreated] == "true" {
-				log.Info("Cluster fully ready — no action required")
 				// Schedule next wakeup for token renewal.
 				requeueAfter := tokenRefreshInterval
 				if ts, ok := cluster.Annotations[annotationJoinTokenRefreshedAt]; ok {
@@ -263,12 +345,21 @@ func (r *RemoteClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 						}
 					}
 				}
+				log.Info("Cluster fully ready",
+					"nextTokenRefreshIn", requeueAfter.Round(time.Minute).String())
 				return ctrl.Result{RequeueAfter: requeueAfter}, nil
 			}
 			return r.reconcilePackageVariants(ctx, cluster)
 		}
 		return ctrl.Result{}, nil
 	case phaseFailed:
+		if cluster.Status.ProvisionRetryCount >= maxProvisionRetries {
+			log.Info("RemoteCluster in terminal Failed state — retry limit reached, manual intervention required",
+				"attempts", cluster.Status.ProvisionRetryCount,
+				"maxRetries", maxProvisionRetries,
+				"message", cluster.Status.Message)
+			return ctrl.Result{}, nil
+		}
 		return r.reconcileProvisioning(ctx, cluster)
 	default:
 		return ctrl.Result{}, nil
@@ -471,16 +562,20 @@ func (r *RemoteClusterReconciler) reconcilePackageVariants(ctx context.Context, 
 	log := logf.FromContext(ctx).WithValues("cluster", cluster.Name, "clusterName", cluster.Spec.ClusterName)
 	log.Info("Creating PackageVariants")
 
-	if err := r.createCorePackageVariants(ctx, cluster); err != nil {
-		return r.fail(ctx, cluster, "CorePackageVariantsFailed", fmt.Errorf("creating core PackageVariants: %w", err))
+	if cluster.Annotations[annotationCoreVariantsCreated] != "true" {
+		if err := r.createCorePackageVariants(ctx, cluster); err != nil {
+			return r.fail(ctx, cluster, "CorePackageVariantsFailed", fmt.Errorf("creating core PackageVariants: %w", err))
+		}
+		if patchErr := r.patchAnnotation(ctx, cluster, annotationCoreVariantsCreated, "true"); patchErr != nil {
+			log.Error(patchErr, "Failed to stamp core-variants-created annotation (non-fatal)")
+		}
+		// Give Porch time to sync the new cluster repo before overlay PackageVariants
+		// are created. Instead of sleeping (which blocks a worker thread), requeue
+		// immediately; the annotation gate above ensures core creation runs only once.
+		log.Info("Core PackageVariants created — requeueing to allow Porch sync before overlay step",
+			"delay", repoReadyWait.String())
+		return ctrl.Result{RequeueAfter: repoReadyWait}, nil
 	}
-
-	// delay to allow Porch to sync the new cluster repo before creating overlay PackageVariants
-	// (otherwise Porch will fail to find the overlay packages in the new repo)
-	// sleep will block the reconcile loop, but this is a one-time delay and the cluster is already in Ready phase
-	log.Info("Waiting for Porch to sync the new cluster repo before creating overlay PackageVariants",
-		"duration", 30*time.Second)
-	time.Sleep(30 * time.Second)
 
 	if err := r.createOverlaysPlusPostInstallPackageVariants(ctx, cluster); err != nil {
 		return r.fail(ctx, cluster, "OverlayPackageVariantsFailed", fmt.Errorf("creating overlay PackageVariants: %w", err))
@@ -543,7 +638,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 			return ctrl.Result{RequeueAfter: controlPlaneRetryInterval}, nil
 		}
 
-		sshClientCP, err := r.getSSHClient(ctx, clusterParent)
+		sshClientCP, err := r.getSSHClient(ctx, clusterParent) // ctx is already sshCtx from reconcileProvisioning
 		if err != nil {
 			return r.fail(ctx, cluster, "SSHConnectionFailed", fmt.Errorf("connecting to control-plane via SSH: %w", err))
 		}
@@ -572,6 +667,22 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		if rErr != nil {
 			return r.fail(ctx, cluster, "RuntimeConfigError",
 				fmt.Errorf("resolving cnlab-runtime config: %w", rErr))
+		}
+		// If the worker CR has no registry credentials, inherit them from the
+		// control-plane CR. This avoids repeating credentialsRef on every worker.
+		if workerRuntimeCfg.Token == "" && clusterParent != nil {
+			parentCfg, pErr := r.resolveCnlabRuntimeConfig(ctx, clusterParent.Spec.NodeInfo.SoftwareConfig, clusterParent.Namespace)
+			if pErr != nil {
+				return r.fail(ctx, cluster, "RuntimeConfigError",
+					fmt.Errorf("resolving cnlab-runtime config from control-plane: %w", pErr))
+			}
+			workerRuntimeCfg.Username = parentCfg.Username
+			workerRuntimeCfg.Token = parentCfg.Token
+			// Inherit registry/repo/version from parent only when the worker
+			// has no cnlabRuntime block at all.
+			if cluster.Spec.NodeInfo.SoftwareConfig.CnlabRuntime == nil {
+				workerRuntimeCfg = parentCfg
+			}
 		}
 
 		err, nodeIP := kubeadm.JoinWorkerNode(
@@ -612,6 +723,9 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 		if _, err := r.handleCreateUpdateNodeProvisionConfig(ctx, cluster, clusterParent, sshClientCP, nodeIP, "update"); err != nil {
 			return r.fail(ctx, cluster, "NodeProvisionNetConfigUpdateFailed", fmt.Errorf("updating NodeProvisionNetConfig with used IP: %w", err))
 		}
+		if err := r.ensureLocalNodeProvisionNetConfig(ctx, clusterParent, clusterParent); err != nil {
+			log.Error(err, "syncing local NodeProvisionNetConfig (non-fatal)")
+		}
 
 	} else {
 		log.Info("Worker already joined; skipping join step")
@@ -620,7 +734,7 @@ func (r *RemoteClusterReconciler) reconcileWorker(
 	// Label the node so the prepull DaemonSets can target it by hardware type.
 	// DaemonSets are already deployed on the CP; labels make the pods schedule.
 	if clusterParent != nil {
-		if sshClientCP, cpSSHErr := r.getSSHClient(ctx, clusterParent); cpSSHErr == nil {
+		if sshClientCP, cpSSHErr := r.getSSHClient(ctx, clusterParent); cpSSHErr == nil { // ctx is sshCtx
 			defer sshClientCP.Conn.Close() //nolint:errcheck
 			hwLabel := "cpu"
 			if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
@@ -781,6 +895,127 @@ func rcBuildDaemonSetPrepullScript(images []string) string {
 	return b.String()
 }
 
+// ensureLocalNodeProvisionNetConfig creates or updates a NodeProvisionNetConfig
+// object on THIS (management) cluster — the one the ml-nodeprovision controller
+// reads from via requireNetConfig when provisioning new AWS/on-prem nodes that
+// need to VPN-join this logical cluster.
+//
+// This is distinct from handleCreateUpdateNodeProvisionConfig, which applies an
+// equivalent object to the REMOTE managed cluster over SSH (for that cluster's
+// own on-prem worker onboarding). Before this function existed, nothing ever
+// synced RemoteCluster.Spec.VPNConfig into a local NodeProvisionNetConfig: the
+// local object had to be hand-authored and kept in sync manually, which is
+// exactly how it ended up with an empty vpnSshCredentialsRef even though the
+// RemoteCluster itself had the correct value all along. Built from typed Go
+// structs (not string-templated YAML) so a field can't be silently dropped.
+//
+// clusterParent must be the control-plane RemoteCluster whose Spec.VPNConfig
+// and Spec.NodeInfo.SoftwareConfig are authoritative for the shared VPN server
+// and cluster software config; cluster is only used for its Spec.ClusterName
+// and Namespace, which are identical between a control-plane and its workers.
+// desiredNodeProvisionNetConfigFields computes every NodeProvisionNetConfig
+// spec field that must mirror a control-plane RemoteCluster — clusterName,
+// vpnRange, vpnServerPublicConfig, and softwareConfig minus CnlabRuntime
+// (which has its own credential-secret-aware sync path,
+// syncCnlabCredentialsToRemote, with its own retry/terminal-condition
+// tracking, and must not be clobbered by a spec-only patch here).
+//
+// This is the SINGLE source of truth for both sync paths — the local
+// (management-cluster) object via ensureLocalNodeProvisionNetConfig, and the
+// remote (SSH-pushed) object via syncNetConfigToRemote — so the two can never
+// again drift apart on which fields they cover the way they previously did
+// (a remote object was found with clusterName, softwareConfig.kubernetesVersion,
+// imagePrepulls and imagePullSecretRef all missing, because the one-time SSH
+// "create" push that was supposed to set them either never fully ran or ran
+// before those fields existed, and nothing ever re-synced them afterward).
+func desiredNodeProvisionNetConfigFields(clusterParent *infrav1.RemoteCluster) mlv1alpha1.NodeProvisionNetConfigSpec {
+	spec := mlv1alpha1.NodeProvisionNetConfigSpec{
+		ClusterName: clusterParent.Spec.ClusterName,
+	}
+
+	if vpnCIDR := VPNRangeToCIDR(clusterParent.Spec.VPNConfig.IP); vpnCIDR != "" {
+		spec.VPNRange = &vpnCIDR
+	}
+
+	vpn := clusterParent.Spec.VPNConfig
+	spec.VPNServerPublicConfig = mlv1alpha1.VPNServerConfig{
+		PublicIP:    vpn.VPNServerPublicIP,
+		SSHPort:     defaultString(vpn.VPNServerSSHPort, "22"),
+		SSHUsername: defaultString(vpn.VPNServerSSHUsername, "ubuntu"),
+		VPNSSHCredentialsRef: mlv1alpha1.VPNSSHCredentialsRef{
+			Name:      vpn.VPNSSHCredentialsRef.Name,
+			NameSpace: vpn.VPNSSHCredentialsRef.NameSpace,
+			Key:       vpn.VPNSSHCredentialsRef.Key,
+		},
+	}
+
+	sw := clusterParent.Spec.NodeInfo.SoftwareConfig
+	spec.SoftwareConfig.KubernetesVersion = sw.KubernetesVersion
+
+	if len(sw.ImagePrepulls) > 0 {
+		prepulls := make([]mlv1alpha1.ImagePrepull, len(sw.ImagePrepulls))
+		for i, ip := range sw.ImagePrepulls {
+			prepulls[i] = mlv1alpha1.ImagePrepull{Image: ip.Image, NodeTarget: ip.NodeTarget}
+		}
+		spec.SoftwareConfig.ImagePrepulls = prepulls
+	}
+
+	if ref := sw.ImagePullSecretRef; ref != nil {
+		spec.SoftwareConfig.ImagePullSecretRef = &mlv1alpha1.SecretKeyReference{Name: ref.Name, Key: ref.Key}
+	}
+
+	return spec
+}
+
+// ensureLocalNodeProvisionNetConfig creates or updates a NodeProvisionNetConfig
+// object on THIS (management) cluster — the one the ml-nodeprovision
+// controller running here reads from via requireNetConfig when provisioning
+// new AWS/on-prem nodes that need to VPN-join this logical cluster.
+func (r *RemoteClusterReconciler) ensureLocalNodeProvisionNetConfig(
+	ctx context.Context,
+	cluster *infrav1.RemoteCluster,
+	clusterParent *infrav1.RemoteCluster,
+) error {
+	log := logf.FromContext(ctx)
+	name := cluster.Spec.ClusterName + "-netconfig"
+
+	nc := &mlv1alpha1.NodeProvisionNetConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: cluster.Namespace,
+		},
+	}
+	res, err := controllerutil.CreateOrUpdate(ctx, r.Client, nc, func() error {
+		desired := desiredNodeProvisionNetConfigFields(clusterParent)
+		nc.Spec.ClusterName = desired.ClusterName
+		nc.Spec.VPNRange = desired.VPNRange
+		nc.Spec.VPNServerPublicConfig = desired.VPNServerPublicConfig
+		nc.Spec.SoftwareConfig.KubernetesVersion = desired.SoftwareConfig.KubernetesVersion
+		nc.Spec.SoftwareConfig.ImagePrepulls = desired.SoftwareConfig.ImagePrepulls
+		nc.Spec.SoftwareConfig.ImagePullSecretRef = desired.SoftwareConfig.ImagePullSecretRef
+		// CnlabRuntime is deliberately left untouched here — synced separately
+		// by syncCnlabCredentialsToRemote, which also handles the credentials
+		// Secret it references.
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("syncing local NodeProvisionNetConfig %q: %w", name, err)
+	}
+	if res != controllerutil.OperationResultNone {
+		log.Info("Synced local NodeProvisionNetConfig from RemoteCluster",
+			"netconfig", name, "operation", res)
+	}
+	return nil
+}
+
+// defaultString returns s if non-empty, otherwise fallback.
+func defaultString(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
+}
+
 func (r *RemoteClusterReconciler) handleCreateUpdateNodeProvisionConfig( //nolint:unparam
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
@@ -921,6 +1156,53 @@ data:
 			log.Info("Ensured image pull secret on remote cluster", "secret", pullSecret.Name)
 		}
 
+		// Copy the cnlab-runtime registry credentials secret to the remote cluster
+		// so its NodeProvisionReconciler can pull the runtime artifact autonomously —
+		// even when the management cluster is unreachable.
+		if cr := clusterParent.Spec.NodeInfo.SoftwareConfig.CnlabRuntime; cr != nil && cr.CredentialsRef.Name != "" {
+			runtimeCredsSecret := &corev1.Secret{}
+			ns := cr.CredentialsRef.NameSpace
+			if ns == "" {
+				ns = cluster.Namespace
+			}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      cr.CredentialsRef.Name,
+				Namespace: ns,
+			}, runtimeCredsSecret); err != nil {
+				return ctrl.Result{}, fmt.Errorf(
+					"fetching cnlab-runtime credentials secret %q: %w",
+					cr.CredentialsRef.Name, err,
+				)
+			}
+
+			secretData := ""
+			for k, v := range runtimeCredsSecret.Data {
+				secretData += fmt.Sprintf("  %s: %s\n", k, base64.StdEncoding.EncodeToString(v))
+			}
+			runtimeSecretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: %s
+data:
+%s`,
+				runtimeCredsSecret.Name,
+				ns,
+				string(runtimeCredsSecret.Type),
+				secretData,
+			)
+
+			runtimeSecretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", runtimeSecretYAML)
+			if runtimeSecretOutput, runtimeSecretErr := sshhelper.Run(sshClient, runtimeSecretCmd); runtimeSecretErr != nil {
+				return ctrl.Result{}, fmt.Errorf(
+					"creating cnlab-runtime credentials secret on remote cluster: %w\nOutput:\n%s",
+					runtimeSecretErr, runtimeSecretOutput,
+				)
+			}
+			log.Info("Ensured cnlab-runtime credentials secret on remote cluster", "secret", runtimeCredsSecret.Name)
+		}
+
 		// Build optional softwareConfig fields (indented to match sibling keys).
 		var imagePrepullsYAML string
 		if len(clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePrepulls) > 0 {
@@ -931,6 +1213,30 @@ data:
 		}
 		if ref := clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePullSecretRef; ref != nil {
 			imagePrepullsYAML += fmt.Sprintf("    imagePullSecretRef:\n      name: \"%s\"\n", ref.Name)
+		}
+		// Propagate cnlabRuntime config so the remote cluster's NodeProvisionReconciler
+		// can pull the runtime artifact without connecting back to the management cluster.
+		var cnlabRuntimeYAML string
+		if cr := clusterParent.Spec.NodeInfo.SoftwareConfig.CnlabRuntime; cr != nil {
+			cnlabRuntimeYAML = "    cnlabRuntime:\n"
+			if cr.Registry != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      registry: %q\n", cr.Registry)
+			}
+			if cr.Repository != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      repository: %q\n", cr.Repository)
+			}
+			if cr.Version != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      version: %q\n", cr.Version)
+			}
+			if cr.OrasVersion != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      orasVersion: %q\n", cr.OrasVersion)
+			}
+			if cr.CredentialsRef.Name != "" {
+				cnlabRuntimeYAML += fmt.Sprintf("      credentialsRef:\n        name: %q\n        namespace: %q\n",
+					cr.CredentialsRef.Name,
+					cr.CredentialsRef.NameSpace,
+				)
+			}
 		}
 
 		vpnServerSSHPort := cluster.Spec.VPNConfig.VPNServerSSHPort
@@ -952,7 +1258,7 @@ spec:
   clusterName: %s
   softwareConfig:
     kubernetesVersion: "%s"
-%s  vpnRange: %s
+%s%s  vpnRange: %s
   vpnServerPublicConfig:
     publicIP: %s
     sshPort: "%s"
@@ -966,6 +1272,7 @@ spec:
 			cluster.Spec.ClusterName,
 			clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion,
 			imagePrepullsYAML,
+			cnlabRuntimeYAML,
 			vpnCIDR,
 			cluster.Spec.VPNConfig.VPNServerPublicIP,
 			vpnServerSSHPort,
@@ -1129,7 +1436,11 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 	}
 	defer func() { _ = sshClient.Conn.Close() }()
 
-	out, err := sshhelper.Run(sshClient, "kubeadm token create --print-join-command 2>/dev/null")
+	// --kubeconfig is explicit rather than relying on kubeadm's default
+	// resolution — see the identical comment in pkg/kubeadm/kubeadm.go's
+	// getJoinCommand for why: a stray KUBECONFIG env var on the target host
+	// can silently redirect kubeadm at an unrelated API server.
+	out, err := sshhelper.Run(sshClient, "kubeadm token create --print-join-command --kubeconfig=/etc/kubernetes/admin.conf 2>/dev/null")
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("kubeadm token create: %w\nOutput: %s", err, out)
 	}
@@ -1138,7 +1449,7 @@ func (r *RemoteClusterReconciler) refreshJoinToken(ctx context.Context, cluster 
 		return ctrl.Result{}, fmt.Errorf("kubeadm token create returned empty output")
 	}
 
-	log.Info("Refreshed kubeadm bootstrap token")
+	log.Info("Refreshed kubeadm bootstrap token", "nextRefreshIn", tokenRefreshInterval.String())
 
 	// Persist the new join command on the RemoteCluster status.
 	if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster); err != nil {
@@ -1318,6 +1629,13 @@ func (r *RemoteClusterReconciler) setStatus(
 	cluster.Status.Phase = phase
 	cluster.Status.Message = message
 
+	// Reset the retry counter whenever provisioning reaches a success phase.
+	if phase == phaseReady && cluster.Status.ProvisionRetryCount > 0 {
+		logf.FromContext(ctx).Info("RemoteCluster provisioning succeeded — resetting retry counter",
+			"previousAttempts", cluster.Status.ProvisionRetryCount)
+		cluster.Status.ProvisionRetryCount = 0
+	}
+
 	condStatus := metav1.ConditionTrue
 	if isError {
 		condStatus = metav1.ConditionFalse
@@ -1336,14 +1654,54 @@ func (r *RemoteClusterReconciler) setStatus(
 	return r.Status().Update(ctx, cluster)
 }
 
+// fail re-fetches the RemoteCluster, increments ProvisionRetryCount, and
+// persists a Failed status via RetryOnConflict so the counter is never silently lost.
 func (r *RemoteClusterReconciler) fail(
 	ctx context.Context,
 	cluster *infrav1.RemoteCluster,
 	reason string,
-	err error,
+	cause error,
 ) (ctrl.Result, error) {
-	logf.FromContext(ctx).Error(err, "RemoteCluster failed", "cluster", cluster.Name, "reason", reason)
-	_ = r.setStatus(ctx, cluster, phaseFailed, reason, err.Error(), true)
+	log := logf.FromContext(ctx)
+	var terminal bool
+	var attempts int
+
+	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav1.RemoteCluster{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), fresh); err != nil {
+			return err
+		}
+		fresh.Status.ProvisionRetryCount++
+		attempts = fresh.Status.ProvisionRetryCount
+		var msg string
+		if fresh.Status.ProvisionRetryCount >= maxProvisionRetries {
+			terminal = true
+			msg = fmt.Sprintf("provisioning failed after %d attempts (last error: %v) — manual intervention required",
+				fresh.Status.ProvisionRetryCount, cause)
+		} else {
+			msg = fmt.Sprintf("provisioning failed (attempt %d/%d): %v",
+				fresh.Status.ProvisionRetryCount, maxProvisionRetries, cause)
+		}
+		return r.setStatus(ctx, fresh, phaseFailed, reason, msg, true)
+	})
+	if updateErr != nil {
+		log.Error(updateErr, "failed to persist provisioning failure status",
+			"cluster", cluster.Name, "reason", reason)
+	}
+
+	if terminal {
+		log.Error(cause, "RemoteCluster provisioning reached retry limit — no further retries",
+			"cluster", cluster.Name,
+			"reason", reason,
+			"attempts", attempts,
+			"maxRetries", maxProvisionRetries)
+		return ctrl.Result{}, nil
+	}
+	log.Error(cause, "RemoteCluster provisioning failed — will retry",
+		"cluster", cluster.Name,
+		"reason", reason,
+		"attempt", attempts,
+		"maxRetries", maxProvisionRetries)
 	return ctrl.Result{RequeueAfter: time.Minute}, nil
 }
 
@@ -1378,6 +1736,9 @@ func (r *RemoteClusterReconciler) completeControlPlane(
 	}
 	if patchErr := r.patchAnnotation(ctx, cluster, annotationNodeProvisionCreated, "true"); patchErr != nil {
 		log.Error(patchErr, "Failed to stamp node-provision-created annotation")
+	}
+	if err := r.ensureLocalNodeProvisionNetConfig(ctx, cluster, cluster); err != nil {
+		log.Error(err, "syncing local NodeProvisionNetConfig (non-fatal)")
 	}
 
 	// All side-effects done — now flip to Ready and persist the join command.
@@ -2229,6 +2590,7 @@ func (r *RemoteClusterReconciler) deleteClusterResources(ctx context.Context, cl
 
 	for _, gvk := range []schema.GroupVersionKind{
 		{Group: "config.porch.kpt.dev", Version: "v1alpha1", Kind: "RepositoryList"},
+		{Group: "infra.nephio.org", Version: "v1alpha1", Kind: "RepositoryList"},
 		{Group: "infra.nephio.org", Version: "v1alpha1", Kind: "TokenList"},
 		{Group: "config.porch.kpt.dev", Version: "v1alpha1", Kind: "PackageVariantList"},
 	} {
@@ -2262,11 +2624,15 @@ type packageRef struct {
 
 // packageVariantSpec is a typed description of a PackageVariant to create or update.
 type packageVariantSpec struct {
-	name           string
-	upstream       packageRef
-	downstream     packageRef
-	annotations    map[string]interface{}
-	packageContext map[string]string // injected into spec.packageContext.data
+	name        string
+	upstream    packageRef
+	downstream  packageRef
+	annotations map[string]interface{}
+	// setters is injected as spec.pipeline.mutators[0].configMap so that
+	// apply-setters processes every `# kpt-set: ${KEY}` comment in the package.
+	// Do NOT use spec.packageContext.data — that only writes into kpt's internal
+	// package-context.yaml and never reaches apply-setters.
+	setters map[string]string
 }
 
 func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context, cluster *infrav1.RemoteCluster) error {
@@ -2274,69 +2640,10 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 	log.Info("Creating Platform Core PackageVariants", "remotecluster", cluster.Name)
 
 	variants := []packageVariantSpec{
-		// {
-		// 	name: "k8s-dra-driver-gpu-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "k8s-dra-driver-gpu",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "k8s-dra-driver-gpu",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-		// {
-		// 	name: "gpu-operator-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "gpu-operator",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "gpu-operator",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-		// {
-		// 	name: "longhorn-storage-provisioner-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "longhorn-storage-provisioner",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "longhorn-storage-provisioner",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-
-		// {
-		// 	name: "nfs-provisioner-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "nfs-provisioner",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "nfs-provisioner",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// },
-
 		{
 			name: "remote-cluster-provisioner-variant",
 			upstream: packageRef{
-				pkg:      "remote-cluster-provisioner",
+				pkg:      "ml-platform/remote-cluster-provisioner",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2350,9 +2657,25 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		},
 
 		{
+			name: "harbor-variant",
+			upstream: packageRef{
+				pkg:      "ml-platform/harbor",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "harbor",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
+
+		{
 			name: "prometheus-stack-variant",
 			upstream: packageRef{
-				pkg:      "prometheus-stack",
+				pkg:      "ml-platform/prometheus-stack",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2368,7 +2691,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "keycloak-variant",
 			upstream: packageRef{
-				pkg:      "keycloak",
+				pkg:      "ml-platform/keycloak",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2384,7 +2707,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "hami-variant",
 			upstream: packageRef{
-				pkg:      "hami",
+				pkg:      "ml-platform/hami",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2396,31 +2719,16 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				"approval.nephio.org/policy": "initial",
 			},
 		},
-		// {
-		// 	name: "hami-webui-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "hami-webui",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "hami-webui",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
 
 		{
-			name: "stateful-migration-variant",
+			name: "fluidcr-variant",
 			upstream: packageRef{
-				pkg:      "stateful-migration",
+				pkg:      "ml-platform/fluidcr",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
 			downstream: packageRef{
-				pkg:  "stateful-migration",
+				pkg:  "fluidcr",
 				repo: cluster.Spec.ClusterName,
 			},
 			annotations: map[string]interface{}{
@@ -2431,7 +2739,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "enterprise-gateway-variant",
 			upstream: packageRef{
-				pkg:      "enterprise-gateway",
+				pkg:      "ml-platform/enterprise-gateway",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2447,7 +2755,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "jupyter-hub-variant",
 			upstream: packageRef{
-				pkg:      "jupyter-hub",
+				pkg:      "ml-platform/jupyter-hub",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2464,7 +2772,7 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		{
 			name: "gpu-operator-variant",
 			upstream: packageRef{
-				pkg:      "gpu-operator",
+				pkg:      "ml-platform/gpu-operator",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2494,41 +2802,10 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 	// No active variants; pending re-enablement:
 	// platform-overlays-variant, post-install-config-variant
 	variantsOverlays := []packageVariantSpec{
-		// {
-		// 	name: "k8s-dra-driver-gpu-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "k8s-dra-driver-gpu",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "k8s-dra-driver-gpu",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-		// {
-		// 	name: "gpu-operator-variant",
-		// 	upstream: packageRef{
-		// 		pkg:      "gpu-operator",
-		// 		repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-		// 		revision: cluster.Spec.GitConfig.PackageRevision,
-		// 	},
-		// 	downstream: packageRef{
-		// 		pkg:  "gpu-operator",
-		// 		repo: cluster.Spec.ClusterName,
-		// 	},
-		// 	annotations: map[string]interface{}{
-		// 		"approval.nephio.org/policy": "initial",
-		// 	},
-		// },
-
 		{
 			name: "services-overlays-variant",
 			upstream: packageRef{
-				pkg:      "services-overlays",
+				pkg:      "ml-platform/services-overlays",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2542,9 +2819,25 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 		},
 
 		{
+			name: "gpu-monitoring-variant",
+			upstream: packageRef{
+				pkg:      "ml-platform/gpu-monitoring",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "gpu-monitoring",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		},
+
+		{
 			name: "ml-system-variant",
 			upstream: packageRef{
-				pkg:      "ml-system",
+				pkg:      "ml-platform/ml-system",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
@@ -2555,16 +2848,70 @@ func (r *RemoteClusterReconciler) createOverlaysPlusPostInstallPackageVariants(c
 			annotations: map[string]interface{}{
 				"approval.nephio.org/policy": "initial",
 			},
-			packageContext: func() map[string]string {
-				m := make(map[string]string, len(cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables))
+			setters: func() map[string]string {
+				m := map[string]string{
+					// Network locations derived from the cluster host.
+					"JUPYTERHUB_PUBLIC_URL":                 "http://" + cluster.Spec.Host + ":30080",
+					"NEXT_PUBLIC_KC_URL":                    "http://" + cluster.Spec.Host + ":30090",
+					"NEXT_PUBLIC_QUOTA_API":                 "http://" + cluster.Spec.Host + ":30082",
+					"NEXT_PUBLIC_ADMIN_EXTERNAL_MONITORING": "http://" + cluster.Spec.Host + ":30802/",
+
+					"EG_KERNELSPECS_NFS_SERVER": cluster.Spec.Host,
+
+					// In-cluster service defaults — override via PlatformVariables
+					// when monitoring or an external Postgres is used.
+					"GRAFANA_URL":      "http://prometheus-grafana.monitoring.svc.cluster.local:80",
+					"ALERTMANAGER_URL": "http://alertmanager-operated.monitoring.svc.cluster.local:9093",
+					"PROMETHEUS_URL":   "http://prometheus-operated.monitoring.svc.cluster.local:9090",
+					"HARBOR_BASE_URL":  "http://harbor.harbor.svc.cluster.local:80",
+					"FLUIDCR_API_URL":  "http://fluidcr-api.fluidcr-system.svc.cluster.local:8080",
+
+					// External Postgres — empty means use the bundled StatefulSet.
+					"DB_HOST": "",
+					"DB_PORT": "",
+
+					// Storage class for model artifacts / vLLM serving.
+					// Empty means the package's committed default applies.
+					"MODEL_ARTIFACT_STORAGE_CLASS": "",
+
+					// Credentials — no safe default; must be supplied via PlatformVariables.
+					"KEYCLOAK_ADMIN_PASSWORD": "",
+					"JUPYTERHUB_API_TOKEN":    "",
+					"QUOTA_API_TOKEN":         "",
+					"DB_PASSWORD":             "",
+					"CREDENTIAL_KEY":          "",
+					"GHCR_DOCKERCONFIGJSON":   "",
+
+					// Harbor credentials — supply EITHER the admin pair (auto-creates a
+					// scoped robot account once at startup) OR a pre-created robot account.
+					// Leave all four empty to skip Harbor integration at startup.
+					"HARBOR_ADMIN_USERNAME": "",
+					"HARBOR_ADMIN_PASSWORD": "",
+					"HARBOR_USERNAME":       "",
+					"HARBOR_SECRET":         "",
+
+					// Image tags — must match what was built and pushed.
+					"QUOTA_API_IMAGE": "",
+					"FRONTEND_IMAGE":  "",
+
+					// Idle GPU reclamation — empty means use the package's committed
+					// defaults (RECLAMATION_POLICY_SOURCE=db, i.e. admin-UI managed).
+					// Set RECLAMATION_POLICY_SOURCE to "env" via PlatformVariables to
+					// activate env-driven policy; the rest only take effect then.
+					"RECLAMATION_POLICY_SOURCE":    "",
+					"RECLAMATION_ENABLED":          "",
+					"RECLAMATION_GPU_UTIL_PCT":     "",
+					"RECLAMATION_WINDOW_MINUTES":   "",
+					"RECLAMATION_GRACE_MINUTES":    "",
+					"RECLAMATION_WARNING_MINUTES":  "",
+					"RECLAMATION_REQUIRE_CPU_IDLE": "",
+					"RECLAMATION_REQUIRE_GPU_IDLE": "",
+				}
+				// PlatformVariables override any default above, including credentials
+				// and any network location that differs from the computed values.
 				for _, pv := range cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables {
 					m[pv.Key] = pv.Value
 				}
-				m["GRAFANA_URL"] = "http://prometheus-grafana.monitoring.svc.cluster.local:80"
-				m["CHECKPOINT_API_URL"] = "http://checkpoint-apiserver.stateful-migration.svc.cluster.local:8090"
-				m["HARBOR_BASE_URL"] = "http://harbor.harbor.svc.cluster.local:80"
-				m["NEXT_PUBLIC_QUOTA_API"] = cluster.Spec.Host + ":30082"
-				m["NEXT_PUBLIC_KC_URL"] = cluster.Spec.Host + ":30090"
 				return m
 			}(),
 		},
@@ -2600,18 +2947,25 @@ func (r *RemoteClusterReconciler) upsertPackageVariants(ctx context.Context, clu
 		if len(v.annotations) > 0 {
 			spec["annotations"] = v.annotations
 		}
-		// Build packageContext.data from cluster-level PlatformVariables (baseline),
-		// then overlay any per-variant overrides. Later entries win on duplicate keys.
-		ctxData := make(map[string]interface{},
-			len(cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables)+len(v.packageContext))
-		for _, pv := range cluster.Spec.NodeInfo.SoftwareConfig.PlatformVariables {
-			ctxData[pv.Key] = pv.Value
-		}
-		for k, val := range v.packageContext {
-			ctxData[k] = val
-		}
-		if len(ctxData) > 0 {
-			spec["packageContext"] = map[string]interface{}{"data": ctxData}
+		// Inject setters as spec.pipeline.mutators[0].configMap so that
+		// apply-setters resolves every `# kpt-set: ${KEY}` comment in the package.
+		// spec.packageContext.data only writes into kpt's internal package-context.yaml
+		// and never reaches apply-setters — do not use it for setter values.
+		if len(v.setters) > 0 {
+			configMap := make(map[string]interface{}, len(v.setters))
+			for k, val := range v.setters {
+				if val != "" {
+					configMap[k] = val
+				}
+			}
+			spec["pipeline"] = map[string]interface{}{
+				"mutators": []interface{}{
+					map[string]interface{}{
+						"image":     "ghcr.io/kptdev/krm-functions-catalog/apply-setters:v0.2.4",
+						"configMap": configMap,
+					},
+				},
+			}
 		}
 
 		obj := &unstructured.Unstructured{}
@@ -2677,13 +3031,417 @@ func (r *RemoteClusterReconciler) resolveCnlabRuntimeConfig(
 	return cfg, nil
 }
 
+// syncCnlabCredentialsToRemote pushes the cnlab-runtime registry secret and
+// the cnlabRuntime block of NodeProvisionNetConfig to the remote cluster via SSH
+// whenever the credentials change.  It is a no-op when credentials are absent or
+// when the annotation hash already matches the current secret.
+//
+// Calling this from the phaseReady control-plane path means clusters provisioned
+// before credentialsRef was added will be backfilled on their next reconcile.
+func (r *RemoteClusterReconciler) syncCnlabCredentialsToRemote(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	log := logf.FromContext(ctx)
+
+	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
+	if err != nil || runtimeCfg.Token == "" {
+		// No credentials configured — nothing to push.
+		return nil
+	}
+
+	h := sha256.Sum256([]byte(runtimeCfg.Username + ":" + runtimeCfg.Token))
+	newHash := fmt.Sprintf("%x", h)
+	if cluster.Annotations[annotationCnlabCredentialsHash] == newHash {
+		log.Info("cnlab-runtime credentials already in sync on remote cluster",
+			"registry", runtimeCfg.Registry, "hash", newHash[:12]+"…")
+		return nil
+	}
+	log.Info("cnlab-runtime credentials changed — syncing to remote cluster",
+		"registry", runtimeCfg.Registry)
+
+	// Terminal: retry limit already reached — do not re-attempt until manually reset.
+	if cluster.Status.CnlabSyncRetryCount >= maxCnlabSyncRetries {
+		log.Info("cnlab-runtime credential sync in terminal error state — retry limit reached",
+			"attempts", cluster.Status.CnlabSyncRetryCount,
+			"maxRetries", maxCnlabSyncRetries,
+			"hint", "patch .status.cnlabSyncRetryCount to 0 to re-enable sync")
+		return nil
+	}
+
+	sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+	defer cancel()
+	sshClient, err := r.getSSHClient(sshCtx, cluster)
+	if err != nil {
+		return r.recordCnlabSyncFailure(ctx, cluster, fmt.Errorf("SSH connection for credential sync: %w", err))
+	}
+	defer func() { _ = sshClient.Conn.Close() }()
+
+	cr := cluster.Spec.NodeInfo.SoftwareConfig.CnlabRuntime
+	ns := cluster.Namespace
+	if cr != nil && cr.CredentialsRef.NameSpace != "" {
+		ns = cr.CredentialsRef.NameSpace
+	}
+
+	// Push the secret.
+	secretData := fmt.Sprintf("  username: %s\n  token: %s\n",
+		base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Username)),
+		base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Token)),
+	)
+	secretName := "cnlab-runtime-registry"
+	if cr != nil && cr.CredentialsRef.Name != "" {
+		secretName = cr.CredentialsRef.Name
+	}
+	secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: Opaque
+data:
+%s`, secretName, ns, secretData)
+
+	secretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", secretYAML)
+	if out, sshErr := sshhelper.Run(sshClient, secretCmd); sshErr != nil {
+		return r.recordCnlabSyncFailure(ctx, cluster,
+			fmt.Errorf("applying cnlab-runtime secret on remote cluster: %w\nOutput: %s", sshErr, out))
+	}
+	log.Info("Synced cnlab-runtime credentials secret to remote cluster", "secret", secretName)
+
+	// Patch the NodeProvisionNetConfig cnlabRuntime block.
+	cnlabRuntimeYAML := fmt.Sprintf(`    cnlabRuntime:
+      registry: %q
+      repository: %q
+      version: %q
+      orasVersion: %q
+      credentialsRef:
+        name: %q
+        namespace: %q
+`, runtimeCfg.Registry, runtimeCfg.Repository, runtimeCfg.Version, runtimeCfg.OrasVersion,
+		secretName, ns)
+
+	netConfigName := cluster.Spec.ClusterName + "-netconfig"
+	patchCmd := fmt.Sprintf(`
+cat <<'NCEOF' | kubectl apply -f -
+apiVersion: ml.dcn.ssu.ac.kr/v1alpha1
+kind: NodeProvisionNetConfig
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  softwareConfig:
+%sNCEOF`, netConfigName, cluster.Namespace, cnlabRuntimeYAML)
+
+	if out, sshErr := sshhelper.Run(sshClient, patchCmd); sshErr != nil {
+		return r.recordCnlabSyncFailure(ctx, cluster,
+			fmt.Errorf("patching NodeProvisionNetConfig cnlabRuntime on remote cluster: %w\nOutput: %s", sshErr, out))
+	}
+	log.Info("Synced cnlabRuntime config to remote NodeProvisionNetConfig", "netconfig", netConfigName)
+
+	// Reset failure counter and clear the error condition on success.
+	if cluster.Status.CnlabSyncRetryCount > 0 {
+		log.Info("cnlab-runtime credential sync recovered after previous failures",
+			"previousAttempts", cluster.Status.CnlabSyncRetryCount)
+		cluster.Status.CnlabSyncRetryCount = 0
+		// Replace any existing CnlabCredentialSyncFailed condition with a success entry.
+		cluster.Status.Conditions = append(cluster.Status.Conditions, metav1.Condition{
+			Type:               cnlabSyncConditionType,
+			Status:             metav1.ConditionTrue,
+			Reason:             "SyncSucceeded",
+			Message:            "cnlab-runtime credentials successfully synced to remote cluster",
+			ObservedGeneration: cluster.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			log.Error(err, "updating cnlab sync recovery status (non-fatal)")
+		}
+	}
+
+	if patchErr := r.patchAnnotation(ctx, cluster, annotationCnlabCredentialsHash, newHash); patchErr != nil {
+		log.Error(patchErr, "failed to stamp cnlab credentials hash annotation (non-fatal)")
+	}
+	return nil
+}
+
+// recordCnlabSyncFailure re-fetches the RemoteCluster, increments
+// CnlabSyncRetryCount, and persists the status via RetryOnConflict so the
+// counter is never silently lost on a ResourceVersion conflict.
+func (r *RemoteClusterReconciler) recordCnlabSyncFailure(ctx context.Context, cluster *infrav1.RemoteCluster, cause error) error {
+	log := logf.FromContext(ctx)
+
+	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &infrav1.RemoteCluster{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(cluster), fresh); err != nil {
+			return err
+		}
+		fresh.Status.CnlabSyncRetryCount++
+		if fresh.Status.CnlabSyncRetryCount >= maxCnlabSyncRetries {
+			msg := fmt.Sprintf("cnlab-runtime credential sync failed after %d attempts (last error: %v) — VPN to remote cluster may be down; patch .status.cnlabSyncRetryCount to 0 to re-enable",
+				fresh.Status.CnlabSyncRetryCount, cause)
+			fresh.Status.Conditions = append(fresh.Status.Conditions, metav1.Condition{
+				Type:               cnlabSyncConditionType,
+				Status:             metav1.ConditionFalse,
+				Reason:             "SyncRetryLimitReached",
+				Message:            msg,
+				ObservedGeneration: fresh.Generation,
+				LastTransitionTime: metav1.Now(),
+			})
+			fresh.Status.Message = msg
+			log.Error(cause, "cnlab-runtime credential sync reached retry limit — no further retries",
+				"attempts", fresh.Status.CnlabSyncRetryCount,
+				"maxRetries", maxCnlabSyncRetries)
+		} else {
+			log.Error(cause, "cnlab-runtime credential sync failed — will retry",
+				"attempt", fresh.Status.CnlabSyncRetryCount,
+				"maxRetries", maxCnlabSyncRetries)
+		}
+		return r.Status().Update(ctx, fresh)
+	})
+	if updateErr != nil {
+		log.Error(updateErr, "failed to persist cnlab sync failure status (non-fatal)")
+	}
+	return cause
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *RemoteClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.Add(r); err != nil {
+		return fmt.Errorf("registering RemoteClusterReconciler as Runnable: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1.RemoteCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("remotecluster").
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(r)
+}
+
+// Start implements manager.Runnable. On controller startup it resyncs, for
+// every Ready control-plane RemoteCluster:
+//  1. The local (management-cluster) NodeProvisionNetConfig — credentials refs
+//     and VPN config, via a plain in-cluster API write. Always attempted,
+//     regardless of whether the remote cluster is reachable.
+//  2. The remote cluster's own credential + VPN config secrets, over SSH.
+//     A provisioned cluster is meant to be decoupled from this controller —
+//     it keeps running on its own once joined — so an unreachable remote
+//     cluster here is only logged and skipped, never retried with a counter
+//     or surfaced as a status/condition change.
+func (r *RemoteClusterReconciler) Start(ctx context.Context) error {
+	log := logf.FromContext(ctx).WithName("startup-sync")
+	log.Info("Running startup sync for all Ready RemoteClusters")
+
+	clusterList := &infrav1.RemoteClusterList{}
+	if err := r.List(ctx, clusterList); err != nil {
+		log.Error(err, "startup sync: failed to list RemoteClusters")
+		return nil
+	}
+
+	for i := range clusterList.Items {
+		cluster := &clusterList.Items[i]
+		if cluster.Status.Phase != phaseReady || cluster.Spec.NodeInfo.NodeType != "control-plane" {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		// Local NodeProvisionNetConfig resync — a plain in-cluster API write,
+		// no SSH involved. Do this unconditionally, before attempting SSH: a
+		// provisioned cluster is meant to keep working via its VPN mesh even
+		// when it (or the network path to it) is unreachable from this
+		// management cluster, so ml-nodeprovision's local copy of its VPN/
+		// credentials config must never depend on remote reachability to stay
+		// current. This is also what heals a stale/empty vpnSshCredentialsRef
+		// on the local NodeProvisionNetConfig across a controller restart,
+		// without needing the remote cluster to be reachable at all.
+		if err := r.ensureLocalNodeProvisionNetConfig(ctx, cluster, cluster); err != nil {
+			log.Error(err, "startup sync: failed to resync local NodeProvisionNetConfig (non-fatal)",
+				"cluster", cluster.Name)
+		} else {
+			log.Info("startup sync: local NodeProvisionNetConfig resynced", "cluster", cluster.Name)
+		}
+
+		// Remote (SSH-based) credential + VPN config push. The remote cluster
+		// is intentionally decoupled from this controller once provisioned —
+		// it must keep running even if this management cluster is down or the
+		// remote cluster is temporarily unreachable — so a failure here is
+		// logged and skipped, never retried with a counter or surfaced as a
+		// RemoteCluster status/condition change.
+		if err := r.startupSyncCluster(ctx, cluster); err != nil {
+			log.Info("startup sync: cluster not reachable via SSH — skipping remote resync",
+				"cluster", cluster.Name, "reason", err.Error())
+		} else {
+			log.Info("startup sync: remote resync completed", "cluster", cluster.Name)
+		}
+	}
+	return nil
+}
+
+// startupSyncCluster pushes credentials and VPN config to a single remote
+// cluster via SSH. Returns an error if the cluster is unreachable; the caller
+// logs and skips — no status fields or retry counters are touched.
+func (r *RemoteClusterReconciler) startupSyncCluster(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	log := logf.FromContext(ctx).WithName("startup-sync").WithValues("cluster", cluster.Name)
+
+	sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+	defer cancel()
+	sshClient, err := r.getSSHClient(sshCtx, cluster)
+	if err != nil {
+		return fmt.Errorf("SSH: %w", err)
+	}
+	defer func() { _ = sshClient.Conn.Close() }()
+
+	// --- credentials ---
+	runtimeCfg, err := r.resolveCnlabRuntimeConfig(ctx, cluster.Spec.NodeInfo.SoftwareConfig, cluster.Namespace)
+	if err == nil && runtimeCfg.Token != "" {
+		cr := cluster.Spec.NodeInfo.SoftwareConfig.CnlabRuntime
+		ns := cluster.Namespace
+		if cr != nil && cr.CredentialsRef.NameSpace != "" {
+			ns = cr.CredentialsRef.NameSpace
+		}
+		secretName := "cnlab-runtime-registry"
+		if cr != nil && cr.CredentialsRef.Name != "" {
+			secretName = cr.CredentialsRef.Name
+		}
+		secretData := fmt.Sprintf("  username: %s\n  token: %s\n",
+			base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Username)),
+			base64.StdEncoding.EncodeToString([]byte(runtimeCfg.Token)),
+		)
+		secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: Opaque
+data:
+%s`, secretName, ns, secretData)
+		secretCmd := fmt.Sprintf("cat <<'EOF' | kubectl apply -f -\n%s\nEOF", secretYAML)
+		if out, sshErr := sshhelper.Run(sshClient, secretCmd); sshErr != nil {
+			return fmt.Errorf("applying credentials secret: %w\nOutput: %s", sshErr, out)
+		}
+		log.Info("Pushed credentials secret", "secret", secretName)
+
+		// Stamp hash so the normal reconcile path knows credentials are current.
+		h := sha256.Sum256([]byte(runtimeCfg.Username + ":" + runtimeCfg.Token))
+		if patchErr := r.patchAnnotation(ctx, cluster, annotationCnlabCredentialsHash, fmt.Sprintf("%x", h)); patchErr != nil {
+			log.Error(patchErr, "stamping credentials hash annotation (non-fatal)")
+		}
+	}
+
+	// --- NodeProvisionNetConfig (VPN config + non-credential software config) ---
+	if err := pushNetConfigViaSSH(sshClient, cluster); err != nil {
+		return err
+	}
+	log.Info("Pushed NodeProvisionNetConfig to remote cluster")
+	return nil
+}
+
+// netConfigSyncHash hashes the exact JSON body pushNetConfigViaSSH would send
+// for the given RemoteCluster, so drift is detected on every field
+// desiredNodeProvisionNetConfigFields computes — not just a hand-picked
+// subset. Marshaling the real struct (rather than hand-listing fields into a
+// format string, the way this used to work) means a newly-added field can
+// never again be silently left out of the hash while the patch below sends
+// it, or vice versa: both derive from the same value.
+func netConfigSyncHash(clusterParent *infrav1.RemoteCluster) (string, error) {
+	b, err := json.Marshal(desiredNodeProvisionNetConfigFields(clusterParent))
+	if err != nil {
+		return "", fmt.Errorf("marshaling NodeProvisionNetConfig fields for hashing: %w", err)
+	}
+	h := sha256.Sum256(b)
+	return fmt.Sprintf("%x", h), nil
+}
+
+// pushNetConfigViaSSH JSON-merge-patches every field
+// desiredNodeProvisionNetConfigFields computes onto the remote cluster's own
+// NodeProvisionNetConfig, over an already-connected SSH client. A no-op
+// (returns nil without doing anything) when no VPN server is configured yet.
+//
+// The patch body is produced by encoding/json against the same
+// mlv1alpha1.NodeProvisionNetConfigSpec struct used for the local sync,
+// instead of a hand-built "{"spec":{...%q...}}" format string — the latter
+// is exactly how clusterName, softwareConfig.kubernetesVersion,
+// imagePrepulls and imagePullSecretRef ended up silently absent from this
+// patch for months (only vpnRange and vpnServerPublicConfig were ever
+// listed), even though the initial SSH "create" push
+// (handleCreateUpdateNodeProvisionConfig) set them once. Marshaling the
+// struct makes that entire bug class structurally impossible here: whatever
+// desiredNodeProvisionNetConfigFields returns is what gets sent, in full,
+// every time.
+func pushNetConfigViaSSH(sshClient *sshhelper.Client, cluster *infrav1.RemoteCluster) error {
+	if cluster.Spec.VPNConfig.VPNServerPublicIP == "" {
+		return nil
+	}
+	patchBody, err := json.Marshal(map[string]any{
+		"spec": desiredNodeProvisionNetConfigFields(cluster),
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling NodeProvisionNetConfig patch body: %w", err)
+	}
+	// Safe to embed patchBody directly inside the outer single quotes: every
+	// value that can appear in it (cluster/secret/image names, versions, IPs,
+	// ports) is restricted to characters that are valid in a Kubernetes name
+	// or a container image reference, none of which include a literal `'`.
+	// This mirrors the existing json.Marshal-into-single-quoted-shell-arg
+	// pattern already used elsewhere in this file (e.g. patchRemoteNetConfigJoinCmd).
+	patchCmd := fmt.Sprintf(
+		"kubectl patch nodeprovisionnetconfig %s-netconfig -n %s --type=merge -p '%s'",
+		cluster.Spec.ClusterName, cluster.Namespace, string(patchBody),
+	)
+	if out, sshErr := sshhelper.Run(sshClient, patchCmd); sshErr != nil {
+		return fmt.Errorf("patching NodeProvisionNetConfig: %w\nOutput: %s", sshErr, out)
+	}
+	return nil
+}
+
+// syncNetConfigToRemote re-pushes every field desiredNodeProvisionNetConfigFields
+// computes to the remote cluster's NodeProvisionNetConfig whenever it has
+// drifted from the last successfully-pushed value (tracked via
+// annotationNetConfigSyncHash). This is what heals a remote push missed at
+// controller-restart time (the remote cluster was unreachable then), or left
+// incomplete by an earlier partial/buggy sync, on the next successful
+// periodic reconcile — instead of requiring another restart, a worker-join
+// event, or (previously) never healing at all since the one-time SSH
+// "create" push is gated by annotationNodeProvisionCreated and never runs
+// again once that's set to "true".
+//
+// Deliberately has no retry counter or terminal/blocking condition, unlike
+// syncCnlabCredentialsToRemote: a provisioned cluster is meant to be
+// decoupled from this controller, so a persistently unreachable remote
+// cluster here is just logged and retried again next reconcile — forever —
+// never escalated into a state requiring manual intervention.
+func (r *RemoteClusterReconciler) syncNetConfigToRemote(ctx context.Context, cluster *infrav1.RemoteCluster) error {
+	log := logf.FromContext(ctx)
+
+	if cluster.Spec.VPNConfig.VPNServerPublicIP == "" {
+		// No VPN server configured yet — nothing to push.
+		return nil
+	}
+
+	newHash, err := netConfigSyncHash(cluster)
+	if err != nil {
+		return err
+	}
+	if cluster.Annotations[annotationNetConfigSyncHash] == newHash {
+		return nil
+	}
+	log.Info("NodeProvisionNetConfig fields changed — syncing to remote cluster")
+
+	sshCtx, cancel := context.WithTimeout(ctx, sshOperationTimeout)
+	defer cancel()
+	sshClient, err := r.getSSHClient(sshCtx, cluster)
+	if err != nil {
+		return fmt.Errorf("SSH connection for NodeProvisionNetConfig sync: %w", err)
+	}
+	defer func() { _ = sshClient.Conn.Close() }()
+
+	if err := pushNetConfigViaSSH(sshClient, cluster); err != nil {
+		return err
+	}
+	log.Info("Synced NodeProvisionNetConfig to remote cluster")
+
+	if patchErr := r.patchAnnotation(ctx, cluster, annotationNetConfigSyncHash, newHash); patchErr != nil {
+		log.Error(patchErr, "failed to stamp NodeProvisionNetConfig sync hash annotation (non-fatal)")
+	}
+	return nil
 }
 
 // parsePort converts a string port value to int, returning defaultPort when

@@ -108,6 +108,32 @@ spec:
     nvidiaContainerToolkitVersion: "1.17.3-1"
     k8sDevicePluginVersion: "v0.17.1"
 
+    # cnlabRuntime — prebuilt CRI-O runtime OCI artifact.
+    # credentialsRef must point to a Secret with "username" and "token" keys
+    # (packages:read scope on GHCR).  Leave credentialsRef.name empty for a
+    # public registry.
+    cnlabRuntime:
+      registry: "ghcr.io"
+      repository: "vitu-mafeni/cnlab-runtime"
+      version: "1.0.0-beta"
+      orasVersion: "1.3.2"
+      credentialsRef:
+        name: cnlab-runtime-registry
+        namespace: default
+
+---
+# Registry credentials for pulling the cnlab-runtime OCI artifact.
+# Requires packages:read scope on GHCR (or equivalent on other registries).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnlab-runtime-registry
+  namespace: default
+type: Opaque
+stringData:
+  username: "vitu-mafeni"
+  token: "ghp_tzldTEST6SFgEBT3H22Bf"  # packages:read scope minimum
+
 ---
 # SSH credential for the WireGuard VPN server.
 # The controller SSHes into this host to run "wg set wg0 peer …".

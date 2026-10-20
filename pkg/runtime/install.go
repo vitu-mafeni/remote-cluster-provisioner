@@ -1,6 +1,9 @@
 package runtime
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // InstallSteps returns an ordered list of shell commands for SSH-based
 // provisioners (each executed via sshhelper.Run in its own SSH session).
@@ -119,14 +122,18 @@ oras version`, cfg.OrasVersion)
 func installRuntimeCmd(cfg Config) string {
 	var loginBlock, logoutBlock string
 	if cfg.Token != "" {
+		// Use %q (Go double-quoted string with escape sequences) to produce a
+		// shell-safe string: double-quoted with backslash escaping of $, `, \, "
+		// so that a token or username containing single quotes, dollar signs, or
+		// backticks cannot break out of the string context and execute code.
 		loginBlock = fmt.Sprintf(
 			"sudo install -m 0600 /dev/null /tmp/.cnlab-reg\n"+
-				"printf '%%s' '%s' | sudo tee /tmp/.cnlab-reg >/dev/null\n"+
+				"printf '%%s' %s | sudo tee /tmp/.cnlab-reg >/dev/null\n"+
 				"CNLAB_TOKEN=$(sudo cat /tmp/.cnlab-reg)\n"+
 				"sudo rm -f /tmp/.cnlab-reg\n"+
-				"printf '%%s' \"$CNLAB_TOKEN\" | oras login \"$REGISTRY\" --username '%s' --password-stdin\n"+
+				"printf '%%s' \"$CNLAB_TOKEN\" | oras login \"$REGISTRY\" --username %s --password-stdin\n"+
 				"unset CNLAB_TOKEN",
-			cfg.Token, cfg.Username)
+			shellQuote(cfg.Token), shellQuote(cfg.Username))
 		logoutBlock = `oras logout "$REGISTRY" 2>/dev/null || true`
 	}
 
@@ -248,4 +255,16 @@ fi
 if [ ! -f /etc/criu/default.conf ]; then
   sudo cp -f /etc/criu/runc.conf /etc/criu/default.conf
 fi`
+}
+
+// shellQuote wraps s in double quotes with backslash-escaping of characters
+// that are special inside a double-quoted bash string: \, $, `, and ".
+// This prevents token or username values that contain single quotes or other
+// shell metacharacters from escaping the string context and executing code.
+func shellQuote(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `$`, `\$`)
+	s = strings.ReplaceAll(s, "`", "\\`")
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }

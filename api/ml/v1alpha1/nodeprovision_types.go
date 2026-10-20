@@ -165,6 +165,19 @@ type NodeProvisionStatus struct {
 
 	// Kubernetes node name after join.
 	NodeName string `json:"nodeName,omitempty"`
+
+	// RuntimeCredentialsHash is the SHA-256 hex digest of the registry
+	// username+token most recently synced to this node via oras login.
+	// The controller re-runs the login whenever this hash differs from the
+	// current secret, ensuring the node stays authorised to pull runtime updates.
+	// +optional
+	RuntimeCredentialsHash string `json:"runtimeCredentialsHash,omitempty"`
+
+	// ProvisionRetryCount is the number of consecutive provisioning failures.
+	// When it reaches maxProvisionRetries the controller stops retrying and
+	// leaves the resource in Failed phase; manual intervention is required.
+	// +optional
+	ProvisionRetryCount int `json:"provisionRetryCount,omitempty"`
 }
 
 // +kubebuilder:object:root=true

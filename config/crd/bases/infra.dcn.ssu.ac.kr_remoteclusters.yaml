@@ -234,6 +234,13 @@ spec:
           status:
             description: status defines the observed state of RemoteCluster
             properties:
+              cnlabSyncRetryCount:
+                description: |-
+                  CnlabSyncRetryCount is the number of consecutive failures pushing
+                  cnlab-runtime credentials to the remote cluster.  When it reaches
+                  maxCnlabSyncRetries the controller stops retrying and surfaces an error
+                  condition; the VPN link to the remote cluster may be down.
+                type: integer
               conditions:
                 description: |-
                   conditions is an ordered list of provisioning progress entries.
@@ -300,6 +307,12 @@ spec:
                 type: string
               phase:
                 type: string
+              provisionRetryCount:
+                description: |-
+                  ProvisionRetryCount is the number of consecutive provisioning failures.
+                  When it reaches maxProvisionRetries the controller stops retrying and
+                  leaves the resource in Failed phase; manual intervention is required.
+                type: integer
             type: object
         required:
         - spec

@@ -8,17 +8,18 @@
 # Referenced by RemoteCluster.spec.nodeInfo.softwareConfig
 #   .cnlabRuntime.credentialsRef
 # ============================================================
-# apiVersion: v1
-# kind: Secret
-# metadata:
-#   name: cnlab-runtime-registry
-#   namespace: default
-# type: Opaque
-# stringData:
-#   username: "your-github-username"
-#   token: "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # packages:read scope minimum
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnlab-runtime-registry
+  namespace: default
+type: Opaque
+stringData:
+  username: "vitu-mafeni"
+  token: "ghp_tzldwREXAMPLEhuzkIS6SFgEBT3H22Bf"  # packages:read scope minimum
 
 ---
+
 # ============================================================
 # RemoteCluster — control-plane node
 #
@@ -85,9 +86,120 @@ spec:
         # Secret containing "username" and "token" for registry auth.
         # Follows the same pattern as vpnSshCredentialsRef.
         # Leave name empty to pull from a public registry without auth.
-        # credentialsRef:
-        #   name: cnlab-runtime-registry
-        #   namespace: default
+        credentialsRef:
+          name: cnlab-runtime-registry
+          namespace: default
+
+      # platformVariables are injected into the ml-platform-deploy PackageVariant
+      # as packageContext and rendered into every manifest via apply-setters.
+      #
+      # Network locations (JUPYTERHUB_PUBLIC_URL, NEXT_PUBLIC_KC_URL,
+      # NEXT_PUBLIC_QUOTA_API, EG_KERNELSPECS_NFS_SERVER) are auto-computed
+      # from spec.host — only add them here to override the defaults.
+      #
+      # In-cluster service URLs (GRAFANA_URL, ALERTMANAGER_URL, PROMETHEUS_URL,
+      # HARBOR_BASE_URL, CHECKPOINT_API_URL) also have working defaults —
+      # override only when using external instances.
+      #
+      # Generation commands:
+      #   JUPYTERHUB_API_TOKEN / QUOTA_API_TOKEN:  openssl rand -hex 32
+      #   KEYCLOAK_ADMIN_PASSWORD / DB_PASSWORD:   openssl rand -base64 24
+      #   CREDENTIAL_KEY: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      #   GHCR_DOCKERCONFIGJSON:
+      #     kubectl create secret docker-registry ghcr-pull-secret \
+      #       --docker-server=ghcr.io --docker-username=<user> --docker-password=<token> \
+      #       --namespace=jhub-ns --dry-run=client \
+      #       -o jsonpath="{.data.\.dockerconfigjson}" | base64 -d
+      platformVariables:
+        # ── Credentials (required — no safe default is possible) ──────────────
+        - key: KEYCLOAK_ADMIN_PASSWORD
+          value: "changeme123"
+        - key: JUPYTERHUB_API_TOKEN        # must match hub.services.quota-api.apiToken in jhub-values.yaml
+          value: "79044be905ddf5EXAMPLE972fcb6f479eeec9d8dfad4ea7"
+        - key: QUOTA_API_TOKEN             # must match hub.extraEnv.QUOTA_API_TOKEN — different from above
+          value: "testtoken123"
+        - key: DB_PASSWORD
+          value: "quota-api"
+        - key: CREDENTIAL_KEY              # Fernet key — generate once, never rotate without migrating data
+          value: "zz_dakGbNuJyvJIX8zvA_ZcYb7bMgGcUo1i6E7zoepU="
+        - key: GHCR_DOCKERCONFIGJSON       # raw JSON (not base64) — see generation command above
+          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldEXAMPLEzkIS6SFgEBT3H22Bf","auth":"dml0dS1tYWZlbmk6Z2hwXEXAMPLE6a0lTNlNGZ0VCVDNIMjJCZg=="}}}'
+
+        # ── Image tags (required — whatever you built and pushed to GHCR) ──────
+        - key: QUOTA_API_IMAGE
+          value: "ghcr.io/vitu-mafeni/quota-api:0.1.0-gist"
+        - key: FRONTEND_IMAGE
+          value: "ghcr.io/vitu-mafeni/ml-platform-frontend:0.1.0-gist"
+
+        # ── Network overrides (optional — auto-computed from spec.host) ────────
+        - key: JUPYTERHUB_PUBLIC_URL
+          value: "http://192.168.3.234:30080"
+        - key: NEXT_PUBLIC_KC_URL
+          value: "http://192.168.3.234:30090"
+        - key: NEXT_PUBLIC_QUOTA_API
+          value: "http://192.168.3.234:30082"
+        
+        - key: EG_KERNELSPECS_NFS_SERVER
+          value: "192.168.3.234"
+
+        # ── Storage (optional — required only for model saving / vLLM serving) ─
+        # - key: MODEL_ARTIFACT_STORAGE_CLASS
+        #   value: "nfs-rwx"
+
+        # ── External Postgres (optional — leave unset to use bundled StatefulSet)
+        - key: DB_HOST
+          value: "postgres.ml-backend-system.svc.cluster.local"
+        - key: DB_PORT
+          value: "5432"
+
+        # ── External monitoring (optional — in-cluster defaults apply otherwise)
+        - key: GRAFANA_URL
+          value: "http://192.168.3.234:32300"
+        - key: ALERTMANAGER_URL
+          value: "http://192.168.3.234:31901"
+        - key: PROMETHEUS_URL
+          value: "http://192.168.3.234:30828"
+        - key: HARBOR_BASE_URL
+          value: "http://10.9.0.13:30728"
+
+        # ── Harbor credentials (optional — only when HARBOR_BASE_URL is set) ──
+        # Supply EITHER an admin login OR a pre-created robot account — never both.
+        #
+        # Option A — admin login: the platform auto-creates a scoped robot account
+        # once at startup using these credentials; the admin login is never stored.
+        - key: HARBOR_ADMIN_USERNAME
+          value: "admin"
+        - key: HARBOR_ADMIN_PASSWORD
+          value: "Harbor12345"
+        #
+        # Option B — robot account you already created yourself:
+        # - key: HARBOR_USERNAME
+        #   value: "robot$your-robot-name"
+        # - key: HARBOR_SECRET
+        #   value: "<your-robot-account-token>"
+
+        - key: CHECKPOINT_API_URL
+          value: "http://192.168.3.234:30829"
+
+        # ── Idle GPU reclamation (optional — default is admin-UI / DB managed) ─
+        # Uncomment RECLAMATION_POLICY_SOURCE first to switch to env-driven policy.
+        # The remaining keys only take effect when policy source is "env".
+        - key: RECLAMATION_POLICY_SOURCE
+          value: "env"
+        - key: RECLAMATION_ENABLED
+          value: "true"
+        - key: RECLAMATION_GPU_UTIL_PCT      # reclaim if GPU util below this % for WINDOW minutes
+          value: "10.0"
+        - key: RECLAMATION_WINDOW_MINUTES    # idle window before reclamation triggers
+          value: "5"
+        - key: RECLAMATION_GRACE_MINUTES     # grace period given to the user before forced stop
+          value: "3"
+        - key: RECLAMATION_WARNING_MINUTES   # how early to warn the user before grace starts
+          value: "2"
+        - key: RECLAMATION_REQUIRE_CPU_IDLE  # also require CPU idle before reclaiming
+          value: "false"
+        - key: RECLAMATION_REQUIRE_GPU_IDLE  # also require GPU memory idle before reclaiming
+          value: "false"
 
   auth:
     sshPrivateKeySecretRef:
@@ -98,10 +210,9 @@ spec:
     enable: "true"
     gitServer: "http://192.168.3.182:31810"
     gitUsername: "nephio"
-    upstreamPlatformRepo: "catalog-workloads-mlplatform"
+    upstreamPlatformRepo: "cnlab-catalog"
     packageRevision: "v1.0.0"
 
----
 ---
 # SSH credential for the control-plane node.
 apiVersion: v1
@@ -128,7 +239,19 @@ stringData:
     jw05oU/cfvEekc7+PjX3O90kAe6EhI3m56WWABoxvXrbyII4MyTIkPKcMBENC0L2
     9JjZAP+Auo8EGriL2Kpz5DmGzqr/9uRMIjH5a87WCBJ3sxNrKW148b+8ZVO052bS
     W+VAwH26iq0h31TAHZl8R4jxDMkGH1mbaLP5Q156A29NqPYPW4xh0NCfj3Vpzp4S
-    IcfnJv59rFuA8fBYn1XhtKDvIrQKSTI6igizC/H1/9kXph2fFSmHlvpaRU5HVUQxEXAMPLE
+    IcfnJv59rFuA8fBYn1XhtKDvIrQKSTI6igizC/H1/9kXph2fFSmHlvpaRU5HVUQx
+    6naU2QNVfQ2r2gGEeLhidktFmJE3oA+YJ2lGpQIDAQABAoIBAA8byNrGbkdBXjIJ
+    izXUrnyP2zG1AqpxMWo6n0ncmXOEGc/wvDEOCtAO/6K+xd1yM9CWcJfSpKP7eV+i
+    V3xzpGodSV2kvOEok72+hcfj+YClmtNAZgk8Y9tMvG9hGkMh+PL5Hs2Tbs29DSJb
+    cRZHaIsEXAMPLE
+    tA2kHQN9OarIrbFI8Ib/GG5ifPszcqeTHx2zUzciTbG+2maytPBn9ux5mKtrvtQT
+    6TpcDPIREuyrm1V69Ifj25zDDOYyNluLo4KuDBSjtlR+ep9p7veSadeeHClWzn65
+    4whYT5uz0XPQQ7RfmvcyTQKBgAa+MlZsnb/81LZgzERE5mUULC73Ve6tzomZMceb
+    kY6GjrZKbWw9/Hjb2gv4d/9vo4QZE8FFeXB4NJMnWfK8JyB3QgWX+cM0xndsOhzD
+    us9nMBn3gK2W2pZdonx86unTbx0uqRG75YSojaXUCcWCF+dG7hzTviTctvr9tZV9
+    yBEJAoGAFjw2ZLLaeE2QgOweFpqncEC5/qinpFc51dX8qTMfgNzDxb8EUOTfklBV
+    hTpDPqU5c3ttLkACemOfp9eGUsIXPgCTYrDPzpKk6IIY+QLF8T7ANr1/zyju8SRK
+    jtiM9JLrHsl6kUYB/3G4lUPo6hTcsavKTr1t4FeS1rcOfzswc1I=
     -----END RSA PRIVATE KEY-----
 
 ---
@@ -141,7 +264,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: dckr_pat_example
+  password: dckr_patEXAMPLEjCbAaQ8TWo
 ---
 # ============================================================
 # RemoteCluster — GPU worker node

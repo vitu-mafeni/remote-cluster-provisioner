@@ -67,18 +67,19 @@ Address = 10.9.0.1/24
 ListenPort = 51820
 PrivateKey = SERVER_PRIVATE_KEY
 
-PostUp = sysctl -w net.ipv4.ip_forward=1
 PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
 PostUp = iptables -A FORWARD -o wg0 -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -s 10.9.0.0/24 -o eno2 -j MASQUERADE
+PostUp = iptables -t nat -A POSTROUTING -o ens5 -j MASQUERADE
 
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
 PostDown = iptables -D FORWARD -o wg0 -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -s 10.9.0.0/24 -o eno2 -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -o ens5 -j MASQUERADE
+
 
 [Peer]
 PublicKey = CLIENT_PUBLIC_KEY
 AllowedIPs = 10.9.0.10/32
+PersistentKeepalive = 25
 ```
 
 ---
