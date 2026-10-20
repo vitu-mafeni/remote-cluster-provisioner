@@ -894,7 +894,7 @@ EOF`,
 	// ── Phase 12: NFS provisioner ─────────────────────────────────────────────────
 	if startPhase <= CPPhaseNFSProvisioner {
 		if err := installNFSProvisioner(client, nodeIP); err != nil {
-			return "", fmt.Errorf("NFS provisioner installation failed: %w", err)
+			return "", fmt.Errorf("Longhorn or NFS provisioner installation failed: %w", err)
 		}
 		if onPhaseComplete != nil {
 			onPhaseComplete(CPPhaseNFSProvisioner)
@@ -919,43 +919,45 @@ EOF`,
 //   - nfs.path          → /srv/nfs/k8s
 //   - storageClass.defaultClass → true  (replaces false, or inserts if absent)
 func installNFSProvisioner(client *sshhelper.Client, nfsServerIP string) error {
-	log.Printf("Installing longhorn provisioner (server: %s)", nfsServerIP)
+	log.Printf("Installing longhorn and NFS provisioners (server: %s)", nfsServerIP)
 
-	nfsDir := "/tmp/catalog/workloads/ml-platform/longhorn"
+	nfsDir := "/tmp/catalog/workloads/ml-platform/nfs-provisioner"
+	longhorn := "/tmp/catalog/workloads/ml-platform/longhorn"
 
 	steps := []string{
 		// HelmRelease resources target the storage namespace.
 		"kubectl create namespace storage 2>/dev/null || true",
-		// "sudo mkdir -p /srv/nfs/k8s 2>/dev/null || true",
+		"sudo mkdir -p /srv/nfs/k8s 2>/dev/null || true",
 
 		// Patch every YAML file in the provisioner directory in-place.
-		//
+
 		// Escaping path through Go raw string → shell double-quote → sed:
 		//   \\  in raw string = two literal backslashes
 		//       shell double-quote collapses \\ → \
 		//       sed receives single \  (used as sed command prefix, e.g. a\ or \| address)
 		//   \\n in raw string = \\ + n
 		//       shell collapses \\ → \, n stays → sed receives \n (newline in append text)
-		// 		fmt.Sprintf(`for f in %s/*.yaml %s/*.yml; do \
-		//   [ -f "$f" ] || continue; \
-		//   sed -i "s/server: .*/server: %s/" "$f"; \
-		//   sed -i "s|path: .*|path: /srv/nfs/k8s|" "$f"; \
-		//   sed -i "s/defaultClass: false/defaultClass: true/" "$f"; \
-		//   grep -q "defaultClass" "$f" || \
-		//     sed -i "\|path: /srv/nfs/k8s|a\\    storageClass:\\n      defaultClass: true" "$f"; \
-		// done`, nfsDir, nfsDir, nfsServerIP),
+		fmt.Sprintf(`for f in %s/*.yaml %s/*.yml; do \
+		  [ -f "$f" ] || continue; \
+		  sed -i "s/server: .*/server: %s/" "$f"; \
+		  sed -i "s|path: .*|path: /srv/nfs/k8s|" "$f"; \
+		  sed -i "s/defaultClass: true/defaultClass: false/" "$f";
+		  grep -q "defaultClass" "$f" || \
+		    sed -i "\|path: /srv/nfs/k8s|a\\    storageClass:\\n      defaultClass: false" "$f"; \
+		done`, nfsDir, nfsDir, nfsServerIP),
 
 		fmt.Sprintf("kubectl apply -f %s/", nfsDir),
+		fmt.Sprintf("kubectl apply -f %s/", longhorn),
 	}
 
 	for i, cmd := range steps {
 		output, err := runStep(client, cmd)
 		if err != nil {
-			return sshhelper.StepError(fmt.Sprintf("longhorn provisioner install step %d/%d", i+1, len(steps)), err, output)
+			return sshhelper.StepError(fmt.Sprintf("longhorn and nfs provisioner install step %d/%d", i+1, len(steps)), err, output)
 		}
 	}
 
-	log.Printf("Longhorn provisioner installed successfully")
+	log.Printf("Longhorn and NFS provisioners installed successfully")
 	return nil
 }
 
