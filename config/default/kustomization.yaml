@@ -48,6 +48,67 @@ patches:
 #  target:
 #    kind: Deployment
 
+# [KUBE-PUBLIC] The top-level `namespace:` above rewrites the namespace of every
+# namespaced resource, which would move the kube-public Role/RoleBinding (used
+# to read kube-public/cluster-info) into the controller namespace, where the
+# grant is useless.
+#
+# WARNING - do not "fix" this with a patch: the namespace transformer runs
+# AFTER the `patches:` field, so a plain `patches:` entry (which is also what
+# `kustomize edit fix` converts the deprecated `patchesJson6902:` into) is
+# silently overridden and the Role/RoleBinding end up in the controller
+# namespace. `replacements:` run after the namespace transformer and are not
+# deprecated, so the namespace is pinned with a replacement instead. The value
+# is read from the `infra.dcn.ssu.ac.kr/pinned-namespace` annotation on the
+# RoleBinding (rbac/kube_public_role_binding.yaml) because the generated
+# rbac/role.yaml cannot be annotated; keep that annotation in sync with the
+# `namespace=` of the `kubebuilder:rbac` configmaps marker in the controller.
+#
+# The RoleBinding subject stays the controller ServiceAccount in the controller
+# namespace. Once the RoleBinding lives in kube-public, kustomize's
+# name-reference pass no longer recognises that subject (different namespace),
+# so it would keep the unprefixed `system/controller-manager`; the second and
+# third replacements copy the final name and namespace from the ServiceAccount.
+#
+# NOTE: if you enable the commented cert-manager `replacements:` further below,
+# merge those entries into this list rather than adding a second `replacements:` key.
+replacements:
+- source:
+    kind: RoleBinding
+    name: manager-kube-public-rolebinding
+    fieldPath: metadata.annotations.[infra.dcn.ssu.ac.kr/pinned-namespace]
+  targets:
+  - select:
+      kind: Role
+      name: manager-role
+    fieldPaths:
+    - metadata.namespace
+  - select:
+      kind: RoleBinding
+      name: manager-kube-public-rolebinding
+    fieldPaths:
+    - metadata.namespace
+- source:
+    kind: ServiceAccount
+    name: controller-manager
+    fieldPath: metadata.name
+  targets:
+  - select:
+      kind: RoleBinding
+      name: manager-kube-public-rolebinding
+    fieldPaths:
+    - subjects.0.name
+- source:
+    kind: ServiceAccount
+    name: controller-manager
+    fieldPath: metadata.namespace
+  targets:
+  - select:
+      kind: RoleBinding
+      name: manager-kube-public-rolebinding
+    fieldPaths:
+    - subjects.0.namespace
+
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 #- path: manager_webhook_patch.yaml

@@ -15,6 +15,7 @@ spec:
   # Cloud / infrastructure provider.
   # OnPrem = SSH-based provisioning via incluster.go
   provider: OnPrem
+  clusterName: my-cluster   # selects the NodeProvisionNetConfig whose spec.clusterName matches (required when the namespace has several clusters)
 
   # Role this node plays in the cluster.
   role: worker
@@ -29,6 +30,14 @@ spec:
   hostname: "gpu-worker-01.lan"
   sshPort: 22
   sshUsernameOverride: ubuntu
+
+  # ── VPN ──────────────────────────────────────────────────────
+  # Normally inherited from the cluster's NodeProvisionNetConfig (set
+  # disableVPN on the control-plane RemoteCluster). Only set it here when
+  # the NodeProvisionNetConfig is hand-authored: this node's ipAddress is a
+  # public (or otherwise directly routable) IP bound to a local interface,
+  # and the control plane's API endpoint is reachable from the node.
+  # disableVPN: true
 
   # ── SSH credentials ──────────────────────────────────────────
   # Secret holding the SSH credential for the node.
@@ -91,9 +100,9 @@ spec:
     # The controller uses these to register new peers via
     # "wg set wg0 peer …" and to persist the config.
     # Defaults: sshPort=22, sshUsername=ubuntu, vpnPort=51820
-    sshPort: 22
+    sshPort: "22"
     sshUsername: ubuntu
-    vpnPort: 51820
+    vpnPort: "51820"
 
     # Secret on THIS cluster that holds the VPN server SSH credential.
     # key + auth auto-detection work the same as credentialsRef above.
@@ -104,9 +113,6 @@ spec:
 
   softwareConfig:
     kubernetesVersion: "v1.34.2"
-    nvidiaDriverVersion: "550"
-    nvidiaContainerToolkitVersion: "1.17.3-1"
-    k8sDevicePluginVersion: "v0.17.1"
 
     # cnlabRuntime — prebuilt CRI-O runtime OCI artifact.
     # credentialsRef must point to a Secret with "username" and "token" keys
@@ -132,7 +138,7 @@ metadata:
 type: Opaque
 stringData:
   username: "vitu-mafeni"
-  token: "ghp_tzldTEST6SFgEBT3H22Bf"  # packages:read scope minimum
+  token: "REPLACE_WITH_REGISTRY_TOKEN"  # packages:read scope minimum
 
 ---
 # SSH credential for the WireGuard VPN server.

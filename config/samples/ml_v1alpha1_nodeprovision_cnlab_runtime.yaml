@@ -16,7 +16,7 @@ metadata:
 type: Opaque
 stringData:
   username: "your-github-username"
-  token: "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # packages:read scope minimum
+  token: "REPLACE_WITH_REGISTRY_TOKEN"  # packages:read scope minimum
 
 ---
 # ============================================================
@@ -44,9 +44,9 @@ spec:
 
   vpnServerPublicConfig:
     publicIP: "13.215.206.108"
-    sshPort: 22
+    sshPort: "22"
     sshUsername: ubuntu
-    vpnPort: 51820
+    vpnPort: "51820"
     vpnSshCredentialsRef:
       name: vpn-server-secret
       namespace: default
@@ -54,9 +54,6 @@ spec:
 
   softwareConfig:
     kubernetesVersion: "v1.34.2"
-    nvidiaDriverVersion: "550"
-    nvidiaContainerToolkitVersion: "1.17.3-1"
-    k8sDevicePluginVersion: "v0.17.1"
 
     # cnlabRuntime configures the prebuilt CRI-O runtime OCI artifact.
     # All fields are optional; defaults are listed as comments.
@@ -105,6 +102,7 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
 spec:
   provider: OnPrem
+  clusterName: my-cluster   # selects the NodeProvisionNetConfig whose spec.clusterName matches (required when the namespace has several clusters)
   role: worker
   nodeLabel: gpu
   ipAddress: "192.168.28.150"
@@ -145,6 +143,7 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
 spec:
   provider: AWS
+  clusterName: my-cluster   # selects the NodeProvisionNetConfig whose spec.clusterName matches (required when the namespace has several clusters)
   role: worker
   # "gpu" → p3.2xlarge  |  "cpu" → t3.xlarge  (resolved automatically)
   nodeLabel: gpu

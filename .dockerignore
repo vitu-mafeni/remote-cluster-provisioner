@@ -1,3 +1,35 @@
 # More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
-# Ignore build and test binaries.
+# Only cmd/, api/, internal/, pkg/, provider/, go.mod and go.sum are COPYed by
+# the Dockerfile; keep everything else out of the build context.
+
+# Version control and CI
+.git
+.gitignore
+.github
+
+# Build and test artifacts
 bin/
+*.test
+*.out
+cover.out
+dist/
+
+# Docs, samples, deployment manifests and local tooling
+docs/
+*.md
+config/
+deploy/
+hack/
+test/
+.devcontainer/
+.vscode/
+.idea/
+Makefile
+*.sh
+*.dsh
+
+# Local secrets / environment
+.env
+*.pem
+*.key
+kubeconfig*

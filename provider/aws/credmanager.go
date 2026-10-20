@@ -24,9 +24,14 @@ import (
 // Reconcilers call Get instead of resolving credentials inline; the background
 // goroutine ensures the cached session is always fresh even between reconciles.
 type CredentialManager struct {
-	client   client.Client
-	mu       sync.RWMutex
-	cache    map[credKey]*credEntry
+	client client.Client
+	mu     sync.RWMutex
+	cache  map[credKey]*credEntry
+	// keyLocks holds one mutex per credential key so concurrent refreshes of the
+	// same secret are serialized (a reused TOTP code is rejected by AWS). Entries
+	// are never deleted: removing one while another goroutine holds it would let
+	// a later refresh create a second mutex and run concurrently with the holder.
+	keyLocks map[credKey]*sync.Mutex
 	interval time.Duration // how often the background loop scans for near-expiry entries
 	grace    time.Duration // refresh when this close to expiry
 	log      logr.Logger
@@ -43,12 +48,30 @@ func (e *credEntry) needsRefresh(grace time.Duration) bool {
 	return !e.expiry.IsZero() && time.Now().Add(grace).After(e.expiry)
 }
 
+// unknownExpiryTTL is how long credentials that carry a session token but no
+// known expiry (e.g. a pre-obtained awsSessionToken) are cached. They must not
+// be cached forever: the token may expire at any time.
+const unknownExpiryTTL = 10 * time.Minute
+
+// keyLock returns the per-key refresh mutex.
+func (m *CredentialManager) keyLock(key credKey) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.keyLocks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		m.keyLocks[key] = l
+	}
+	return l
+}
+
 // NewCredentialManager returns a CredentialManager ready to be added to a
 // controller-runtime Manager.
 func NewCredentialManager(c client.Client, log logr.Logger) *CredentialManager {
 	return &CredentialManager{
 		client:   c,
 		cache:    make(map[credKey]*credEntry),
+		keyLocks: make(map[credKey]*sync.Mutex),
 		interval: 2 * time.Minute,
 		grace:    mfaSessionGrace, // 5 minutes — same window as the MFA session grace
 		log:      log,
@@ -79,6 +102,10 @@ func (m *CredentialManager) Get(ctx context.Context, namespace, name, region str
 // Evict removes the cache entry for the given secret.  Call it when the
 // associated resource (NodeProvision, etc.) is deleted to prevent the
 // background loop from repeatedly attempting to refresh a deleted secret.
+//
+// The per-key refresh mutexes are deliberately kept (they are tiny): a refresh
+// may be in flight, and forgetting its mutex would let the next refresh of the
+// same key run concurrently with it.
 func (m *CredentialManager) Evict(namespace, name string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -124,6 +151,21 @@ func (m *CredentialManager) NeedLeaderElection() bool { return true }
 //
 // Callers must not hold m.mu.
 func (m *CredentialManager) refresh(ctx context.Context, key credKey) (AWSCredentials, error) {
+	// Serialize refreshes per credential key: concurrent callers would otherwise
+	// each generate a TOTP code for the same 30 s window (AWS rejects a reused
+	// code) and race on the secret patch. Waiters re-check the cache once they
+	// hold the lock and reuse the winner's result.
+	l := m.keyLock(key)
+	l.Lock()
+	defer l.Unlock()
+
+	m.mu.RLock()
+	entry, cached := m.cache[key]
+	m.mu.RUnlock()
+	if cached && !entry.needsRefresh(m.grace) {
+		return entry.creds, nil
+	}
+
 	secret := &corev1.Secret{}
 	if err := m.client.Get(ctx, client.ObjectKey{
 		Namespace: key.namespace,
@@ -156,6 +198,18 @@ func (m *CredentialManager) refresh(ctx context.Context, key credKey) (AWSCreden
 	// ── Step 2a (no AssumeRole): cache base / MFA session ───────────────────
 	if roleArn == "" {
 		entry := &credEntry{creds: baseCreds}
+		if mfaSession == nil && baseCreds.SessionToken != "" {
+			// A session token that was not just minted here (a pre-obtained
+			// awsSessionToken, or an MFA session reused from the secret). Use the
+			// REAL expiry when the secret carries one: needsRefresh then refreshes
+			// it grace before that moment. Only a token with no known expiry gets
+			// the synthetic TTL (never cached forever).
+			if exp, ok := secretSessionExpiry(secret, baseCreds.SessionToken); ok {
+				entry.expiry = exp
+			} else {
+				entry.expiry = time.Now().Add(unknownExpiryTTL + m.grace)
+			}
+		}
 		if mfaSession != nil {
 			entry.expiry = mfaSession.Expiry
 			m.patchSecret(ctx, secret, map[string]string{

@@ -5,6 +5,13 @@ const (
 	DefaultRepository  = "vitu-mafeni/cnlab-runtime"
 	DefaultVersion     = "1.0.0-beta"
 	DefaultOrasVersion = "1.3.2"
+
+	// OSVariantAuto makes the install script pick the artifact variant from the
+	// node's own /etc/os-release: "<Version>-ubuntu20" on Ubuntu 20.x/21.x and
+	// "<Version>-ubuntu22" on Ubuntu 22.x-25.x and "<Version>-ubuntu26" on
+	// Ubuntu 26.x and newer. Version is the base version (e.g. "1.0.2") without
+	// an OS suffix.
+	OSVariantAuto = "auto"
 )
 
 // Config holds the resolved runtime artifact configuration with credentials
@@ -15,8 +22,10 @@ type Config struct {
 	Repository  string
 	Version     string
 	OrasVersion string
-	Username    string
-	Token       string // never log this value
+	// OSVariant is "" (Version is the exact tag) or OSVariantAuto.
+	OSVariant string
+	Username  string
+	Token     string // never log this value
 }
 
 // ApplyDefaults fills zero-value fields with the package defaults.
@@ -36,6 +45,8 @@ func (c *Config) ApplyDefaults() {
 }
 
 // ImageRef returns the fully-qualified OCI reference "registry/repository:version".
+// With OSVariantAuto the tag is only known on the node, so this is the base
+// reference; the install script appends the OS suffix.
 func (c *Config) ImageRef() string {
 	return c.Registry + "/" + c.Repository + ":" + c.Version
 }

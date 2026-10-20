@@ -32,15 +32,33 @@ type RemoteClusterSpec struct {
 
 	// foo is an example field of RemoteCluster. Edit remotecluster_types.go to remove/update
 	// +optional
-	ClusterName string    `json:"clusterName"` // this has to be unique for each cluster, and will be used as the cluster name when provisioning, and also will be used as the parent cluster
-	Host        string    `json:"host"`
-	VPNConfig   VPNConfig `json:"vpnConfig,omitempty"`
-	Port        string    `json:"port"`
-	User        string    `json:"user"`
-	NodeInfo    NodeInfo  `json:"nodeInfo,omitempty"`
+	ClusterName string `json:"clusterName"` // this has to be unique for each cluster, and will be used as the cluster name when provisioning, and also will be used as the parent cluster
+	Host        string `json:"host"`
+	// LocalPrimaryIP string    `json:"localPrimaryIP,omitempty"` // the primary IP of the local node that is used to connect to the remote cluster, this is used for VPN connection
+	VPNConfig VPNConfig `json:"vpnConfig,omitempty"`
+	Port      string    `json:"port"`
+	User      string    `json:"user"`
+	NodeInfo  NodeInfo  `json:"nodeInfo,omitempty"`
 
 	Auth      RemoteClusterAuth `json:"auth"`
 	GitConfig GitConfig         `json:"gitConfig,omitempty"`
+
+	// DisableVPN runs the cluster without WireGuard. Use it when spec.host is
+	// an IP that is directly reachable by the controller and by the other
+	// nodes of the cluster. spec.host must be an IP address bound to a local
+	// interface on the node; it is used as the kubelet node IP (and, for a
+	// control-plane, the API server advertise address) in place of the wg0
+	// address.
+	//
+	// The mode belongs to the whole cluster and is decided by the
+	// control-plane: it publishes it in the cluster's NodeProvisionNetConfig,
+	// workers (RemoteCluster and NodeProvision) inherit it, and a node that
+	// disables the VPN under a VPN control-plane is failed. With it set, no VPN
+	// server is contacted, no VPN range/credentials are published or copied, no
+	// peer is removed, flannel is not pinned to wg0, WireGuard is not installed
+	// or torn down, and spec.vpnConfig is ignored.
+	// +optional
+	DisableVPN bool `json:"disableVPN,omitempty"`
 }
 
 type VPNConfig struct {
@@ -89,6 +107,29 @@ type SoftwareConfig struct {
 	KubernetesVersion string         `json:"kubernetesVersion,omitempty"` // e.g., "v1.34.2"
 	ImagePrepulls     []ImagePrepull `json:"imagePrepulls,omitempty"`
 
+	// InsecureRegistries lists container registries (host or host:port, e.g.
+	// "harbor.example.com:30002") that CRI-O must reach over plain HTTP or with
+	// an untrusted/self-signed certificate. Each is written to a
+	// /etc/containers/registries.conf.d drop-in with insecure = true on every
+	// node provisioned by this operator (on-prem, AWS, GCP) BEFORE CRI-O starts.
+	// Use it for registries that are not listed in imagePrepulls but are pulled
+	// from by other workloads.
+	//
+	// Backward compatibility: the registry host of every fully-qualified image
+	// in imagePrepulls is ALSO marked insecure, exactly as before; the effective
+	// list is the de-duplicated, sorted union of both. Entries must be a bare
+	// host or host:port: no scheme, path, spaces, quotes or other special
+	// characters (invalid entries are rejected).
+	//
+	// CRI-O reads registries.conf.d only at start, so nodes that are already
+	// provisioned need a one-time manual CRI-O restart after the drop-in is
+	// written (see docs/controllers-user-guide.md).
+	// +optional
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=259
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`
+	InsecureRegistries []string `json:"insecureRegistries,omitempty"`
+
 	// ImagePullSecretRef optionally references a Secret containing registry
 	// credentials used when pre-pulling private images listed in ImagePrepulls.
 	// The Secret must have "username" and "password" keys.
@@ -121,6 +162,16 @@ type CnlabRuntimeConfig struct {
 	// OrasVersion is the ORAS CLI version to install. Default: "1.3.2"
 	// +optional
 	OrasVersion string `json:"orasVersion,omitempty"`
+	// OSVariant selects how the artifact tag is chosen. Empty (default): Version
+	// is used exactly as given. "auto": Version is the base version (e.g.
+	// "1.0.2") and each node picks its own build from /etc/os-release, installing
+	// "<Version>-ubuntu20" on Ubuntu 20.x/21.x and "<Version>-ubuntu22" on
+	// Ubuntu 22.x-25.x and "<Version>-ubuntu26" on Ubuntu 26.x and newer. Use it
+	// for clusters that mix supported OS releases; it requires an explicit
+	// Version without an OS suffix.
+	// +kubebuilder:validation:Enum=auto
+	// +optional
+	OSVariant string `json:"osVariant,omitempty"`
 	// CredentialsRef references a Secret with "username" and "token" keys
 	// for authenticating to the OCI registry. Follows the same pattern as
 	// VPNSSHCredentialsRef — set Name to enable secret lookup.

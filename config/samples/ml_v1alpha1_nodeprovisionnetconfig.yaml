@@ -6,4 +6,15 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: nodeprovisionnetconfig-sample
 spec:
-  # TODO(user): Add fields here
+  # Minimal hand-authored example (normally created by the management cluster
+  # controller). For a cluster without WireGuard, set disableVPN and drop
+  # vpnRange / vpnServerPublicConfig.
+  clusterName: my-cluster
+  disableVPN: true
+  softwareConfig:
+    kubernetesVersion: "v1.34.2"
+    # Registries served over plain HTTP / with an untrusted cert (host or host:port).
+    # Written as CRI-O registries.conf.d drop-ins on every provisioned node. Hosts
+    # of the imagePrepulls images are ALSO marked insecure (backward compatible).
+    # insecureRegistries:
+    #   - harbor.example.com:30002

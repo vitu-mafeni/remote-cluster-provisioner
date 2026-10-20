@@ -6,4 +6,27 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: remotecluster-sample
 spec:
-  # TODO(user): Add fields here
+  # Minimal on-prem control-plane example reachable directly over SSH (no
+  # WireGuard). See infra_v1_remotecluster_gpu_worker.yaml for a VPN worker and
+  # infra_v1_remoteclustercopy-new.yaml for a fully annotated example.
+  clusterName: "remotecluster-sample" # unique per cluster
+  host: "192.168.3.234"               # IP bound to a local interface on the node
+  port: "22"
+  user: "ubuntu"
+  disableVPN: true
+  nodeInfo:
+    nodeType: "control-plane"
+    hardwareType: "cpu"
+  auth:
+    passwordSecretRef:
+      name: remotecluster-sample-ssh-secret
+      key: password
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: remotecluster-sample-ssh-secret
+  namespace: default
+type: Opaque
+stringData:
+  password: "REPLACE_WITH_SSH_PASSWORD"

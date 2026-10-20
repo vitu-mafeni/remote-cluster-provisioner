@@ -9,9 +9,20 @@
 #      registry host:port (e.g. "10.8.0.1:30080").
 #   2. kubectl apply -f deploy/harbor-registry-configurator.yaml
 #
+# NOTE: the endpoint reaches the container as an environment variable
+# (configMapKeyRef), which Kubernetes resolves only when the container starts.
+# Editing the ConfigMap afterwards is NOT picked up by running pods, not even by
+# the hourly re-check below. After changing the endpoint run:
+#   kubectl -n kube-system rollout restart daemonset/harbor-registry-configurator
+#
+# The container is privileged (with hostPID) so it can write the host's
+# /etc/containers and signal the host's CRI-O process. It replaces the whole
+# registries.conf, so any existing content of that file on the node is overwritten.
+#
 # To auto-discover the Harbor NodePort from within the cluster:
 #   kubectl -n harbor get svc harbor -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}'
-# Then set endpoint to "<control-plane-vpn-ip>:<nodeport>".
+# Then set endpoint to "<control-plane-vpn-ip>:<nodeport>" (the control-plane's own
+# address instead of its VPN IP when the cluster runs with disableVPN).
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -19,8 +30,10 @@ metadata:
   name: harbor-registry
   namespace: kube-system
 data:
-  # Harbor registry endpoint — host:port reachable from all nodes (VPN IP + NodePort).
+  # Harbor registry endpoint — host:port reachable from all nodes (VPN IP + NodePort,
+  # or the control-plane address + NodePort when the cluster runs with disableVPN).
   # Example: "10.8.0.1:30080"
+  # Read once at pod start: restart the DaemonSet after changing it (see header).
   endpoint: ""
 ---
 apiVersion: apps/v1
@@ -50,7 +63,7 @@ spec:
       - operator: Exists    # tolerate all taints — must run on every node
       containers:
       - name: configurator
-        image: alpine:3
+        image: alpine:3.20.3@sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a   # pinned tag+digest; bump deliberately
         securityContext:
           privileged: true
         env:
@@ -101,8 +114,10 @@ spec:
             done
           }
 
-          # Apply immediately on startup, then re-check hourly so the config
-          # survives CRI-O restarts and node reboots.
+          # Apply immediately on startup, then re-check hourly and rewrite the
+          # file if something on the node changed it. HARBOR_ENDPOINT is fixed
+          # for the life of this pod (env is resolved at container start), so a
+          # ConfigMap change needs a DaemonSet rollout restart.
           apply_config
           while sleep 3600; do
             apply_config

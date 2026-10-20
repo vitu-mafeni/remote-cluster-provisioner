@@ -61,15 +61,62 @@ type CredentialsRef struct {
 
 // AWSConfig holds AWS-specific parameters for EC2 node provisioning.
 type AWSConfig struct {
-	// VPC ID where the instance will be launched.
+	// VPC ID where the instance will be launched, e.g. "vpc-0123456789abcdef0".
+	// When subnetId is also set it must be that subnet's VPC. When only vpcId is
+	// set, a subnet of this VPC is chosen. When neither is set the region's
+	// default VPC is used (and created if the region has none).
+	// +optional
 	VPCID string `json:"vpcId,omitempty"`
-	// Subnet ID for the instance's primary network interface.
+	// Subnet ID for the instance's primary network interface. Determines the VPC
+	// when vpcId is unset. Must be in spec.region.
+	// +optional
 	SubnetID string `json:"subnetId,omitempty"`
-	// Security group IDs to attach to the instance.
+	// Security group IDs to attach to the instance; they must all be in the
+	// instance's VPC. When vpcId and subnetId are unset, the VPC is taken from
+	// these groups. When empty, the default security group of the resolved VPC is
+	// used: if the controller chose the whole network (nothing set here, vpcId
+	// or subnetId) it opens SSH, and WireGuard when the VPN is enabled, on that
+	// group; for a VPC or subnet you named it leaves the group's rules untouched.
 	// +optional
 	SecurityGroupIDs []string `json:"securityGroupIds,omitempty"`
-	// AMI ID to use for the instance.
+	// DisablePublicIP launches the instance without a public IPv4 address, for
+	// private subnets. The node then needs an egress path (NAT gateway, transit
+	// gateway, ...) for package/image downloads and, with a VPN, to reach the VPN
+	// server. Default false: the instance gets a public IP.
+	// +optional
+	DisablePublicIP bool `json:"disablePublicIp,omitempty"`
+	// SkipControlPlaneVPCCheck turns off the no-VPN guard that fails a node whose
+	// VPC does not contain the control plane's (private) API endpoint. Without a
+	// VPN every node must be able to route to the control plane; set this only
+	// when it is reachable by VPC peering or a transit gateway.
+	// +optional
+	SkipControlPlaneVPCCheck bool `json:"skipControlPlaneVpcCheck,omitempty"`
+	// AMI ID to boot, e.g. "ami-0123456789abcdef0": a public, shared or private
+	// (custom) image in spec.region. It must be an available, EBS-backed, HVM,
+	// non-Windows image whose architecture matches the instance type, and
+	// Ubuntu 20.04 or newer with cloud-init (the bootstrap uses apt and systemd).
+	// When empty it is resolved: from amiName if set, otherwise the latest
+	// Canonical Ubuntu 22.04 LTS. If both ami and amiName are set, ami wins.
+	// +optional
 	AMI string `json:"ami,omitempty"`
+	// AMIName selects the newest available image whose name matches (wildcards
+	// allowed, e.g. "my-k8s-node-*") among amiOwners, with the instance type's
+	// architecture. The result is recorded in ami and stays pinned.
+	// +optional
+	AMIName string `json:"amiName,omitempty"`
+	// AMIOwners limits the amiName search: "self" (default), "amazon",
+	// "aws-marketplace" or 12-digit account IDs.
+	// +optional
+	AMIOwners []string `json:"amiOwners,omitempty"`
+	// RootSnapshotID boots the instance from this EBS snapshot instead of the
+	// image's own root volume: the root volume is created from the snapshot
+	// ("snap-0123456789abcdef0", in spec.region, completed) while ami (or the
+	// default Ubuntu AMI) supplies architecture, boot mode and virtualization, so
+	// the snapshot must come from a compatible root volume. rootVolumeSizeGB
+	// must be at least the snapshot size. No AMI is registered, so nothing needs
+	// cleaning up when the node is deleted.
+	// +optional
+	RootSnapshotID string `json:"rootSnapshotId,omitempty"`
 	// EC2 key pair name for SSH access (optional when using cloud-init only).
 	// +optional
 	KeyPairName string `json:"keyPairName,omitempty"`
@@ -86,9 +133,129 @@ type AWSConfig struct {
 	RootVolumeSizeGB int32 `json:"rootVolumeSizeGB,omitempty"`
 }
 
+// GCPAccelerator attaches GPUs to an N1 instance. A2/A3/G2 machine types include
+// their GPUs, so leave this unset for them.
+type GCPAccelerator struct {
+	// Type is the accelerator type name, e.g. "nvidia-tesla-t4", "nvidia-tesla-v100".
+	// +kubebuilder:validation:MinLength=1
+	Type string `json:"type"`
+	// Count is the number of GPUs to attach (default 1).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	// +optional
+	Count int32 `json:"count,omitempty"`
+}
+
+// GCPConfig holds Google Compute Engine parameters for GCP node provisioning.
+//
+// The machine type is spec.instanceType (e.g. "e2-standard-4", "n1-standard-8",
+// "g2-standard-8"). The location is spec.region and/or gcpConfig.zone: a zone
+// ("us-central1-a") implies its region and, if spec.region is also set, must
+// belong to it; with only a region the controller picks a zone of that region
+// that offers the machine type (and accelerator) and records it in this field.
+type GCPConfig struct {
+	// ProjectID is the GCP project to create the instance in. Defaults to the
+	// project_id of the service-account key in spec.credentialsRef.
+	// +optional
+	ProjectID string `json:"projectId,omitempty"`
+	// Zone is the compute zone, e.g. "us-central1-a" (see the type comment).
+	// +optional
+	Zone string `json:"zone,omitempty"`
+	// Network is the VPC network name or "projects/<host>/global/networks/<n>"
+	// (Shared VPC). When unset it is taken from subnetwork if that is set,
+	// otherwise "default". If both are set the subnetwork must belong to it.
+	// +optional
+	Network string `json:"network,omitempty"`
+	// Subnetwork is a subnetwork name (in the network's project), or
+	// "regions/<r>/subnetworks/<n>", "projects/<p>/regions/<r>/subnetworks/<n>"
+	// or a full URL. It must be in the instance's region and PRIVATE. Required for custom-mode networks; optional for auto-mode ones.
+	// +optional
+	Subnetwork string `json:"subnetwork,omitempty"`
+	// SourceImage is the boot image: a custom image name (in imageProject, default
+	// the instance's project), "projects/<p>/global/images/<name>",
+	// "projects/<p>/global/images/family/<f>" or a full URL. It must be a READY,
+	// non-deprecated, x86_64, non-Windows Ubuntu 20.04+ image (the startup script
+	// uses apt and systemd). When empty (and sourceSnapshot is unset) the latest
+	// image of imageFamily/imageProject is resolved and recorded here (default:
+	// latest Ubuntu 22.04 LTS, x86_64).
+	// +optional
+	SourceImage string `json:"sourceImage,omitempty"`
+	// SourceSnapshot boots the instance from a disk snapshot of a boot disk: a
+	// snapshot name (in the instance's project), "projects/<p>/global/snapshots/<n>"
+	// or a full URL. It is mutually exclusive with sourceImage, imageFamily and
+	// imageProject. The snapshot must be READY, non-Windows and from an x86_64
+	// Ubuntu 20.04+ boot disk; bootDiskSizeGB must be at least its size (when
+	// unset it is raised to fit).
+	// +optional
+	SourceSnapshot string `json:"sourceSnapshot,omitempty"`
+	// ImageFamily is the image family used when sourceImage is empty.
+	// Defaults to "ubuntu-2204-lts".
+	// +optional
+	ImageFamily string `json:"imageFamily,omitempty"`
+	// ImageProject is the project that publishes imageFamily.
+	// Defaults to "ubuntu-os-cloud".
+	// +optional
+	ImageProject string `json:"imageProject,omitempty"`
+	// BootDiskSizeGB is the boot disk size in GB (default 50).
+	// +kubebuilder:validation:Minimum=10
+	// +optional
+	BootDiskSizeGB int32 `json:"bootDiskSizeGB,omitempty"`
+	// BootDiskType is the persistent disk type, e.g. "pd-balanced" (default),
+	// "pd-ssd", "pd-standard" or a hyperdisk type required by newer machine series.
+	// +optional
+	BootDiskType string `json:"bootDiskType,omitempty"`
+	// Labels are extra GCE labels for the instance. Controller labels cannot be overridden.
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+	// NetworkTags are extra network tags for the instance (firewall targeting).
+	// +optional
+	NetworkTags []string `json:"networkTags,omitempty"`
+	// ServiceAccountEmail attaches this service account to the instance. When
+	// empty no service account is attached (least privilege; the node does not need one).
+	// +optional
+	ServiceAccountEmail string `json:"serviceAccountEmail,omitempty"`
+	// ServiceAccountScopes are the OAuth scopes of the attached service account.
+	// Defaults to cloud-platform (access is then governed by IAM).
+	// +optional
+	ServiceAccountScopes []string `json:"serviceAccountScopes,omitempty"`
+	// Accelerator attaches GPUs to an N1 instance (see GCPAccelerator). GPU
+	// instances always use onHostMaintenance=TERMINATE.
+	// +optional
+	Accelerator *GCPAccelerator `json:"accelerator,omitempty"`
+	// Spot runs the instance as a Spot VM (can be preempted at any time).
+	// +optional
+	Spot bool `json:"spot,omitempty"`
+	// DisableExternalIP creates the instance without an external IP address. The
+	// node then needs Cloud NAT (or another egress path) for package downloads
+	// and, with a VPN, to reach the VPN server.
+	// +optional
+	DisableExternalIP bool `json:"disableExternalIP,omitempty"`
+	// FirewallSourceRanges are the CIDRs allowed to reach the node through the
+	// per-node firewall rules (SSH, and kubelet/flannel without a VPN). Defaults
+	// to the RFC1918 private ranges plus the node's own subnetwork range (so a VPC
+	// that is not RFC1918, e.g. 172.168.0.0/16, is not locked out): the controller
+	// and the control plane reach the node's internal address. With a VPN SSH travels inside the tunnel, so
+	// the SSH rule is created only when this is set.
+	// +optional
+	FirewallSourceRanges []string `json:"firewallSourceRanges,omitempty"`
+}
+
 // NodeProvisionSpec defines the desired state of NodeProvision.
 type NodeProvisionSpec struct {
 	Provider CloudProvider `json:"provider,omitempty"`
+
+	// ClusterName names the cluster this node joins: the NodeProvisionNetConfig
+	// in the namespace whose spec.clusterName equals this value supplies the VPN
+	// range, VPN mode, image pre-pulls, registry secret and join command.
+	// Provisioning fails with a clear error when none or several match.
+	//
+	// Optional only for backward compatibility: when empty and the namespace
+	// holds exactly one NodeProvisionNetConfig, that one is used; when the
+	// namespace holds several, provisioning fails and asks for this field
+	// (the controller never guesses). Set it whenever a namespace serves more
+	// than one cluster.
+	// +optional
+	ClusterName string `json:"clusterName,omitempty"`
 
 	// HardwareType classifies the node for image pre-pull targeting.
 	// "gpu" — node has GPUs; pulls images with nodeTarget "gpu" and "all".
@@ -115,9 +282,37 @@ type NodeProvisionSpec struct {
 
 	CredentialsRef CredentialsRef `json:"credentialsRef,omitempty"`
 
+	// DisableVPN provisions the node without a WireGuard tunnel: no VPN server
+	// connection, IP allocation, peer, WireGuard package/config or security
+	// group rule is made. Use it when the node is directly reachable by the
+	// controller and the control plane, and the control plane's API endpoint
+	// (the address in the kubeadm join command) is reachable from the node.
+	//
+	// The mode belongs to the whole cluster and is taken from the
+	// NodeProvisionNetConfig (spec.disableVPN, synced from the control-plane
+	// RemoteCluster): a node in a VPN-less cluster inherits true, and setting
+	// true against a VPN cluster fails the provision. Setting it here is only
+	// needed for a hand-authored NodeProvisionNetConfig.
+	//
+	// The node's own address is used as the kubelet node IP:
+	//   - OnPrem: spec.ipAddress, which must be an IP bound to a local interface.
+	//   - AWS: the instance's private IP (a public EC2 IP is NATed and cannot be
+	//     a kubelet node IP), so the control plane must be able to route to it,
+	//     e.g. same or peered VPC.
+	//   - GCP: the instance's internal (VPC) IP, for the same reason; the
+	//     per-node firewall rules admit the control plane / controller ranges
+	//     (gcpConfig.firewallSourceRanges).
+	// +optional
+	DisableVPN bool `json:"disableVPN,omitempty"`
+
 	// AWSConfig holds provider-specific parameters for AWS EC2 provisioning.
 	// +optional
 	AWSConfig *AWSConfig `json:"awsConfig,omitempty"`
+
+	// GCPConfig holds provider-specific parameters for Google Compute Engine
+	// provisioning (provider: GCP).
+	// +optional
+	GCPConfig *GCPConfig `json:"gcpConfig,omitempty"`
 }
 
 // NodeProvisionStatus defines the observed state of NodeProvision.
@@ -134,7 +329,8 @@ type NodeProvisionStatus struct {
 	// Timestamp when provisioning completed.
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 
-	// Provider-generated instance ID (e.g. i-xxxxxxxxxxxxxxxxx for AWS).
+	// Provider-generated instance ID (e.g. i-xxxxxxxxxxxxxxxxx for AWS; the
+	// instance name for GCP, which is unique within the zone).
 	InstanceID string `json:"instanceId,omitempty"`
 
 	// Assigned hostname.

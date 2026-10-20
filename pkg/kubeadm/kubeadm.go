@@ -1,8 +1,13 @@
 package kubeadm
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,6 +15,7 @@ import (
 	"dcn.ssu.ac.kr/infra/pkg/argocd"
 	pkgruntime "dcn.ssu.ac.kr/infra/pkg/runtime"
 	sshhelper "dcn.ssu.ac.kr/infra/pkg/ssh"
+	cryptossh "golang.org/x/crypto/ssh"
 )
 
 const (
@@ -59,17 +65,23 @@ type ProvisionPhase struct {
 // runPhases executes each phase in order, skipping those with index < startPhase.
 // After every successful phase it calls onPhaseComplete (if non-nil) with the
 // completed phase index so the caller can persist progress.
-func runPhases(client *sshhelper.Client, phases []ProvisionPhase, startPhase int, onPhaseComplete func(int)) error {
+//
+// Every step runs under "set -o pipefail" so a failing producer in a pipeline
+// (e.g. `curl | gpg | tee`) fails the step instead of leaving a truncated file.
+// Errors name the phase and step index plus the scrubbed tail of the step's
+// output — never the command text, which can embed registry tokens. secrets are
+// additionally scrubbed from that output.
+func runPhases(client *sshhelper.Client, phases []ProvisionPhase, startPhase int, onPhaseComplete func(int), secrets ...string) error {
 	for i, phase := range phases {
 		if i < startPhase {
 			log.Printf("[phase %d/%d] Skipping %q (already completed)", i, len(phases)-1, phase.Name)
 			continue
 		}
 		log.Printf("[phase %d/%d] Running %q", i, len(phases)-1, phase.Name)
-		for _, cmd := range phase.Steps {
-			output, err := sshhelper.Run(client, cmd)
+		for si, cmd := range phase.Steps {
+			output, err := runStep(client, cmd)
 			if err != nil {
-				return fmt.Errorf("phase %d (%s) command failed: %s\nOutput:\n%s", i, phase.Name, cmd, output)
+				return sshhelper.StepError(fmt.Sprintf("phase %d (%s) step %d/%d", i, phase.Name, si+1, len(phase.Steps)), err, output, secrets...)
 			}
 		}
 		if onPhaseComplete != nil {
@@ -79,133 +91,113 @@ func runPhases(client *sshhelper.Client, phases []ProvisionPhase, startPhase int
 	return nil
 }
 
-// cpPhase* constants name the control-plane provision phases.
-// They are used by the controller to resume from the last completed phase on retry.
-const (
-	CPPhaseCleanup         = 0
-	CPPhaseNFS             = 1
-	CPPhaseSysSettings     = 2
-	CPPhaseAPTRepos        = 3
-	CPPhaseCRIOInstall     = 4
-	CPPhaseCRIOStart       = 5
-	CPPhaseK8sInstall      = 6
-	CPPhaseKubeadmInit     = 7
-	CPPhasePostInit        = 8
-	CPPhaseCNI             = 9
-	CPPhaseAddons          = 10
-	CPPhaseArgoCDConfigure = 11
-	CPPhaseNFSProvisioner  = 12
-)
+// pipefailPrefix is prepended to every provisioning step (see runStep).
+const pipefailPrefix = "set -o pipefail\n"
 
-// WorkerPhase* constants name the worker-node provision phases.
-const (
-	WorkerPhaseCleanup     = 0
-	WorkerPhaseSysSettings = 1
-	WorkerPhaseAPTRepos    = 2
-	WorkerPhaseCRIOInstall = 3
-	WorkerPhaseCRIOStart   = 4
-	WorkerPhaseK8sInstall  = 5
-	WorkerPhaseGPUCDI      = 6
-	WorkerPhaseCRIORestart = 7
-	WorkerPhaseJoin        = 8
-)
-
-// insecureRegistriesConfStep returns a shell step that marks the registry
-// host:port of every private image reference in imagePrepulls as insecure
-// (plain HTTP) via a CRI-O registries.conf.d drop-in. This platform's
-// self-hosted registries (e.g. Harbor exposed through a NodePort on the
-// node's own LAN IP) are reached over plain HTTP, not TLS — without this,
-// CRI-O defaults to HTTPS and every pull fails with "server gave HTTP
-// response to HTTPS client". Returns "" (add nothing) when no image
-// reference has a qualified registry host to configure.
-func insecureRegistriesConfStep(imagePrepulls []infrav1.ImagePrepull) string {
-	seen := map[string]bool{}
-	var hosts []string
-	for _, ip := range imagePrepulls {
-		host, _, found := strings.Cut(ip.Image, "/")
-		if !found {
-			continue
-		}
-		// A bare Docker Hub org/user (e.g. "library", "vitu1") has no dot or
-		// colon and isn't a registry host — skip it so unqualified images
-		// don't misfire this check.
-		if !strings.ContainsAny(host, ".:") || seen[host] {
-			continue
-		}
-		seen[host] = true
-		hosts = append(hosts, host)
-	}
-	if len(hosts) == 0 {
-		return ""
-	}
-	fileName := strings.NewReplacer(".", "-", ":", "-").Replace
-	var b strings.Builder
-	b.WriteString("sudo mkdir -p /etc/containers/registries.conf.d\n")
-	for _, h := range hosts {
-		fmt.Fprintf(&b, "cat <<'EOF' | sudo tee /etc/containers/registries.conf.d/50-insecure-%s.conf > /dev/null\n"+
-			"[[registry]]\nlocation = \"%s\"\ninsecure = true\nEOF\n", fileName(h), h)
-	}
-	return b.String()
+// runStep runs cmd on the node under bash with pipefail enabled.
+func runStep(client *sshhelper.Client, cmd string) (string, error) {
+	return sshhelper.Run(client, pipefailPrefix+cmd)
 }
 
-// joinWorkerSteps returns the shell steps that wait for the control-plane API
-// server to become reachable over the VPN tunnel, then run kubeadm join with
-// its own retry loop. kubeadm's own preflight check for the cluster-info
-// ConfigMap uses a short (~10s) internal timeout, which is too tight for a
-// worker whose WireGuard tunnel may not have finished its handshake/routing
-// yet — that transient race is what produces "couldn't validate the identity
-// of the API Server ... context deadline exceeded". Explicitly waiting for
-// the endpoint to answer first, then retrying the join itself a few times,
-// converges far faster than relying on an outer reconcile retry.
-func joinWorkerSteps(joinCmd string) []string {
-	apiEndpoint := ""
-	fields := strings.Fields(joinCmd)
-	for i, f := range fields {
-		if f == "join" && i+1 < len(fields) {
-			apiEndpoint = fields[i+1]
-			break
-		}
+var (
+	k8sVersionRE  = regexp.MustCompile(`^[0-9]+\.[0-9]+(\.[0-9]+)?$`)
+	apiEndpointRE = regexp.MustCompile(`^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?):[0-9]{1,5}$`)
+	joinCmdSafeRE = regexp.MustCompile(`^kubeadm join [A-Za-z0-9._:\[\]/=+@,-]+( [A-Za-z0-9._:\[\]/=+@,-]+)*$`)
+)
+
+// ParseKubernetesVersion strips a leading "v" from v, validates it as
+// MAJOR.MINOR[.PATCH] and returns the cleaned version plus the MAJOR.MINOR
+// apt repository version. The values are interpolated into shell commands, so
+// anything else is rejected.
+func ParseKubernetesVersion(v string) (clean, repoVersion string, err error) {
+	clean = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if !k8sVersionRE.MatchString(clean) {
+		return "", "", fmt.Errorf("invalid kubernetes version %q (want MAJOR.MINOR[.PATCH], e.g. 1.35.0)", v)
 	}
-
-	var steps []string
-	if apiEndpoint != "" {
-		steps = append(steps, fmt.Sprintf(`echo "Waiting for control-plane API server %[1]s to become reachable over the VPN tunnel..."
-for i in $(seq 1 60); do
-  curl -sk --connect-timeout 3 --max-time 5 "https://%[1]s/healthz" -o /dev/null && { echo "Control-plane API server reachable"; break; }
-  sleep 5
-done`, apiEndpoint))
-	}
-	steps = append(steps, fmt.Sprintf(`for attempt in 1 2 3 4 5; do
-  if sudo %s --cri-socket=unix:///var/run/crio/crio.sock; then
-    echo "kubeadm join succeeded"
-    break
-  fi
-  if [ "$attempt" = "5" ]; then
-    echo "ERROR: kubeadm join failed after 5 attempts" >&2
-    exit 1
-  fi
-  sleep $((attempt * 15))
-done`, joinCmd))
-	return steps
-}
-
-func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster, startPhase int, onPhaseComplete func(int), runtimeCfg pkgruntime.Config) (string, error) {
-	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
-
-	tunIP, err := GetTunIP(client)
-	if err != nil {
-		return "", fmt.Errorf("failed to get control plane wg0 IP: %w", err)
-	}
-	log.Printf("Control plane VPN IP: %s", tunIP)
-
-	clean := strings.TrimPrefix(cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion, "v")
 	parts := strings.Split(clean, ".")
-	if len(parts) < 2 {
-		return "", fmt.Errorf("invalid kubernetes version: %s", cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion)
-	}
-	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
+	return clean, parts[0] + "." + parts[1], nil
+}
 
-	kubeadmConfig := fmt.Sprintf(`
+// cgroupV1Applies reports whether a kubelet of this Kubernetes version refuses to
+// run on a cgroups v1 host unless failCgroupV1 is false (Kubernetes >= 1.35).
+func cgroupV1Applies(version string) bool {
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	return majorErr == nil && minorErr == nil && (major > 1 || (major == 1 && minor >= 35))
+}
+
+func cgroupV1CompatibilitySettings(version string) (configStep, preflightArg string) {
+	if !cgroupV1Applies(version) {
+		return "", ""
+	}
+	return `if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then
+  sudo sed -i '/^featureGates:/i failCgroupV1: false' /tmp/kubeadm-config.yaml
+fi`, ` $(if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then printf '%s' '--ignore-preflight-errors=SystemVerification'; fi)`
+}
+
+// CgroupV1JoinSnippet returns bash that defines CGROUP_V1_JOIN_ARGS, the extra
+// `kubeadm join` arguments a WORKER needs on a cgroups v1 host (e.g. Ubuntu
+// 20.04) running Kubernetes >= 1.35 — the join counterpart of the init handling in
+// cgroupV1CompatibilitySettings. Without them the join fails kubeadm's
+// SystemVerification preflight ("cgroups v1 support is deprecated ..."), and even
+// past it the kubelet refuses to start unless failCgroupV1 is false. The
+// arguments are:
+//
+//	--ignore-preflight-errors=SystemVerification
+//	--patches=<dir>   a kubeletconfiguration patch setting failCgroupV1: false
+//
+// so the worker's kubelet config is correct whatever the cluster's kubelet-config
+// ConfigMap says. On cgroups v2 hosts, or for Kubernetes < 1.35, the variable is
+// empty. sudo ("" or "sudo") prefixes the privileged commands. CNLAB_CGROUP_CONTROLLERS
+// and CNLAB_PATCH_DIR override the probed file and the patch directory (tests only).
+func CgroupV1JoinSnippet(version, sudo string) string {
+	if !cgroupV1Applies(version) {
+		return `CGROUP_V1_JOIN_ARGS=""`
+	}
+	if sudo != "" {
+		sudo += " "
+	}
+	return `CGROUP_V1_JOIN_ARGS=""
+if [ ! -e "${CNLAB_CGROUP_CONTROLLERS:-/sys/fs/cgroup/cgroup.controllers}" ]; then
+  # cgroups v1 host: kubelet >= 1.35 needs failCgroupV1=false and kubeadm's
+  # SystemVerification preflight must be skipped.
+  CGROUP_V1_PATCH_DIR="${CNLAB_PATCH_DIR:-/var/lib/node-bootstrap-kubeadm-patches}"
+  ` + sudo + `mkdir -p "$CGROUP_V1_PATCH_DIR"
+  printf 'failCgroupV1: false\n' | ` + sudo + `tee "$CGROUP_V1_PATCH_DIR/kubeletconfiguration+merge.yaml" >/dev/null
+  CGROUP_V1_JOIN_ARGS="--ignore-preflight-errors=SystemVerification --patches=$CGROUP_V1_PATCH_DIR"
+  echo "cgroups v1 host: joining with failCgroupV1=false and SystemVerification ignored"
+fi`
+}
+
+// sharedStoragePhases returns the final worker phase that mounts the control plane's
+// shared checkpoint directory (none when the join command has no usable control-plane
+// host). Its index is WorkerPhaseSharedStorage.
+func sharedStoragePhases(joinCmd string) []ProvisionPhase {
+	snippet := CheckpointStorageMountSnippet(NFSServerFromJoinCommand(joinCmd), "sudo")
+	if snippet == "" {
+		return nil
+	}
+	return []ProvisionPhase{{Name: "Shared Storage", Steps: []string{snippet}}}
+}
+
+// checkpointExportStep creates the shared checkpoint directory on the control plane
+// (idempotent). It lives under the /srv/nfs/k8s export, so it needs no export line of
+// its own; workers also create it themselves when an older control plane lacks it.
+func checkpointExportStep() string {
+	return fmt.Sprintf(`sudo mkdir -p %[1]s
+sudo chown nobody:nogroup %[1]s
+sudo chmod 755 %[1]s`, CheckpointNFSExport)
+}
+
+// kubeadmInitConfig renders the multi-document kubeadm config of the control
+// plane: InitConfiguration, ClusterConfiguration, KubeletConfiguration and
+// KubeProxyConfiguration. clean is the cleaned Kubernetes version (e.g. "1.35.0").
+func kubeadmInitConfig(nodeIP, clean, clusterName string) string {
+	cfg := fmt.Sprintf(`
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 localAPIEndpoint:
@@ -252,34 +244,368 @@ cgroupDriver: systemd
 containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
 featureGates:
   DynamicResourceAllocation: true
-  DRAConsumableCapacity: true
+	DRAConsumableCapacity: true
 runtimeRequestTimeout: "15m"
+imageGCHighThresholdPercent: 95
+imageGCLowThresholdPercent: 90
+evictionHard:
+  imagefs.available: "15%%"
+  memory.available: "500Mi"
+  nodefs.available: "10%%"
+  nodefs.inodesFree: "5%%"
+evictionPressureTransitionPeriod: 0s
 ---
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
 mode: ipvs
-`, tunIP, clean, cluster.Spec.ClusterName)
+`, nodeIP, clean, yamlString(clusterName))
+	return normalizeKubeadmConfig(cfg)
+}
+
+// kubeadmInitSteps returns the shell steps of the "kubeadm Init" phase:
+// write the config (plus the cgroups v1 adjustment of it), check CRI-O, run
+// `kubeadm init` (guarded by `test -f admin.conf`, so it is safe to retry) with the
+// cgroups v1 preflight argument, and set up the admin kubeconfig.
+func kubeadmInitSteps(kubeadmConfig, cgroupV1ConfigStep, cgroupV1PreflightArg string) []string {
+	return []string{
+		`sudo mkdir -p /var/lib/kubelet /etc/containers`,
+		fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF\n%s", kubeadmConfig, cgroupV1ConfigStep),
+		`sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
+  || { sudo systemctl restart crio && sleep 5 && \
+       sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
+       || { sudo journalctl -xeu crio.service --no-pager >&2; false; }; }`,
+		`test -f /etc/kubernetes/admin.conf || ( \
+sudo kubeadm init --config /tmp/kubeadm-config.yaml` + cgroupV1PreflightArg + `; RC=$?; \
+if [ $RC -ne 0 ]; then \
+  echo "=== crictl ps -a ===" >&2; \
+  sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a >&2 2>&1 || true; \
+  CIDS=$(sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a -q 2>/dev/null | head -6); \
+  for CID in $CIDS; do \
+    echo "=== container logs: $CID ===" >&2; \
+    sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock logs --tail=50 "$CID" >&2 2>&1 || true; \
+  done; \
+  echo "=== kubelet journal ===" >&2; \
+  sudo journalctl -xeu kubelet --no-pager -n 80 >&2 2>&1 || true; \
+fi; \
+exit $RC )`,
+		"mkdir -p $HOME/.kube",
+		"sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config",
+		"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
+	}
+}
+
+func normalizeKubeadmConfig(config string) string {
+	return strings.ReplaceAll(config, "\t", "  ")
+}
+
+// ValidateJoinCommand rejects a `kubeadm join ...` command containing anything
+// but plain arguments (no shell metacharacters), since it is embedded in shell
+// scripts run on the node.
+func ValidateJoinCommand(joinCmd string) error {
+	if !joinCmdSafeRE.MatchString(strings.TrimSpace(joinCmd)) {
+		return fmt.Errorf("join command is not a plain 'kubeadm join <endpoint> --token ... --discovery-token-ca-cert-hash ...' invocation")
+	}
+	return nil
+}
+
+// yamlString renders s as a YAML scalar (a JSON string is valid YAML).
+func yamlString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// cpPhase* constants name the control-plane provision phases.
+// They are used by the controller to resume from the last completed phase on retry.
+const (
+	CPPhaseCleanup         = 0
+	CPPhaseNFS             = 1
+	CPPhaseSysSettings     = 2
+	CPPhaseAPTRepos        = 3
+	CPPhaseCRIOInstall     = 4
+	CPPhaseCRIOStart       = 5
+	CPPhaseK8sInstall      = 6
+	CPPhaseKubeadmInit     = 7
+	CPPhasePostInit        = 8
+	CPPhaseCNI             = 9
+	CPPhaseAddons          = 10
+	CPPhaseArgoCDConfigure = 11
+	CPPhaseNFSProvisioner  = 12
+)
+
+// WorkerPhase* constants name the worker-node provision phases.
+const (
+	WorkerPhaseCleanup     = 0
+	WorkerPhaseSysSettings = 1
+	WorkerPhaseAPTRepos    = 2
+	WorkerPhaseCRIOInstall = 3
+	WorkerPhaseCRIOStart   = 4
+	WorkerPhaseK8sInstall  = 5
+	WorkerPhaseGPUCDI      = 6
+	WorkerPhaseCRIORestart = 7
+	WorkerPhaseJoin        = 8
+	// WorkerPhaseSharedStorage mounts the control plane's shared checkpoint NFS
+	// directory. It is the LAST phase so the numbering of the earlier ones (stored
+	// as progress on in-flight provisioning) is unchanged, and it never fails.
+	WorkerPhaseSharedStorage = 9
+)
+
+// crioCDIDropInSteps returns the steps that enable CDI in CRI-O (the NVIDIA
+// Container Toolkit's CDI mode). CRI-O only reads crio.conf.d at start, so
+// callers must run them before CRI-O starts or restart it afterwards.
+func crioCDIDropInSteps() []string {
+	return []string{
+		"sudo mkdir -p /etc/cdi /var/run/cdi /etc/crio/crio.conf.d",
+		`test -f /etc/crio/crio.conf.d/99-cdi.conf || \
+printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]\n' \
+  | sudo tee /etc/crio/crio.conf.d/99-cdi.conf > /dev/null`,
+	}
+}
+
+// insecureRegistriesConfStep returns a shell step that marks insecure (plain
+// HTTP / untrusted TLS) every registry in the effective list: the explicit
+// softwareConfig.insecureRegistries plus, for backward compatibility, the
+// registry host of every fully-qualified imagePrepulls image, via CRI-O
+// registries.conf.d drop-ins. This platform's self-hosted registries (e.g.
+// Harbor exposed through a NodePort on the node's own LAN IP) are reached over
+// plain HTTP, not TLS — without this, CRI-O defaults to HTTPS and every pull
+// fails with "server gave HTTP response to HTTPS client". Returns "" (add
+// nothing) when the effective list is empty, and an error when an explicit
+// entry is not a valid host[:port]. The merge and the drop-in rendering are
+// shared with the on-prem NodeProvision and the AWS/GCP bootstrap scripts
+// (pkgruntime.InsecureRegistryHosts / InsecureRegistriesStep).
+func insecureRegistriesConfStep(sw infrav1.SoftwareConfig) (string, error) {
+	images := make([]string, 0, len(sw.ImagePrepulls))
+	for _, ip := range sw.ImagePrepulls {
+		images = append(images, ip.Image)
+	}
+	hosts, err := pkgruntime.InsecureRegistryHosts(sw.InsecureRegistries, images)
+	if err != nil {
+		return "", err
+	}
+	return pkgruntime.InsecureRegistriesStep(hosts), nil
+}
+
+// joinWorkerSteps returns the shell steps that wait for the control-plane API
+// server to become reachable (over the VPN tunnel, if one is used), then run kubeadm join with
+// its own retry loop. kubeadm's own preflight check for the cluster-info
+// ConfigMap uses a short (~10s) internal timeout, which is too tight for a
+// worker whose WireGuard tunnel may not have finished its handshake/routing
+// yet — that transient race is what produces "couldn't validate the identity
+// of the API Server ... context deadline exceeded". Explicitly waiting for
+// the endpoint to answer first, then retrying the join itself a few times,
+// converges far faster than relying on an outer reconcile retry.
+func joinWorkerSteps(joinCmd string) []string { return joinWorkerStepsFor(joinCmd, "") }
+
+// joinWorkerStepsFor is joinWorkerSteps for a worker running Kubernetes version
+// (cleaned, e.g. "1.35.0"): on a cgroups v1 host with Kubernetes >= 1.35 the join
+// carries CgroupV1JoinSnippet's arguments. An empty version adds nothing.
+func joinWorkerStepsFor(joinCmd, version string) []string {
+	apiEndpoint := JoinEndpoint(joinCmd)
+
+	var steps []string
+	if apiEndpoint != "" {
+		steps = append(steps, fmt.Sprintf(`%[2]s
+if node_already_joined %[1]s; then
+  echo "Node is already joined to the cluster; skipping the API server wait"
+  exit 0
+fi
+echo "Waiting for control-plane API server %[1]s to become reachable..."
+for i in $(seq 1 60); do
+  curl -sk --connect-timeout 3 --max-time 5 "https://%[1]s/healthz" -o /dev/null && { echo "Control-plane API server reachable"; break; }
+  sleep 5
+done`, apiEndpoint, NodeAlreadyJoinedFunc))
+	}
+	steps = append(steps, fmt.Sprintf(`%[3]s
+# Resuming after an SSH drop or a controller restart must not wipe a node that
+# is already healthily joined: skip the join entirely.
+if node_already_joined %[2]s; then
+  echo "Node is already joined to the cluster (kubelet healthy, API server reachable); skipping kubeadm join"
+  exit 0
+fi
+%[4]s
+for attempt in 1 2 3 4 5; do
+  if sudo %[1]s $CGROUP_V1_JOIN_ARGS --cri-socket=unix:///var/run/crio/crio.sock; then
+    echo "kubeadm join succeeded"
+    break
+  fi
+  # kubeadm can report an error after the kubelet already registered; a healthy
+  # node must never be reset (that would evict it from the cluster).
+  if node_already_joined %[2]s; then
+    echo "kubeadm join reported an error but the node is healthily joined; not resetting"
+    break
+  fi
+  if [ "$attempt" = "5" ]; then
+    echo "ERROR: kubeadm join failed after 5 attempts" >&2
+    exit 1
+  fi
+  # A failed join can leave partial state (kubelet config, certs, manifests)
+  # that makes the next attempt fail preflight; reset before retrying (only
+  # reached when the node is NOT healthily joined).
+  sudo kubeadm reset --force --cri-socket=unix:///var/run/crio/crio.sock >/dev/null 2>&1 || true
+  sleep $((attempt * 15))
+done`, joinCmd, sshhelper.ShellQuote(apiEndpoint), NodeAlreadyJoinedFunc, CgroupV1JoinSnippet(version, "sudo")))
+	return steps
+}
+
+// JoinEndpoint returns the API server host:port of a `kubeadm join <endpoint>
+// ...` command, or "" when it is missing or not a plain host:port (it is then
+// never embedded in a script).
+func JoinEndpoint(joinCmd string) string {
+	fields := strings.Fields(joinCmd)
+	for i, f := range fields {
+		if f == "join" && i+1 < len(fields) {
+			if apiEndpointRE.MatchString(fields[i+1]) {
+				return fields[i+1]
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// NodeAlreadyJoinedFunc is a bash function definition, shared by the SSH and
+// cloud-init join flows:
+//
+//	node_already_joined [API_ENDPOINT]
+//
+// It succeeds only when the node is HEALTHILY joined: kubelet.conf exists (and,
+// when API_ENDPOINT is given, points at that API server, i.e. the cluster this
+// provisioning is for), kubelet is active and the API server answers /healthz
+// using kubelet's own credentials. Callers use it to skip a join and to avoid
+// `kubeadm reset` on a working node. CNLAB_KUBELET_CONF overrides the kubelet.conf
+// path (tests only).
+const NodeAlreadyJoinedFunc = `node_already_joined() {
+  local kc="${CNLAB_KUBELET_CONF:-/etc/kubernetes/kubelet.conf}" s=""
+  [ "$(id -u)" = 0 ] || s=sudo
+  [ -f "$kc" ] || return 1
+  if [ -n "${1:-}" ]; then
+    $s grep -qF -- "server: https://$1" "$kc" 2>/dev/null || return 1
+  fi
+  systemctl is-active --quiet kubelet 2>/dev/null || return 1
+  $s timeout 20 kubectl --kubeconfig "$kc" --request-timeout=10s get --raw /healthz >/dev/null 2>&1
+}`
+
+// nodeHealthilyJoined reports whether the remote node is healthily joined to
+// the cluster that joinCmd targets (see NodeAlreadyJoinedFunc). Only a genuine
+// non-zero exit of the probe means "not joined"; a transport error is returned
+// so the caller never mistakes an unreachable node for one that is safe to reset.
+func nodeHealthilyJoined(client *sshhelper.Client, joinCmd string) (bool, error) {
+	probe := NodeAlreadyJoinedFunc + "\nnode_already_joined " + sshhelper.ShellQuote(JoinEndpoint(joinCmd))
+	_, err := sshhelper.Run(client, probe)
+	if err == nil {
+		return true, nil
+	}
+	var exit *cryptossh.ExitError
+	if errors.As(err, &exit) {
+		return false, nil
+	}
+	return false, err
+}
+
+// flannelNodeIPEnv is the env var the VPN-less flannel patch injects (from the
+// pod's status.hostIP, i.e. the kubelet --node-ip) and references in --iface.
+const flannelNodeIPEnv = "FLANNEL_NODE_IP"
+
+// flannelIfaceStep returns the shell snippet that pins flannel to the
+// interface carrying the node's cluster address.
+//
+//   - VPN in use: the fixed WireGuard interface, --iface=wg0.
+//   - No VPN: there is no wg0, and flannel's default-route detection picks the
+//     wrong interface on a multi-homed host (the VXLAN endpoint would then not
+//     be the kubelet node IP). The DaemonSet args are cluster-wide, so instead
+//     of a name the pin is the node's own address: flannel accepts an IP for
+//     --iface, and the kubelet resolves $(FLANNEL_NODE_IP) per pod from the
+//     downward API (status.hostIP of a hostNetwork pod is the node IP).
+//
+// Both variants are idempotent and set CHANGED=1 only when they changed the
+// DaemonSet.
+func flannelIfaceStep(disableVPN bool) string {
+	if disableVPN {
+		return `if ! grep -qw -- '` + flannelNodeIPEnv + `' <<<"$(kubectl -n kube-flannel get daemonset kube-flannel-ds -o jsonpath='{.spec.template.spec.containers[0].env[*].name}')"; then
+  kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"` + flannelNodeIPEnv + `","valueFrom":{"fieldRef":{"fieldPath":"status.hostIP"}}}}]'
+  CHANGED=1
+fi
+grep -qF -- '--iface=$(` + flannelNodeIPEnv + `)' <<<"$(kubectl -n kube-flannel get daemonset kube-flannel-ds -o jsonpath='{.spec.template.spec.containers[0].args}')" || {
+  kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface=$(` + flannelNodeIPEnv + `)"}]'
+  CHANGED=1
+}
+`
+	}
+	// grep reads a here-string rather than a pipe: steps run under pipefail and
+	// `grep -q` exiting early would otherwise SIGPIPE the producer.
+	return `grep -q -- '--iface=wg0' <<<"$(kubectl -n kube-flannel get daemonset kube-flannel-ds -o jsonpath='{.spec.template.spec.containers[0].args}')" || {
+  kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface=wg0"}]'
+  CHANGED=1
+}
+`
+}
+
+func InitializeControlPlane(client *sshhelper.Client, cluster *infrav1.RemoteCluster, startPhase int, onPhaseComplete func(int), runtimeCfg pkgruntime.Config) (string, error) {
+	log.Printf("Provisioning Kubernetes cluster with kubeadm on %s", cluster.Spec.Host)
+
+	nodeIP, err := ResolveNodeIP(client, cluster)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve control plane node IP: %w", err)
+	}
+	log.Printf("Control plane node IP: %s (VPN disabled: %t)", nodeIP, cluster.Spec.DisableVPN)
+
+	clean, repoVersion, err := ParseKubernetesVersion(cluster.Spec.NodeInfo.SoftwareConfig.KubernetesVersion)
+	if err != nil {
+		return "", err
+	}
+	cgroupV1ConfigStep, cgroupV1PreflightArg := cgroupV1CompatibilitySettings(clean)
+
+	kubeadmConfig := kubeadmInitConfig(nodeIP, clean, cluster.Spec.ClusterName)
 
 	// Mirrors the worker-join labeling logic below (see labelAndTaintCmd) so a
 	// single-node ("one box") cluster — where the control-plane node is also
 	// the only compute node — gets the same gpu=on label and PreferNoSchedule
 	// taint a GPU worker would, instead of only the bare hardware-type label.
+	// The control-plane node always accepts CPU workloads (its control-plane
+	// taint is removed in Phase 8). When it is also a GPU node, label it gpu=on
+	// but do NOT apply the hardware-type=gpu:PreferNoSchedule taint — that taint
+	// is reserved for pure worker GPU nodes so that CPU pods have somewhere to
+	// schedule when all workers are GPU. The cpu label is always added so that
+	// workloads with a cpu node-selector can land here.
+	//
+	// Also stamps infra.dcn.ssu.ac.kr/worker=true and
+	// infra.dcn.ssu.ac.kr/hardware-type=gpu|cpu — the exact labels
+	// deployPrepullDaemonSets' nodeSelectors require (see
+	// remotecluster_controller.go). Those are normally set by labelWorkerNode
+	// after a separate worker joins, but the control-plane never goes through
+	// that path — without this, a single-node ("one box") control-plane never
+	// matches either prepull DaemonSet's nodeSelector and silently never gets
+	// its images pre-pulled, GPU or not.
+	nsHardwareType := "cpu"
 	var postInitLabelCmd string
 	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+		nsHardwareType = "gpu"
 		postInitLabelCmd = fmt.Sprintf(
-			"kubectl label nodes --all hardware-type=%s gpu=on ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite && kubectl taint nodes --all hardware-type=gpu:PreferNoSchedule --overwrite",
-			cluster.Spec.NodeInfo.HardwareType,
+			"kubectl label nodes --all %s hardware-type=cpu gpu=on %s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite",
+			sshhelper.ShellQuote("hardware-type="+cluster.Spec.NodeInfo.HardwareType),
+			sshhelper.ShellQuote("infra.dcn.ssu.ac.kr/hardware-type="+nsHardwareType),
 		)
 	} else {
 		postInitLabelCmd = fmt.Sprintf(
-			"kubectl label nodes --all hardware-type=%s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite",
-			cluster.Spec.NodeInfo.HardwareType,
+			"kubectl label nodes --all %s %s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite",
+			sshhelper.ShellQuote("hardware-type="+cluster.Spec.NodeInfo.HardwareType),
+			sshhelper.ShellQuote("infra.dcn.ssu.ac.kr/hardware-type="+nsHardwareType),
 		)
 	}
+	postInitLabelCmd += " && kubectl label nodes --all infra.dcn.ssu.ac.kr/worker=true --overwrite"
 
 	crioInstallSteps := pkgruntime.InstallSteps(runtimeCfg)
-	if s := insecureRegistriesConfStep(cluster.Spec.NodeInfo.SoftwareConfig.ImagePrepulls); s != "" {
+	if s, err := insecureRegistriesConfStep(cluster.Spec.NodeInfo.SoftwareConfig); err != nil {
+		return "", fmt.Errorf("spec.nodeInfo.softwareConfig.%w", err)
+	} else if s != "" {
 		crioInstallSteps = append(crioInstallSteps, s)
+	}
+	// A GPU control-plane gets the same CRI-O CDI config a GPU worker does. It
+	// is written during the CRI-O Install phase, i.e. before the CRI-O Start
+	// phase's first start, so no restart is needed under a running control
+	// plane and no phase is added (phase indices must stay stable for resume).
+	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
+		crioInstallSteps = append(crioInstallSteps, crioCDIDropInSteps()...)
 	}
 
 	phases := []ProvisionPhase{
@@ -338,6 +664,10 @@ grep -qxF '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' /etc/exports
   echo '/srv/nfs/k8s *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
 sudo exportfs -ra`,
 
+			// The shared checkpoint directory every worker mounts (it lives under the
+			// /srv/nfs/k8s export above, so it needs no export line of its own).
+			checkpointExportStep(),
+
 			// Second, separate export for Enterprise Gateway's kernelspecs (see
 			// EGKernelspecsExportPath). Kept as its own always-run, self-idempotent
 			// step so a resumed/retried run still adds this export rather than
@@ -390,6 +720,9 @@ fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 		{Name: "APT Repos", Steps: []string{
 			"sudo apt-get update",
 			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates software-properties-common curl gnupg apt-transport-https",
+			// Longhorn node prerequisites: open-iscsi + iscsid, NFS client, cryptsetup, dmsetup.
+			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y " + LonghornPackagesArg(),
+			"sudo systemctl enable --now iscsid",
 			"sudo install -m 0755 -d /etc/apt/keyrings",
 			"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
 			fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
@@ -432,7 +765,7 @@ fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 			"sudo apt-mark hold kubelet kubeadm kubectl",
 			"sudo systemctl enable kubelet",
 			"sudo systemctl stop kubelet 2>/dev/null || true",
-			fmt.Sprintf(`printf 'KUBELET_EXTRA_ARGS=--node-ip=%s\n' | sudo tee /etc/default/kubelet > /dev/null`, tunIP),
+			fmt.Sprintf(`printf 'KUBELET_EXTRA_ARGS=--node-ip=%s\n' | sudo tee /etc/default/kubelet > /dev/null`, nodeIP),
 			`sudo mkdir -p /etc/systemd/system/kubelet.service.d && \
 printf '[Unit]\nAfter=crio.service\nRequires=crio.service\n' \
   | sudo tee /etc/systemd/system/kubelet.service.d/10-crio.conf > /dev/null`,
@@ -441,31 +774,7 @@ printf '[Unit]\nAfter=crio.service\nRequires=crio.service\n' \
 
 		// ── Phase 7: kubeadm init ─────────────────────────────────────────────────────
 		// kubeadm init is guarded by `test -f admin.conf` so it is safe to retry.
-		{Name: "kubeadm Init", Steps: []string{
-			`sudo mkdir -p /var/lib/kubelet /etc/containers`,
-			fmt.Sprintf("cat <<'EOF' | sudo tee /tmp/kubeadm-config.yaml\n%s\nEOF", kubeadmConfig),
-			`sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
-  || { sudo systemctl restart crio && sleep 5 && \
-       sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock info \
-       || { sudo journalctl -xeu crio.service --no-pager >&2; false; }; }`,
-			`test -f /etc/kubernetes/admin.conf || ( \
-sudo kubeadm init --config /tmp/kubeadm-config.yaml; RC=$?; \
-if [ $RC -ne 0 ]; then \
-  echo "=== crictl ps -a ===" >&2; \
-  sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a >&2 2>&1 || true; \
-  CIDS=$(sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock ps -a -q 2>/dev/null | head -6); \
-  for CID in $CIDS; do \
-    echo "=== container logs: $CID ===" >&2; \
-    sudo crictl --runtime-endpoint unix:///var/run/crio/crio.sock logs --tail=50 "$CID" >&2 2>&1 || true; \
-  done; \
-  echo "=== kubelet journal ===" >&2; \
-  sudo journalctl -xeu kubelet --no-pager -n 80 >&2 2>&1 || true; \
-fi; \
-exit $RC )`,
-			"mkdir -p $HOME/.kube",
-			"sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config",
-			"sudo chown $(id -u):$(id -g) $HOME/.kube/config",
-		}},
+		{Name: "kubeadm Init", Steps: kubeadmInitSteps(kubeadmConfig, cgroupV1ConfigStep, cgroupV1PreflightArg)},
 
 		// ── Phase 8: Post-init ───────────────────────────────────────────────────────
 		{Name: "Post-Init", Steps: []string{
@@ -491,26 +800,14 @@ exit $RC )`,
 			// though the conflist file is present on disk. Install the standard
 			// CNI plugins bundle so portmap (and friends) exist before flannel
 			// comes up. Idempotent: skipped once portmap is already present.
-			`if [ ! -x /opt/cni/bin/portmap ]; then
-  ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-  CNI_PLUGINS_VERSION=v1.5.1
-  curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${ARCH}-${CNI_PLUGINS_VERSION}.tgz" -o /tmp/cni-plugins.tgz
-  sudo mkdir -p /opt/cni/bin
-  sudo tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin
-  rm -f /tmp/cni-plugins.tgz
-fi`,
+			pkgruntime.CNIPluginsInstallScript(),
 			"kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml",
 			// `kubectl apply` above resets the DaemonSet's args to the upstream
 			// manifest (which has no --iface=wg0) on every run, so this check
 			// will legitimately re-fire once per retry until the CNI phase
 			// finally completes — but only bounces the daemonset when the flag
 			// is genuinely missing, not unconditionally.
-			`CHANGED=0
-kubectl -n kube-flannel get daemonset kube-flannel-ds -o jsonpath='{.spec.template.spec.containers[0].args}' | grep -q -- '--iface=wg0' || {
-  kubectl -n kube-flannel patch daemonset kube-flannel-ds --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface=wg0"}]'
-  CHANGED=1
-}
-# Flannel's VXLAN backend defaults to UDP port 8472, which collides with
+			"CHANGED=0\n" + flannelIfaceStep(cluster.Spec.DisableVPN) + `# Flannel's VXLAN backend defaults to UDP port 8472, which collides with
 # other VXLAN users already on the host network namespace (e.g.
 # Cilium-managed LXD/Incus containers on bare-metal nodes bind
 # 0.0.0.0:8472 for cilium_vxlan), causing "failed to set interface
@@ -519,8 +816,9 @@ kubectl -n kube-flannel get daemonset kube-flannel-ds -o jsonpath='{.spec.templa
 # pre-existing one. Network below matches the podSubnet configured in
 # kubeadmConfig above. Only rewritten (and the daemonset only bounced) if
 # not already configured, so a healthy flannel pod is left alone on retry.
-kubectl -n kube-flannel get configmap kube-flannel-cfg -o jsonpath='{.data.net-conf\.json}' | grep -q '"Port": 8473' || {
-  cat <<'EOF' > /tmp/net-conf.json
+grep -q '"Port": 8473' <<<"$(kubectl -n kube-flannel get configmap kube-flannel-cfg -o jsonpath='{.data.net-conf\.json}')" || {
+  FLANNEL_NETCONF=$(mktemp)
+  cat <<'EOF' > "$FLANNEL_NETCONF"
 {
   "Network": "10.244.0.0/16",
   "Backend": {
@@ -530,8 +828,9 @@ kubectl -n kube-flannel get configmap kube-flannel-cfg -o jsonpath='{.data.net-c
 }
 EOF
   kubectl -n kube-flannel create configmap kube-flannel-cfg \
-    --from-file=net-conf.json=/tmp/net-conf.json \
+    --from-file=net-conf.json="$FLANNEL_NETCONF" \
     --dry-run=client -o json | kubectl -n kube-flannel patch configmap kube-flannel-cfg --type merge --patch-file=/dev/stdin
+  rm -f "$FLANNEL_NETCONF"
   CHANGED=1
 }
 if [ "$CHANGED" = "1" ]; then
@@ -578,7 +877,7 @@ EOF`,
 		}},
 	}
 
-	if err := runPhases(client, phases, startPhase, onPhaseComplete); err != nil {
+	if err := runPhases(client, phases, startPhase, onPhaseComplete, runtimeCfg.Token, runtimeCfg.Username); err != nil {
 		return "", err
 	}
 
@@ -594,7 +893,7 @@ EOF`,
 
 	// ── Phase 12: NFS provisioner ─────────────────────────────────────────────────
 	if startPhase <= CPPhaseNFSProvisioner {
-		if err := installNFSProvisioner(client, tunIP); err != nil {
+		if err := installNFSProvisioner(client, nodeIP); err != nil {
 			return "", fmt.Errorf("NFS provisioner installation failed: %w", err)
 		}
 		if onPhaseComplete != nil {
@@ -620,14 +919,14 @@ EOF`,
 //   - nfs.path          → /srv/nfs/k8s
 //   - storageClass.defaultClass → true  (replaces false, or inserts if absent)
 func installNFSProvisioner(client *sshhelper.Client, nfsServerIP string) error {
-	log.Printf("Installing NFS provisioner (server: %s)", nfsServerIP)
+	log.Printf("Installing longhorn provisioner (server: %s)", nfsServerIP)
 
-	nfsDir := "/tmp/catalog/workloads/ml-platform/nfs-provisioner"
+	nfsDir := "/tmp/catalog/workloads/ml-platform/longhorn"
 
 	steps := []string{
 		// HelmRelease resources target the storage namespace.
 		"kubectl create namespace storage 2>/dev/null || true",
-		"sudo mkdir -p /srv/nfs/k8s 2>/dev/null || true",
+		// "sudo mkdir -p /srv/nfs/k8s 2>/dev/null || true",
 
 		// Patch every YAML file in the provisioner directory in-place.
 		//
@@ -637,26 +936,26 @@ func installNFSProvisioner(client *sshhelper.Client, nfsServerIP string) error {
 		//       sed receives single \  (used as sed command prefix, e.g. a\ or \| address)
 		//   \\n in raw string = \\ + n
 		//       shell collapses \\ → \, n stays → sed receives \n (newline in append text)
-		fmt.Sprintf(`for f in %s/*.yaml %s/*.yml; do \
-  [ -f "$f" ] || continue; \
-  sed -i "s/server: .*/server: %s/" "$f"; \
-  sed -i "s|path: .*|path: /srv/nfs/k8s|" "$f"; \
-  sed -i "s/defaultClass: false/defaultClass: true/" "$f"; \
-  grep -q "defaultClass" "$f" || \
-    sed -i "\|path: /srv/nfs/k8s|a\\    storageClass:\\n      defaultClass: true" "$f"; \
-done`, nfsDir, nfsDir, nfsServerIP),
+		// 		fmt.Sprintf(`for f in %s/*.yaml %s/*.yml; do \
+		//   [ -f "$f" ] || continue; \
+		//   sed -i "s/server: .*/server: %s/" "$f"; \
+		//   sed -i "s|path: .*|path: /srv/nfs/k8s|" "$f"; \
+		//   sed -i "s/defaultClass: false/defaultClass: true/" "$f"; \
+		//   grep -q "defaultClass" "$f" || \
+		//     sed -i "\|path: /srv/nfs/k8s|a\\    storageClass:\\n      defaultClass: true" "$f"; \
+		// done`, nfsDir, nfsDir, nfsServerIP),
 
 		fmt.Sprintf("kubectl apply -f %s/", nfsDir),
 	}
 
-	for _, cmd := range steps {
-		output, err := sshhelper.Run(client, cmd)
+	for i, cmd := range steps {
+		output, err := runStep(client, cmd)
 		if err != nil {
-			return fmt.Errorf("nfs provisioner install failed: %s\nOutput:\n%s", cmd, output)
+			return sshhelper.StepError(fmt.Sprintf("longhorn provisioner install step %d/%d", i+1, len(steps)), err, output)
 		}
 	}
 
-	log.Printf("NFS provisioner installed successfully")
+	log.Printf("Longhorn provisioner installed successfully")
 	return nil
 }
 
@@ -667,15 +966,44 @@ func getJoinCommand(client *sshhelper.Client) (string, error) {
 	// silently redirects kubeadm at a different API server entirely, which
 	// surfaces as a confusing TLS SAN mismatch against the *correct*
 	// cluster's certificate rather than a connection failure.
-	output, err := sshhelper.Run(client, "sudo kubeadm token create --print-join-command --ttl 24h --kubeconfig=/etc/kubernetes/admin.conf")
+	//
+	// Only stdout is parsed: stderr routinely carries noise such as
+	// "sudo: unable to resolve host <name>" that would otherwise be glued onto
+	// the join command and rejected by ValidateJoinCommand.
+	output, err := sshhelper.RunStdout(client, "sudo kubeadm token create --print-join-command --ttl 24h --kubeconfig=/etc/kubernetes/admin.conf")
 	if err != nil {
-		return "", fmt.Errorf("kubeadm token create failed: %w\nOutput: %s", err, output)
+		// The output of a failing `token create` never contains a token, but scrub anyway.
+		return "", sshhelper.StepError("kubeadm token create", err, output)
 	}
-	joinCmd := strings.TrimSpace(output)
-	if joinCmd == "" {
+	return extractJoinCommand(output)
+}
+
+// extractJoinCommand picks the `kubeadm join ...` line out of the stdout of
+// `kubeadm token create --print-join-command` (the last such line; a lone
+// unprefixed line is returned as is so the caller's validation reports it).
+func extractJoinCommand(stdout string) (string, error) {
+	var last, only string
+	n := 0
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		n++
+		only = line
+		if strings.HasPrefix(line, "kubeadm join ") {
+			last = line
+		}
+	}
+	switch {
+	case last != "":
+		return last, nil
+	case n == 0:
 		return "", fmt.Errorf("kubeadm returned an empty join command")
+	case n == 1:
+		return only, nil
 	}
-	return joinCmd, nil
+	return "", fmt.Errorf("kubeadm output contains no 'kubeadm join' line")
 }
 
 func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluster *infrav1.RemoteCluster, joinCmd string, clusterParent *infrav1.RemoteCluster, startPhase int, onPhaseComplete func(int), runtimeCfg pkgruntime.Config) (error, string) {
@@ -684,37 +1012,35 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 	if joinCmd == "" {
 		return fmt.Errorf("joinCmd must not be empty"), ""
 	}
+	if err := ValidateJoinCommand(joinCmd); err != nil {
+		return err, ""
+	}
 	if clusterParent.Spec.NodeInfo.HardwareType == "" {
 		return fmt.Errorf("clusterParent.Spec.NodeInfo.HardwareType must not be empty"), ""
 	}
 
-	nodeIP, err := GetTunIP(client)
+	nodeIP, err := ResolveNodeIP(client, cluster)
 	if err != nil {
-		return fmt.Errorf("failed to get worker wg0 IP: %w", err), ""
+		return fmt.Errorf("failed to resolve worker node IP: %w", err), ""
 	}
-	log.Printf("Worker VPN IP: %s", nodeIP)
+	log.Printf("Worker node IP: %s (VPN disabled: %t)", nodeIP, cluster.Spec.DisableVPN)
 
-	clean := strings.TrimPrefix(clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion, "v")
-	parts := strings.Split(clean, ".")
-	if len(parts) < 2 {
-		return fmt.Errorf("invalid kubernetes version: %s", clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion), ""
+	clean, repoVersion, err := ParseKubernetesVersion(clusterParent.Spec.NodeInfo.SoftwareConfig.KubernetesVersion)
+	if err != nil {
+		return err, ""
 	}
-	repoVersion := fmt.Sprintf("%s.%s", parts[0], parts[1])
 
 	// GPU CDI steps are non-empty only for GPU nodes; the phase always exists so
 	// phase indices remain stable across node types.
 	var gpuCDISteps []string
 	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
-		gpuCDISteps = []string{
-			"sudo mkdir -p /etc/cdi /var/run/cdi /etc/crio/crio.conf.d",
-			`test -f /etc/crio/crio.conf.d/99-cdi.conf || \
-printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]\n' \
-  | sudo tee /etc/crio/crio.conf.d/99-cdi.conf > /dev/null`,
-		}
+		gpuCDISteps = crioCDIDropInSteps()
 	}
 
 	crioInstallSteps := pkgruntime.InstallSteps(runtimeCfg)
-	if s := insecureRegistriesConfStep(clusterParent.Spec.NodeInfo.SoftwareConfig.ImagePrepulls); s != "" {
+	if s, err := insecureRegistriesConfStep(clusterParent.Spec.NodeInfo.SoftwareConfig); err != nil {
+		return fmt.Errorf("spec.nodeInfo.softwareConfig.%w", err), ""
+	} else if s != "" {
 		crioInstallSteps = append(crioInstallSteps, s)
 	}
 
@@ -757,8 +1083,10 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 		{Name: "APT Repos", Steps: []string{
 			"sudo apt-get update",
 			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg apt-transport-https",
-			// nfs-common: kernel NFS client + mount.nfs so the node can mount NFS volumes.
-			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common",
+			// Longhorn node prerequisites: open-iscsi + iscsid, NFS client (nfs-common:
+			// mount.nfs for NFS volumes), cryptsetup, dmsetup.
+			"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y " + LonghornPackagesArg(),
+			"sudo systemctl enable --now iscsid",
 			"sudo install -m 0755 -d /etc/apt/keyrings",
 			"sudo rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg",
 			fmt.Sprintf(`curl -fsSL https://pkgs.k8s.io/core:/stable:/v%s/deb/Release.key | gpg --dearmor | sudo tee /etc/apt/keyrings/kubernetes-apt-keyring.gpg > /dev/null`, repoVersion),
@@ -820,31 +1148,45 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 			// reports NetworkPluginNotReady forever. Install the standard CNI
 			// plugins bundle here so portmap is already present before the
 			// flannel pod lands. Idempotent: skipped once portmap is present.
-			`if [ ! -x /opt/cni/bin/portmap ]; then
-  ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-  CNI_PLUGINS_VERSION=v1.5.1
-  curl -fsSL "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${ARCH}-${CNI_PLUGINS_VERSION}.tgz" -o /tmp/cni-plugins.tgz
-  sudo mkdir -p /opt/cni/bin
-  sudo tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin
-  rm -f /tmp/cni-plugins.tgz
-fi`,
-		}, joinWorkerSteps(joinCmd)...)},
+			pkgruntime.CNIPluginsInstallScript(),
+		}, joinWorkerStepsFor(joinCmd, clean)...)},
+	}
+	phases = append(phases, sharedStoragePhases(joinCmd)...)
+
+	// A provisioning run that restarts from an early phase (the phase-progress
+	// annotation was lost, or the controller restarted right after a successful
+	// join) must not run the Cleanup phase's `kubeadm reset` on a worker that is
+	// already healthily joined to THIS cluster: that would wipe a working node.
+	// Such a node needs nothing but the final node-name resolution below.
+	if startPhase < WorkerPhaseJoin {
+		joined, jerr := nodeHealthilyJoined(client, joinCmd)
+		if jerr != nil {
+			return fmt.Errorf("checking whether the node is already joined: %w", jerr), ""
+		}
+		if joined {
+			log.Printf("Worker node %s is already healthily joined to %s: skipping provisioning phases %d-%d",
+				cluster.Spec.Host, cluster.Spec.ClusterName, startPhase, WorkerPhaseJoin)
+			startPhase = WorkerPhaseJoin + 1
+			if onPhaseComplete != nil {
+				onPhaseComplete(WorkerPhaseJoin)
+			}
+		}
 	}
 
-	if err := runPhases(client, phases, startPhase, onPhaseComplete); err != nil {
+	if err := runPhases(client, phases, startPhase, onPhaseComplete, runtimeCfg.Token, runtimeCfg.Username); err != nil {
 		return err, ""
 	}
 
-	// Resolve the node name by matching the worker's VPN IP in the node address table.
+	// Resolve the node name by matching the worker's node IP in the node address table.
 	// kubelet takes a few seconds to register after kubeadm join; retry for up to 90 s.
 	var rawNodeOutput string
 	nodeName := ""
 	for attempt := 0; attempt < 45; attempt++ {
 		var queryErr error
-		rawNodeOutput, queryErr = sshhelper.Run(cpClient,
+		rawNodeOutput, queryErr = sshhelper.RunStdout(cpClient,
 			`kubectl get nodes -o json | jq -r '.items[] | .metadata.name as $n | .status.addresses[].address | [$n, .] | @tsv'`)
 		if queryErr != nil {
-			return fmt.Errorf("failed to list nodes: %w\nOutput:\n%s", queryErr, rawNodeOutput), ""
+			return sshhelper.StepError("listing nodes on the control plane", queryErr, rawNodeOutput), ""
 		}
 		for _, line := range strings.Split(strings.TrimSpace(rawNodeOutput), "\n") {
 			fields := strings.Fields(line)
@@ -860,37 +1202,99 @@ fi`,
 		time.Sleep(2 * time.Second)
 	}
 	if nodeName == "" {
-		return fmt.Errorf("failed to resolve node name for host %s vpn ip: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput), ""
+		return fmt.Errorf("failed to resolve node name for host %s node IP: %s — address table:\n%s", cluster.Spec.Host, nodeIP, rawNodeOutput), ""
 	}
 
 	var labelAndTaintCmd string
 	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 		labelAndTaintCmd = fmt.Sprintf(
-			"kubectl label node %s hardware-type=%s gpu=on ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite && kubectl taint node %s hardware-type=gpu:PreferNoSchedule --overwrite",
-			nodeName, cluster.Spec.NodeInfo.HardwareType, nodeName,
+			"kubectl label node %s %s gpu=on ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite && kubectl taint node %s hardware-type=gpu:PreferNoSchedule --overwrite",
+			sshhelper.ShellQuote(nodeName), sshhelper.ShellQuote("hardware-type="+cluster.Spec.NodeInfo.HardwareType), sshhelper.ShellQuote(nodeName),
 		)
 	} else {
 		labelAndTaintCmd = fmt.Sprintf(
-			"kubectl label node %s hardware-type=%s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite",
-			nodeName, cluster.Spec.NodeInfo.HardwareType,
+			"kubectl label node %s %s ml.dcn.ssu.ac.kr/provider=OnPrem --overwrite",
+			sshhelper.ShellQuote(nodeName), sshhelper.ShellQuote("hardware-type="+cluster.Spec.NodeInfo.HardwareType),
 		)
 	}
 	if output, err := sshhelper.Run(cpClient, labelAndTaintCmd); err != nil {
-		return fmt.Errorf("failed to label/taint worker node %s: %w\nOutput:\n%s", nodeName, err, output), ""
+		return sshhelper.StepError(fmt.Sprintf("labelling/tainting worker node %s", nodeName), err, output), ""
 	}
 
 	log.Printf("Worker node %s successfully joined cluster %s", cluster.Spec.Host, cluster.Spec.ClusterName)
 	return nil, nodeIP
 }
 
+// ResolveNodeIP returns the IP the node should register with Kubernetes: the
+// wg0 address when a VPN is in use, otherwise the primary local IPv4 address.
+func ResolveNodeIP(client *sshhelper.Client, cluster *infrav1.RemoteCluster) (string, error) {
+	if !cluster.Spec.DisableVPN {
+		return GetTunIP(client)
+	}
+	ip, err := GetPrimaryIP(client)
+	if err != nil {
+		return "", err
+	}
+	if err := VerifyLocalIP(client, ip); err != nil {
+		return "", err
+	}
+	return ip, nil
+}
+
+// VerifyLocalIP checks that ip is assigned to a network interface on the
+// remote host. kubelet refuses to start with a --node-ip that is not, which
+// is what happens with a public IP that the provider 1:1-NATs to the host, so
+// failing here gives an actionable message instead of a later join timeout.
+func VerifyLocalIP(client *sshhelper.Client, ip string) error {
+	cmd := fmt.Sprintf(`ip -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -qxF %q`, ip)
+	if out, err := sshhelper.Run(client, cmd); err != nil {
+		return sshhelper.StepError(fmt.Sprintf("checking that %s is bound to a local interface (NATed public IPs are not supported when the VPN is disabled)", ip), err, out)
+	}
+	return nil
+}
+
+// GetPrimaryIP returns the primary IPv4 address used for outbound traffic
+// on the remote host.
+func GetPrimaryIP(client *sshhelper.Client) (string, error) {
+	output, err := sshhelper.RunStdout(client, `ip -4 route get 1.1.1.1`)
+	if err != nil {
+		return "", sshhelper.StepError("reading the primary host IP", err, output)
+	}
+	return parsePrimaryIP(output)
+}
+
+func parsePrimaryIP(output string) (string, error) {
+	// Example output:
+	// 1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.100 uid 1000
+	fields := strings.Fields(strings.TrimSpace(output))
+	var ip string
+
+	for i := 0; i < len(fields)-1; i++ {
+		if fields[i] == "src" {
+			ip = fields[i+1]
+			break
+		}
+	}
+
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil || parsedIP.To4() == nil {
+		return "", fmt.Errorf("could not determine the primary IPv4 address from the routing table")
+	}
+
+	return ip, nil
+}
+
 // GetTunIP returns the IPv4 address of the wg0 interface on the remote host.
 func GetTunIP(client *sshhelper.Client) (string, error) {
-	output, err := sshhelper.Run(client, `ip -4 addr show wg0 | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'`)
+	output, err := sshhelper.RunStdout(client, `ip -4 addr show wg0 | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+'`)
 	if err != nil {
-		return "", fmt.Errorf("ip addr show wg0 failed: %w\nOutput: %s", err, output)
+		return "", sshhelper.StepError("reading the wg0 address", err, output)
 	}
-	ip := strings.TrimSpace(output)
-	if ip == "" {
+	// First line only: a host with several addresses on wg0 must not yield a
+	// multi-line "IP".
+	ip, _, _ := strings.Cut(strings.TrimSpace(output), "\n")
+	ip = strings.TrimSpace(ip)
+	if net.ParseIP(ip) == nil {
 		return "", fmt.Errorf("wg0 has no IPv4 address — is the VPN connected?")
 	}
 	return ip, nil
@@ -941,10 +1345,10 @@ sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
 		"sudo nvidia-ctk --version",
 	}
 
-	for _, cmd := range steps {
-		output, err := sshhelper.Run(client, cmd)
+	for i, cmd := range steps {
+		output, err := runStep(client, cmd)
 		if err != nil {
-			return fmt.Errorf("nvidia toolkit install failed: %s\nOutput:\n%s", cmd, output)
+			return sshhelper.StepError(fmt.Sprintf("nvidia toolkit install step %d/%d", i+1, len(steps)), err, output)
 		}
 	}
 
@@ -1034,10 +1438,10 @@ func GenerateCDI(client *sshhelper.Client) error {
 		"sudo mkdir -p /etc/cdi",
 		"sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
 	}
-	for _, cmd := range steps {
-		output, err := sshhelper.Run(client, cmd)
+	for i, cmd := range steps {
+		output, err := runStep(client, cmd)
 		if err != nil {
-			return fmt.Errorf("cdi generate failed: %s\nOutput:\n%s", cmd, output)
+			return sshhelper.StepError(fmt.Sprintf("cdi generate step %d/%d", i+1, len(steps)), err, output)
 		}
 	}
 	return nil

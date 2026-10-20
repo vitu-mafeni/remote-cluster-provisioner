@@ -16,7 +16,7 @@ spec:
 
   # Target node SSH information
   host: "192.168.3.234"
-  port: 22
+  port: "22"
   user: "ubuntu"
 
   # Node information
@@ -28,16 +28,14 @@ spec:
     hardwareType: "cpu"
 
     softwareConfig:
-      # GPU-related fields are optional.
-      # Only required when hardwareType=gpu
-
-      # nvidiaDriverVersion: "580" #nvidia driver version for gpu node, e.g. 535.104.05
-      # nvidiaContainerToolkitVersion: "1.19.0-1" #nvidia container toolkit version for gpu node
-      # k8sDevicePluginVersion: "v0.17.1"
+      # NVIDIA driver / container toolkit / device plugin are not configured
+      # here; the GPU Operator owns the NVIDIA software stack.
       kubernetesVersion: "v1.35.0"
       imagePrepulls:
-        - "docker.io/vitu1/kernel-pytorch-gpu:3.2.3-cu121"
-        - "docker.io/vitu1/kernel-tf-gpu:3.2.3-cu121"
+        - image: "docker.io/vitu1/kernel-pytorch-gpu:3.2.3-cu121"
+          nodeTarget: gpu
+        - image: "docker.io/vitu1/kernel-tf-gpu:3.2.3-cu121"
+          nodeTarget: gpu
       imagePullSecretRef:
         name: dockerhub-creds
 
@@ -106,7 +104,7 @@ type: Opaque
 stringData:
   id_rsa: |
     -----BEGIN RSA PRIVATE KEY-----
-CHANGE ME
+    CHANGE ME
     -----END RSA PRIVATE KEY-----
 ---
 # Secret

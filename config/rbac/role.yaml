@@ -21,6 +21,7 @@ rules:
   - secrets
   verbs:
   - create
+  - delete
   - get
   - list
   - patch
@@ -37,14 +38,18 @@ rules:
   - list
   - watch
 - apiGroups:
-  - infra.nephio.org
+  - config.porch.kpt.dev
   resources:
-  - tokens
+  - packagevariants
+  - repositories
   verbs:
   - create
   - delete
   - get
   - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - infra.dcn.ssu.ac.kr
   resources:
@@ -71,6 +76,19 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - infra.nephio.org
+  resources:
+  - repositories
+  - tokens
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - ml.dcn.ssu.ac.kr
   resources:

@@ -1,0 +1,233 @@
+# ============================================================================
+# RemoteCluster — cluster WITH a WireGuard VPN (the default mode)
+#
+# Every node gets a WireGuard IP from the VPN range; the controller reaches
+# nodes, and nodes reach the control-plane, over that tunnel. The control-plane
+# registers each node as a WireGuard peer on the VPN server (over SSH).
+#
+# The whole cluster uses ONE mode, decided by the control-plane:
+#   - A worker must NOT set disableVPN under this control-plane (it is failed
+#     with VPNModeMismatch if it does).
+#   - To run without a VPN instead, see infra_v1_remotecluster_novpn.yaml.
+#
+# Contents: control-plane (CPU) + GPU worker + CPU worker + their Secrets.
+# Workers join only after the control-plane is Ready.
+#
+# All secret values below are placeholders — replace every CHANGE_ME.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Control-plane
+# ----------------------------------------------------------------------------
+apiVersion: infra.dcn.ssu.ac.kr/v1
+kind: RemoteCluster
+metadata:
+  name: ml-vpn-cp
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # Unique per cluster. Workers set the SAME clusterName to be adopted by this
+  # control-plane, and NodeProvision resources set spec.clusterName to the same
+  # value to select this cluster's NodeProvisionNetConfig (required as soon as
+  # more than one cluster shares a namespace).
+  clusterName: "ml-vpn"
+
+  # SSH access to the node (used by the controller to provision it).
+  host: "192.168.3.234"
+  port: "22"
+  user: "ubuntu"
+
+  vpnConfig:
+    # WireGuard IP this node gets. It is also the node's kubelet node IP and the
+    # API server advertise address, so workers join via https://<ip>:6443.
+    ip: "10.9.0.1"
+    # WireGuard server the controller registers peers on, and how to log in to it.
+    vpnServerPublicIP: "203.0.113.10"
+    vpnServerSSHPort: "22"
+    vpnServerSSHUsername: ubuntu
+    vpnSshCredentialsRef:
+      name: ml-vpn-server-ssh
+      namespace: default
+      key: id_rsa
+
+  nodeInfo:
+    nodeType: "control-plane"
+    # "cpu": this control-plane only runs CPU workloads. Use "gpu" if the
+    # control-plane box has GPUs and should also run/pre-pull GPU workloads (see
+    # the single-node GPU control-plane in infra_v1_remotecluster_novpn.yaml).
+    hardwareType: "cpu"
+    softwareConfig:
+      kubernetesVersion: "v1.35.0"
+
+      # Images pre-pulled onto nodes. nodeTarget: "gpu" = GPU nodes only,
+      # "all" = every node. Registry hosts of these images (when fully
+      # qualified with a host or host:port) are ALSO marked insecure, so a
+      # plain-HTTP registry here needs no extra configuration.
+      imagePrepulls:
+        - image: "docker.io/example/kernel-pytorch-gpu:3.2.3-cu121"
+          nodeTarget: "gpu"
+        - image: "docker.io/example/base-tools:1.0"
+          nodeTarget: "all"
+      # Secret (username/password keys) used to pull the private images above.
+      imagePullSecretRef:
+        name: ml-vpn-dockerhub-creds
+
+      # Registries CRI-O must reach over plain HTTP or with an untrusted
+      # certificate (host or host:port, no scheme or path) — e.g. a Harbor
+      # exposed on a NodePort over the VPN. Use this for registries that other
+      # workloads pull from but that are NOT in imagePrepulls. Written to
+      # /etc/containers/registries.conf.d before CRI-O first starts on every
+      # node (on-prem, AWS and GCP). Already-provisioned nodes need the
+      # one-time manual drop-in + `systemctl restart crio` described in the
+      # user guide.
+      insecureRegistries:
+        - "10.9.0.1:30728"
+
+      # Prebuilt CRI-O runtime artifact. All fields optional; defaults shown.
+      cnlabRuntime:
+        registry: "ghcr.io"
+        repository: "vitu-mafeni/cnlab-runtime"
+        version: "1.0.2-beta"
+        orasVersion: "1.3.2"
+        credentialsRef:
+          name: ml-vpn-cnlab-runtime-registry
+          namespace: default
+
+  auth:
+    passwordSecretRef:
+      name: ml-vpn-cp-ssh
+      key: password
+
+  # Optional GitOps (Nephio/Porch) platform deployment. Omit to provision the
+  # bare cluster only.
+  # gitConfig:
+  #   enable: "true"
+  #   gitServer: "http://git.example.com:31810"
+  #   gitUsername: "nephio"
+  #   upstreamPlatformRepo: "cnlab-catalog"
+  #   packageRevision: "v1.0.0"
+
+---
+# ----------------------------------------------------------------------------
+# GPU worker — joins ml-vpn-cp over the VPN
+# ----------------------------------------------------------------------------
+apiVersion: infra.dcn.ssu.ac.kr/v1
+kind: RemoteCluster
+metadata:
+  name: ml-vpn-gpu-worker-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  clusterName: "ml-vpn" # must match the control-plane
+  host: "192.168.3.235" # how the controller reaches the node over SSH
+  port: "22"
+  user: "ubuntu"
+  vpnConfig:
+    ip: "10.9.0.14" # this worker's WireGuard IP (unique; also its kubelet node IP)
+  nodeInfo:
+    nodeType: "worker"
+    hardwareType: "gpu" # gets gpu=on and the gpu pre-pull images
+    # softwareConfig is optional on workers: images, registries and the runtime
+    # are inherited from the control-plane's cluster-wide config.
+  auth:
+    passwordSecretRef:
+      name: ml-vpn-gpu-worker-ssh
+      key: password
+
+---
+# ----------------------------------------------------------------------------
+# CPU worker — joins ml-vpn-cp over the VPN
+# ----------------------------------------------------------------------------
+apiVersion: infra.dcn.ssu.ac.kr/v1
+kind: RemoteCluster
+metadata:
+  name: ml-vpn-cpu-worker-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: remote-cluster-provisioner
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  clusterName: "ml-vpn"
+  host: "192.168.3.236"
+  port: "22"
+  user: "ubuntu"
+  vpnConfig:
+    ip: "10.9.0.15"
+  nodeInfo:
+    nodeType: "worker"
+    hardwareType: "cpu"
+  auth:
+    passwordSecretRef:
+      name: ml-vpn-cpu-worker-ssh
+      key: password
+
+---
+# ----------------------------------------------------------------------------
+# Secrets (placeholders)
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-vpn-cp-ssh
+  namespace: default
+type: Opaque
+stringData:
+  password: "CHANGE_ME"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-vpn-gpu-worker-ssh
+  namespace: default
+type: Opaque
+stringData:
+  password: "CHANGE_ME"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-vpn-cpu-worker-ssh
+  namespace: default
+type: Opaque
+stringData:
+  password: "CHANGE_ME"
+---
+# SSH key for the WireGuard server (used to register/remove peers).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-vpn-server-ssh
+  namespace: default
+type: Opaque
+stringData:
+  id_rsa: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    CHANGE_ME
+    -----END OPENSSH PRIVATE KEY-----
+---
+# Registry credentials for imagePrepulls (keys: username, password).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-vpn-dockerhub-creds
+  namespace: default
+type: Opaque
+stringData:
+  username: "CHANGE_ME"
+  password: "CHANGE_ME"
+---
+# Credentials for the cnlab-runtime OCI artifact (keys: username, token;
+# packages:read scope is enough).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-vpn-cnlab-runtime-registry
+  namespace: default
+type: Opaque
+stringData:
+  username: "CHANGE_ME"
+  token: "CHANGE_ME"

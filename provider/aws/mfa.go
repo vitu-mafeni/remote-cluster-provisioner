@@ -300,6 +300,20 @@ func CachedRoleSession(secret *corev1.Secret, grace time.Duration) (AWSCredentia
 	}, exp, true
 }
 
+// secretSessionExpiry returns the awsSessionExpiry recorded in the secret when
+// the secret's awsSessionToken is the given token (i.e. the expiry belongs to
+// the credentials in use).
+func secretSessionExpiry(secret *corev1.Secret, token string) (time.Time, bool) {
+	if token == "" || secretVal(secret, secretKeySessionToken) != token {
+		return time.Time{}, false
+	}
+	exp, err := time.Parse(time.RFC3339, secretVal(secret, secretKeySessionExpiry))
+	if err != nil || exp.IsZero() {
+		return time.Time{}, false
+	}
+	return exp, true
+}
+
 // secretVal reads a secret Data key and trims surrounding whitespace.
 func secretVal(secret *corev1.Secret, key string) string {
 	return strings.TrimSpace(string(secret.Data[key]))

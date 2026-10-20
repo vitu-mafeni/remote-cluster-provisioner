@@ -250,6 +250,11 @@ func (in *SoftwareConfig) DeepCopyInto(out *SoftwareConfig) {
 		*out = make([]ImagePrepull, len(*in))
 		copy(*out, *in)
 	}
+	if in.InsecureRegistries != nil {
+		in, out := &in.InsecureRegistries, &out.InsecureRegistries
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.ImagePullSecretRef != nil {
 		in, out := &in.ImagePullSecretRef, &out.ImagePullSecretRef
 		*out = new(SecretKeyReference)
