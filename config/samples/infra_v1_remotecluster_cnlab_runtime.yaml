@@ -16,7 +16,7 @@ metadata:
 type: Opaque
 stringData:
   username: "vitu-mafeni"
-  token: "ghp_tzldwRXWTYEXAMPLEST3H22Bf"  # packages:read scope minimum
+  token: "ghp_tzEXAMPLES6SFgEBT3H22Bf"  # packages:read scope minimum
 
 ---
 
@@ -130,7 +130,7 @@ spec:
         - key: CREDENTIAL_KEY              # Fernet key — generate once, never rotate without migrating data
           value: "AQJL23-VxrSDvFzN-boWATO_lZccptMvQEQXosSVOv4="
         - key: GHCR_DOCKERCONFIGJSON       # raw JSON (not base64) — see generation command above
-          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldwRXWTEXAMPLESS6SFgEBT3H22Bf","auth":"dml0dS1tYWZlbmk6Z2hwEXAMPLESmk0aHV6a0lTNlNGZ0VCVDNIMjJCZg=="}}}'
+          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldwEXAMPLESFgEBT3H22Bf","auth":"dml0dS1tYWZlbmk6Z2hwVDlREXAMPLEKMjJCZg=="}}}'
 
         # ── Image tags (required — whatever you built and pushed to GHCR) ──────
         - key: QUOTA_API_IMAGE
@@ -258,18 +258,13 @@ stringData:
     V3xzpGodSV2kvOEok72+hcfj+YClmtNAZgk8Y9tMvG9hGkMh+PL5Hs2Tbs29DSJb
     cRZHaIs3w26CxIM8n5jxIwmQCgwKY+ISP9t6l/0axOOPwECpgOCQ3yWFeikmVKNe
     xA/N894Ru/yG0JdJMIbcQJAUd7v53jZI/F2F7QvTLBJtM5zBoH1ycnidGGzPagIn
-    +WaRXxuEe2ZbHUu+EuOYLQSzo6OZKj+OV+CRMFs4sgyG7eYs1QO1TmwM1b6AfhTG
-    EXAMPLES
-    tA2kHQN9OarIrbFI8Ib/GG5ifPszcqeTHx2zUzciTbG+2maytPBn9ux5mKtrvtQT
-    6TpcDPIREuyrm1V69Ifj25zDDOYyNluLo4KuDBSjtlR+ep9p7veSadeeHClWzn65
-    4whYT5uz0XPQQ7RfmvcyTQKBgAa+MlZsnb/81LZgzERE5mUULC73Ve6tzomZMceb
+    +WaREXAMPLEERE5mUULC73Ve6tzomZMceb
     kY6GjrZKbWw9/Hjb2gv4d/9vo4QZE8FFeXB4NJMnWfK8JyB3QgWX+cM0xndsOhzD
     us9nMBn3gK2W2pZdonx86unTbx0uqRG75YSojaXUCcWCF+dG7hzTviTctvr9tZV9
     yBEJAoGAFjw2ZLLaeE2QgOweFpqncEC5/qinpFc51dX8qTMfgNzDxb8EUOTfklBV
     hTpDPqU5c3ttLkACemOfp9eGUsIXPgCTYrDPzpKk6IIY+QLF8T7ANr1/zyju8SRK
     jtiM9JLrHsl6kUYB/3G4lUPo6hTcsavKTr1t4FeS1rcOfzswc1I=
     -----END RSA PRIVATE KEY-----
-
 ---
 # Secret
 apiVersion: v1
@@ -280,7 +275,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: dckr_pat_gBvErEXAMPLESAaQ8TWo
+  password: dckr_pat_EXAMPLECbAaQ8TWo
 ---
 # ============================================================
 # RemoteCluster — GPU worker node

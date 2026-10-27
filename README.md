@@ -315,8 +315,8 @@ WireGuard is only required when `disableVPN` is `false` (the default). Set
 `spec.disableVPN: true` when every node is directly reachable (public or otherwise routable IPs):
 no VPN server is contacted, no VPN range/credentials are published, no peers or WireGuard
 packages/config are created or removed, no AWS security-group / GCP firewall rule for the WireGuard UDP port is added, and
-flannel is pinned per node to the node's own address (`--iface=$(FLANNEL_NODE_IP)` from the pod's
-`status.hostIP`, i.e. the kubelet node IP) instead of `wg0`.
+Cilium is installed without the `devices=wg0` pin and auto-detects the node's own interface (the one carrying the
+kubelet node IP) instead of `wg0`. With the VPN enabled, Cilium runs in VXLAN tunnel mode with `devices=wg0`.
 
 - **Inheritance:** the mode is a property of the whole cluster. Set it on the **control-plane**
   `RemoteCluster`; it is published in the cluster's `NodeProvisionNetConfig.spec.disableVPN` and
@@ -335,7 +335,7 @@ flannel is pinned per node to the node's own address (`--iface=$(FLANNEL_NODE_IP
   existing resource is likewise unsupported: deletion cleanup follows what was recorded in
   `status` (`vpnIp` for a VPN node, only `ipAddress` for a VPN-less one), not the current spec.
 - **Networking is yours to manage:** allow TCP 6443 to the control-plane, kubelet TCP 10250 and
-  flannel VXLAN UDP 8473 between nodes. Pod traffic then crosses the network unencrypted.
+  Cilium VXLAN UDP 8472 (and health TCP 4240) between nodes. Pod traffic then crosses the network unencrypted.
 - `spec.host` / `ipAddress` must be an IP bound to an interface on the node (a NATed public IP
   is rejected early); for AWS and GCP the instance's private / internal IP is used.
 

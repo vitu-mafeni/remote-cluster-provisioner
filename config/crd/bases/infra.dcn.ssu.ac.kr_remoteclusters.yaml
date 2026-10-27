@@ -83,7 +83,7 @@ spec:
                   workers (RemoteCluster and NodeProvision) inherit it, and a node that
                   disables the VPN under a VPN control-plane is failed. With it set, no VPN
                   server is contacted, no VPN range/credentials are published or copied, no
-                  peer is removed, flannel is not pinned to wg0, WireGuard is not installed
+                  peer is removed, Cilium is not pinned to wg0, WireGuard is not installed
                   or torn down, and spec.vpnConfig is ignored.
                 type: boolean
               gitConfig:
@@ -226,10 +226,6 @@ spec:
                         maxItems: 32
                         type: array
                       kubernetesVersion:
-                        description: |-
-                          NvidiaDriverVersion           string   `json:"nvidiaDriverVersion,omitempty"`
-                          NvidiaContainerToolkitVersion string   `json:"nvidiaContainerToolkitVersion,omitempty"`
-                          K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
                         type: string
                       platformVariables:
                         description: |-
@@ -250,6 +246,12 @@ spec:
                           - value
                           type: object
                         type: array
+                      schedulerType:
+                        description: |-
+                          NvidiaDriverVersion           string   `json:"nvidiaDriverVersion,omitempty"`
+                          NvidiaContainerToolkitVersion string   `json:"nvidiaContainerToolkitVersion,omitempty"`
+                          K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
+                        type: string
                     type: object
                 required:
                 - hardwareType

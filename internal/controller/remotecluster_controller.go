@@ -1914,7 +1914,7 @@ func ensureAnnotations(obj client.Object) map[string]string {
 }
 
 // reconcileVPNMode keeps a worker's VPN mode consistent with its
-// control-plane's, which decides for the whole cluster: flannel is pinned to
+// control-plane's, which decides for the whole cluster: Cilium is pinned to
 // wg0 on VPN clusters and the API server is advertised on the wg0 (or, without
 // a VPN, the host) address, so a mixed cluster cannot work.
 //
@@ -3047,22 +3047,6 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		},
 
 		{
-			name: "hami-variant",
-			upstream: packageRef{
-				pkg:      "ml-platform/hami",
-				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
-				revision: cluster.Spec.GitConfig.PackageRevision,
-			},
-			downstream: packageRef{
-				pkg:  "hami",
-				repo: cluster.Spec.ClusterName,
-			},
-			annotations: map[string]interface{}{
-				"approval.nephio.org/policy": "initial",
-			},
-		},
-
-		{
 			name: "fluidcr-variant",
 			upstream: packageRef{
 				pkg:      "ml-platform/fluidcr",
@@ -3132,6 +3116,72 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		// harbor-variant, kai-scheduler-variant, keycloak-variant,
 		// kubeflow-variant, kueue-variant, kyverno-variant, prometheus-stack-variant,
 		// ml-platform-admin
+	}
+
+	if cluster.Spec.NodeInfo.SoftwareConfig.SchedulerType == "volcano" {
+		variants = append(variants, packageVariantSpec{
+			name: "volcano-variant",
+			upstream: packageRef{
+				pkg:      "ml-platform/volcano",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "volcano",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		})
+
+		variants = append(variants, packageVariantSpec{
+			name: "volcano-vgpu-device-plugin-variant",
+			upstream: packageRef{
+				pkg:      "ml-platform/volcano-vgpu-device-plugin",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "volcano-vgpu-device-plugin",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		})
+
+		variants = append(variants, packageVariantSpec{
+			name: "kueue-variant",
+			upstream: packageRef{
+				pkg:      "ml-platform/kueue-plugin",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "kueue-plugin",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		})
+	} else {
+		variants = append(variants, packageVariantSpec{
+			name: "hami-variant",
+			upstream: packageRef{
+				pkg:      "ml-platform/hami",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "hami",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		})
 	}
 
 	return r.upsertPackageVariants(ctx, cluster, variants)

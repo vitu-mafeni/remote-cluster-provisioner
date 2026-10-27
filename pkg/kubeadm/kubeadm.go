@@ -502,6 +502,20 @@ func nodeHealthilyJoined(client *sshhelper.Client, joinCmd string) (bool, error)
 	return false, err
 }
 
+// ciliumInstallFlags returns the `cilium install` flags. The pod CIDR matches
+// the kubeadm podSubnet. With the VPN enabled the nodes only reach each other
+// over wg0 (the kubelet node-ip is the wg0 address), so Cilium's devices are
+// pinned to wg0 and it runs in VXLAN tunnel mode, carrying pod traffic inside
+// the WireGuard tunnel. Without the VPN Cilium auto-detects the node's
+// devices, which is the node's own routable address.
+func ciliumInstallFlags(disableVPN bool) string {
+	flags := "--set ipam.operator.clusterPoolIPv4PodCIDRList=10.244.0.0/16"
+	if !disableVPN {
+		flags += " --set routingMode=tunnel --set tunnelProtocol=vxlan --set devices=wg0"
+	}
+	return flags
+}
+
 // flannelNodeIPEnv is the env var the VPN-less flannel patch injects (from the
 // pod's status.hostIP, i.e. the kubelet --node-ip) and references in --iface.
 const flannelNodeIPEnv = "FLANNEL_NODE_IP"
@@ -713,6 +727,8 @@ fi`, EGKernelspecsExportPath, EGKernelspecsImage),
 			"sudo modprobe overlay",
 			"sudo modprobe br_netfilter",
 			`echo -e "net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
+			"sudo sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576",
+			`printf 'fs.inotify.max_user_instances=8192\nfs.inotify.max_user_watches=1048576\n' | sudo tee /etc/sysctl.d/99-inotify.conf`,
 			"sudo sysctl --system",
 		}},
 
@@ -801,42 +817,60 @@ printf '[Unit]\nAfter=crio.service\nRequires=crio.service\n' \
 			// CNI plugins bundle so portmap (and friends) exist before flannel
 			// comes up. Idempotent: skipped once portmap is already present.
 			pkgruntime.CNIPluginsInstallScript(),
-			"kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml",
-			// `kubectl apply` above resets the DaemonSet's args to the upstream
-			// manifest (which has no --iface=wg0) on every run, so this check
-			// will legitimately re-fire once per retry until the CNI phase
-			// finally completes — but only bounces the daemonset when the flag
-			// is genuinely missing, not unconditionally.
-			"CHANGED=0\n" + flannelIfaceStep(cluster.Spec.DisableVPN) + `# Flannel's VXLAN backend defaults to UDP port 8472, which collides with
-# other VXLAN users already on the host network namespace (e.g.
-# Cilium-managed LXD/Incus containers on bare-metal nodes bind
-# 0.0.0.0:8472 for cilium_vxlan), causing "failed to set interface
-# flannel.1 to UP state: address already in use". Pin flannel to a
-# distinct port so its VXLAN socket bind never contends with a
-# pre-existing one. Network below matches the podSubnet configured in
-# kubeadmConfig above. Only rewritten (and the daemonset only bounced) if
-# not already configured, so a healthy flannel pod is left alone on retry.
-grep -q '"Port": 8473' <<<"$(kubectl -n kube-flannel get configmap kube-flannel-cfg -o jsonpath='{.data.net-conf\.json}')" || {
-  FLANNEL_NETCONF=$(mktemp)
-  cat <<'EOF' > "$FLANNEL_NETCONF"
-{
-  "Network": "10.244.0.0/16",
-  "Backend": {
-    "Type": "vxlan",
-    "Port": 8473
-  }
-}
-EOF
-  kubectl -n kube-flannel create configmap kube-flannel-cfg \
-    --from-file=net-conf.json="$FLANNEL_NETCONF" \
-    --dry-run=client -o json | kubectl -n kube-flannel patch configmap kube-flannel-cfg --type merge --patch-file=/dev/stdin
-  rm -f "$FLANNEL_NETCONF"
-  CHANGED=1
-}
-if [ "$CHANGED" = "1" ]; then
-  kubectl -n kube-flannel rollout restart daemonset kube-flannel-ds
+			// Cilium (https://docs.cilium.io/en/stable/gettingstarted/k8s-install-default/).
+			// Installed with the cilium CLI; skipped when the cilium DaemonSet already
+			// exists so CNI-phase retries do not reinstall. Pod CIDR matches podSubnet.
+			`if ! kubectl -n kube-system get daemonset cilium >/dev/null 2>&1; then
+  if ! command -v cilium >/dev/null 2>&1; then
+    CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+    CLI_ARCH=amd64; [ "$(uname -m)" = "aarch64" ] && CLI_ARCH=arm64
+    curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+    sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+    sudo tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+    rm -f cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+  fi
+  cilium install ` + ciliumInstallFlags(cluster.Spec.DisableVPN) + `
 fi`,
-			"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
+			"cilium status --wait --wait-duration 5m",
+			// ── Flannel (disabled in favour of Cilium) ──
+			/*
+							"kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml",
+							// `kubectl apply` above resets the DaemonSet's args to the upstream
+							// manifest (which has no --iface=wg0) on every run, so this check
+							// will legitimately re-fire once per retry until the CNI phase
+							// finally completes — but only bounces the daemonset when the flag
+							// is genuinely missing, not unconditionally.
+							"CHANGED=0\n" + flannelIfaceStep(cluster.Spec.DisableVPN) + `# Flannel's VXLAN backend defaults to UDP port 8472, which collides with
+				# other VXLAN users already on the host network namespace (e.g.
+				# Cilium-managed LXD/Incus containers on bare-metal nodes bind
+				# 0.0.0.0:8472 for cilium_vxlan), causing "failed to set interface
+				# flannel.1 to UP state: address already in use". Pin flannel to a
+				# distinct port so its VXLAN socket bind never contends with a
+				# pre-existing one. Network below matches the podSubnet configured in
+				# kubeadmConfig above. Only rewritten (and the daemonset only bounced) if
+				# not already configured, so a healthy flannel pod is left alone on retry.
+				grep -q '"Port": 8473' <<<"$(kubectl -n kube-flannel get configmap kube-flannel-cfg -o jsonpath='{.data.net-conf\.json}')" || {
+				  FLANNEL_NETCONF=$(mktemp)
+				  cat <<'EOF' > "$FLANNEL_NETCONF"
+				{
+				  "Network": "10.244.0.0/16",
+				  "Backend": {
+				    "Type": "vxlan",
+				    "Port": 8473
+				  }
+				}
+				EOF
+				  kubectl -n kube-flannel create configmap kube-flannel-cfg \
+				    --from-file=net-conf.json="$FLANNEL_NETCONF" \
+				    --dry-run=client -o json | kubectl -n kube-flannel patch configmap kube-flannel-cfg --type merge --patch-file=/dev/stdin
+				  rm -f "$FLANNEL_NETCONF"
+				  CHANGED=1
+				}
+				if [ "$CHANGED" = "1" ]; then
+				  kubectl -n kube-flannel rollout restart daemonset kube-flannel-ds
+				fi`,
+							"kubectl rollout status daemonset kube-flannel-ds -n kube-flannel --timeout=120s",
+			*/
 			"kubectl wait --for=condition=Ready nodes --all --timeout=180s",
 		}},
 
@@ -1078,6 +1112,8 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 			"sudo modprobe overlay",
 			"sudo modprobe br_netfilter",
 			`echo -e "net.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\nnet.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
+			"sudo sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576",
+			`printf 'fs.inotify.max_user_instances=8192\nfs.inotify.max_user_watches=1048576\n' | sudo tee /etc/sysctl.d/99-inotify.conf`,
 			"sudo sysctl --system",
 		}},
 

@@ -484,15 +484,13 @@ spec:
     server advertise address, in place of the <code>wg0</code> address.</li>
 <li>Nothing VPN-related is touched: no VPN server contact, no VPN range/credentials published or
     copied, no peer allocation or removal, no WireGuard install or teardown, no AWS security
-    group rule for UDP 51820. Instead of <code>--iface=wg0</code>, flannel is pinned <strong>per node to the
-    node's own address</strong> (<code>--iface=$(FLANNEL_NODE_IP)</code>, taken from the pod's <code>status.hostIP</code>, which
-    is the kubelet node IP), so the VXLAN endpoint is always the interface that carries the node
-    IP, even on multi-homed hosts. <code>vpnConfig</code> is ignored.</li>
-<li>Nodes must reach the address the control-plane advertises. Pod traffic (flannel VXLAN,
-    UDP 8473) then crosses the network unencrypted.</li>
+    group rule for UDP 51820. Instead of <code>devices=wg0</code>, Cilium is installed without a device pin and
+    <strong>auto-detects the node's own interface</strong>, which carries the kubelet node IP. <code>vpnConfig</code> is ignored.</li>
+<li>Nodes must reach the address the control-plane advertises. Pod traffic (Cilium VXLAN,
+    UDP 8472) then crosses the network unencrypted.</li>
 <li>Firewalling is yours to manage: the controller only opens what it needs itself (for AWS
     nodes the default security group it creates gets <strong>SSH only</strong>). The kubelet port
-    (<strong>TCP 10250</strong>) and flannel VXLAN (<strong>UDP 8473</strong>) between the cluster's nodes must be allowed
+    (<strong>TCP 10250</strong>) and Cilium VXLAN (<strong>UDP 8472</strong>) and health checks (<strong>TCP 4240</strong>) between the cluster's nodes must be allowed
     by your own security group / firewall (and TCP 6443 to the control-plane for joins).</li>
 <li>Choose the mode when you create the cluster; switching an existing cluster is not supported.</li>
 <li><strong><code>gitConfig.enable</code></strong> — a <strong>string</strong> <code>"true"</code>/<code>"false"</code>, not a bare <code>true</code>/<code>false</code>. Only when
@@ -829,7 +827,7 @@ owns the driver, container toolkit and CDI (leave Secure Boot off, the default, 
 <tr>
 <td>no VPN</td>
 <td><code>mgmt</code></td>
-<td>TCP 22, TCP 10250 (kubelet), UDP 8472 (flannel VXLAN) and ICMP from <code>firewallSourceRanges</code> (default: RFC1918 <strong>plus the node's own subnetwork range</strong>, so a VPC outside RFC1918 such as <code>172.168.0.0/16</code> works)</td>
+<td>TCP 22, TCP 10250 (kubelet), UDP 8472 (Cilium VXLAN) and ICMP from <code>firewallSourceRanges</code> (default: RFC1918 <strong>plus the node's own subnetwork range</strong>, so a VPC outside RFC1918 such as <code>172.168.0.0/16</code> works)</td>
 </tr>
 </tbody>
 </table></div>
