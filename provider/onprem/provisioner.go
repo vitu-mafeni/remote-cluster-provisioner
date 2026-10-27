@@ -318,6 +318,8 @@ sleep 2`, wgConfig),
 				`echo -e "net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
 net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/k8s.conf`,
+				"sudo sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576",
+				`printf 'fs.inotify.max_user_instances=8192\nfs.inotify.max_user_watches=1048576\n' | sudo tee /etc/sysctl.d/99-inotify.conf`,
 				"sudo sysctl --system",
 			},
 		},

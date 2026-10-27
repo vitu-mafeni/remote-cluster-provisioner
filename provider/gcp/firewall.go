@@ -19,10 +19,10 @@ var PrivateRanges = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 
 const (
 	// Ports of a node as the control plane sees it without a VPN.
-	kubeletPort  = "10250" // API server -> kubelet (logs, exec)
-	flannelPort  = "8472"  // flannel VXLAN (default backend)
-	sshPort      = "22"
-	defaultWGUDP = 51820
+	kubeletPort     = "10250" // API server -> kubelet (logs, exec)
+	ciliumVXLANPort = "8472"  // Cilium VXLAN (tunnel mode)
+	sshPort         = "22"
+	defaultWGUDP    = 51820
 
 	firewallOwnerMarker = "node-provision-controller"
 )
@@ -36,7 +36,7 @@ type firewallPlan struct {
 	VPNServerIP string // VPN mode: the only source of the WireGuard rule
 	WGPort      int
 	// SSHSources are the CIDRs allowed to SSH (and, without a VPN, reach the
-	// kubelet and flannel). Empty in VPN mode means "no SSH rule".
+	// kubelet and Cilium VXLAN). Empty in VPN mode means "no SSH rule".
 	SSHSources  []string
 	Description string
 }
@@ -47,7 +47,7 @@ type firewallPlan struct {
 //	VPN mode:  <node>-wg   udp/<wg port> from the VPN server only
 //	           <node>-ssh  tcp/22 from SSHSources (only when configured: with a
 //	                       VPN the controller reaches SSH inside the tunnel)
-//	no VPN:    <node>-mgmt tcp/22, tcp/10250 (kubelet), udp/8472 (flannel VXLAN)
+//	no VPN:    <node>-mgmt tcp/22, tcp/10250 (kubelet), udp/8472 (Cilium VXLAN)
 //	                       and ICMP from SSHSources (default: RFC1918)
 func desiredFirewalls(p firewallPlan) ([]*computepb.Firewall, error) {
 	network := fmt.Sprintf("projects/%s/global/networks/%s", p.NetProject, p.NetworkName)
@@ -74,7 +74,7 @@ func desiredFirewalls(p firewallPlan) ([]*computepb.Firewall, error) {
 			src = PrivateRanges
 		}
 		return []*computepb.Firewall{mk("mgmt", src,
-			proto2("tcp", sshPort, kubeletPort), proto2("udp", flannelPort), proto2("icmp"))}, nil
+			proto2("tcp", sshPort, kubeletPort), proto2("udp", ciliumVXLANPort), proto2("icmp"))}, nil
 	}
 
 	ip := net.ParseIP(strings.TrimSpace(p.VPNServerIP))

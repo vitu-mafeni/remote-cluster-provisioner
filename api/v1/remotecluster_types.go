@@ -55,7 +55,7 @@ type RemoteClusterSpec struct {
 	// workers (RemoteCluster and NodeProvision) inherit it, and a node that
 	// disables the VPN under a VPN control-plane is failed. With it set, no VPN
 	// server is contacted, no VPN range/credentials are published or copied, no
-	// peer is removed, flannel is not pinned to wg0, WireGuard is not installed
+	// peer is removed, Cilium is not pinned to wg0, WireGuard is not installed
 	// or torn down, and spec.vpnConfig is ignored.
 	// +optional
 	DisableVPN bool `json:"disableVPN,omitempty"`
@@ -104,6 +104,7 @@ type SoftwareConfig struct {
 	// NvidiaDriverVersion           string   `json:"nvidiaDriverVersion,omitempty"`
 	// NvidiaContainerToolkitVersion string   `json:"nvidiaContainerToolkitVersion,omitempty"`
 	// K8sDevicePluginVersion        string   `json:"k8sDevicePluginVersion,omitempty"`
+	SchedulerType     string         `json:"schedulerType,omitempty"`     // e.g., "kube-scheduler" or "volcano" | if volcano is used packagevariant for volcano and volcano-vgpu-device-plugin will be installed otherwise hami packagevariant for kube-scheduler
 	KubernetesVersion string         `json:"kubernetesVersion,omitempty"` // e.g., "v1.34.2"
 	ImagePrepulls     []ImagePrepull `json:"imagePrepulls,omitempty"`
 

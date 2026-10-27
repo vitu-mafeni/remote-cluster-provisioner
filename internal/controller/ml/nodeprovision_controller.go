@@ -2226,7 +2226,7 @@ func (r *NodeProvisionReconciler) resetOnPremNodeViaSSH(ctx context.Context, np 
 const joinTokenMaxAge = 20 * time.Hour
 
 // reconcileVPNMode makes np.Spec.DisableVPN follow the cluster's mode, which is
-// carried by the NodeProvisionNetConfig (synced from the control-plane): flannel
+// carried by the NodeProvisionNetConfig (synced from the control-plane): Cilium
 // is pinned to wg0 on VPN clusters and the API server is advertised on the wg0
 // (or, without a VPN, the host) address, so a mixed cluster cannot work.
 //   - cluster without the VPN, node unset → the node inherits it (persisted, so
