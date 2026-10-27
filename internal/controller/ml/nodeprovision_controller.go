@@ -1779,7 +1779,10 @@ func buildPrepullScript(images []mlv1alpha1.ImagePrepull) string {
 		}
 		q := shellQuote(img)
 		fmt.Fprintf(&b, "printf '[prepull] Pulling %%s...\\n' %s\n", q)
-		fmt.Fprintf(&b, "\"$CRICTL\" --runtime-endpoint \"$ENDPOINT\" pull ${CREDS[@]+\"${CREDS[@]}\"} %s\n", q)
+		// The one credential pair is sent to every image, but it only belongs to
+		// one registry (e.g. Docker Hub); others such as ghcr.io reject it with
+		// 403 even for public images. Fall back to an anonymous pull.
+		fmt.Fprintf(&b, "\"$CRICTL\" --runtime-endpoint \"$ENDPOINT\" pull ${CREDS[@]+\"${CREDS[@]}\"} %s || \"$CRICTL\" --runtime-endpoint \"$ENDPOINT\" pull %s\n", q, q)
 	}
 	b.WriteString("echo \"[prepull] Done.\"\n")
 	return b.String()
