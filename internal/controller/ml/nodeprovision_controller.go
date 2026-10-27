@@ -1570,10 +1570,18 @@ func (r *NodeProvisionReconciler) reconcileImagePrepullJob(
 			attempts := prepullRetryCount(np) + 1
 			_ = r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))
 			if attempts >= maxPrepullRetries {
-				log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed after max retries, failing NodeProvision",
+				// Pre-pull is an optimisation: the node has already joined and
+				// is schedulable, so a failed pull must not tear it down.
+				// Images are pulled on demand by the kubelet instead.
+				log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed after max retries; marking node Ready without pre-pulled images",
 					"job", jobName, "attempts", attempts, "maxRetries", maxPrepullRetries)
-				return r.failNodeProvision(ctx, np, fmt.Sprintf(
-					"image pre-pull job failed after %d attempts", attempts))
+				res, err := r.markNodeProvisionReady(ctx, np)
+				if err != nil {
+					return res, err
+				}
+				np.Status.ImagePrepullFailed = true
+				np.Status.Message = fmt.Sprintf("Node joined cluster; image pre-pull FAILED after %d attempts (images will be pulled on demand)", attempts)
+				return res, r.Status().Update(ctx, np)
 			}
 			log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed — deleting for retry",
 				"job", jobName, "attempt", attempts, "maxRetries", maxPrepullRetries)
