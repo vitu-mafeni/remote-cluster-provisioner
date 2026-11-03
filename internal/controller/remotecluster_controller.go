@@ -960,7 +960,8 @@ func rcBuildDaemonSetPrepullScript(images []string) string {
 		}
 		// shQuote: an image reference must never be interpreted by the shell.
 		fmt.Fprintf(&b, "printf '[prepull] Pulling %%s...\\n' %s\n", shQuote(img))
-		fmt.Fprintf(&b, "$CRICTL --runtime-endpoint \"$ENDPOINT\" pull $CREDS %s\n", shQuote(img))
+		// Creds belong to one registry; others (e.g. ghcr.io) 403 on them, so retry anonymously.
+		fmt.Fprintf(&b, "$CRICTL --runtime-endpoint \"$ENDPOINT\" pull $CREDS %s || $CRICTL --runtime-endpoint \"$ENDPOINT\" pull %s\n", shQuote(img), shQuote(img))
 	}
 	b.WriteString("echo \"[prepull] Done.\"\n")
 	b.WriteString("exec sleep infinity\n")

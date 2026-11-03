@@ -1570,10 +1570,18 @@ func (r *NodeProvisionReconciler) reconcileImagePrepullJob(
 			attempts := prepullRetryCount(np) + 1
 			_ = r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))
 			if attempts >= maxPrepullRetries {
-				log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed after max retries, failing NodeProvision",
+				// Pre-pull is an optimisation: the node has already joined and
+				// is schedulable, so a failed pull must not tear it down.
+				// Images are pulled on demand by the kubelet instead.
+				log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed after max retries; marking node Ready without pre-pulled images",
 					"job", jobName, "attempts", attempts, "maxRetries", maxPrepullRetries)
-				return r.failNodeProvision(ctx, np, fmt.Sprintf(
-					"image pre-pull job failed after %d attempts", attempts))
+				res, err := r.markNodeProvisionReady(ctx, np)
+				if err != nil {
+					return res, err
+				}
+				np.Status.ImagePrepullFailed = true
+				np.Status.Message = fmt.Sprintf("Node joined cluster; image pre-pull FAILED after %d attempts (images will be pulled on demand)", attempts)
+				return res, r.Status().Update(ctx, np)
 			}
 			log.Error(fmt.Errorf("pre-pull job failed"), "Image pre-pull job failed — deleting for retry",
 				"job", jobName, "attempt", attempts, "maxRetries", maxPrepullRetries)
@@ -1779,7 +1787,10 @@ func buildPrepullScript(images []mlv1alpha1.ImagePrepull) string {
 		}
 		q := shellQuote(img)
 		fmt.Fprintf(&b, "printf '[prepull] Pulling %%s...\\n' %s\n", q)
-		fmt.Fprintf(&b, "\"$CRICTL\" --runtime-endpoint \"$ENDPOINT\" pull ${CREDS[@]+\"${CREDS[@]}\"} %s\n", q)
+		// The one credential pair is sent to every image, but it only belongs to
+		// one registry (e.g. Docker Hub); others such as ghcr.io reject it with
+		// 403 even for public images. Fall back to an anonymous pull.
+		fmt.Fprintf(&b, "\"$CRICTL\" --runtime-endpoint \"$ENDPOINT\" pull ${CREDS[@]+\"${CREDS[@]}\"} %s || \"$CRICTL\" --runtime-endpoint \"$ENDPOINT\" pull %s\n", q, q)
 	}
 	b.WriteString("echo \"[prepull] Done.\"\n")
 	return b.String()

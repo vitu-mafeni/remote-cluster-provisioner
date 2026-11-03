@@ -353,6 +353,11 @@ spec:
               hostname:
                 description: Assigned hostname.
                 type: string
+              imagePrepullFailed:
+                description: |-
+                  ImagePrepullFailed is true when the node joined but the image pre-pull
+                  Job exhausted its retries. The node is Ready; images are pulled on demand.
+                type: boolean
               instanceId:
                 description: |-
                   Provider-generated instance ID (e.g. i-xxxxxxxxxxxxxxxxx for AWS; the

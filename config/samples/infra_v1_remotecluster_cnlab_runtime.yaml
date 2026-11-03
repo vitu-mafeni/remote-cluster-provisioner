@@ -16,7 +16,7 @@ metadata:
 type: Opaque
 stringData:
   username: "vitu-mafeni"
-  token: "ghp_tzEXAMPLES6SFgEBT3H22Bf"  # packages:read scope minimum
+  token: "ghp_EXAMPLES6SFgEBT3H22Bf"  # packages:read scope minimum
 
 ---
 
@@ -59,6 +59,7 @@ spec:
     nodeType: "control-plane"
     hardwareType: "cpu"
     softwareConfig:
+      schedulerType: "volcano"
       kubernetesVersion: "v1.35.0"
       imagePrepulls:
         - image: "docker.io/vitu1/kernel-pytorch-gpu:3.2.3-cu121"
@@ -130,7 +131,7 @@ spec:
         - key: CREDENTIAL_KEY              # Fernet key — generate once, never rotate without migrating data
           value: "AQJL23-VxrSDvFzN-boWATO_lZccptMvQEQXosSVOv4="
         - key: GHCR_DOCKERCONFIGJSON       # raw JSON (not base64) — see generation command above
-          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldwEXAMPLESFgEBT3H22Bf","auth":"dml0dS1tYWZlbmk6Z2hwVDlREXAMPLEKMjJCZg=="}}}'
+          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_EXAMPLES6SFgEBT3H22Bf","auth":"dml0dS1tYWZlbmEXAMPLEM2U0ZnRUJUMkhKMjJCZg=="}}}'
 
         # ── Image tags (required — whatever you built and pushed to GHCR) ──────
         - key: QUOTA_API_IMAGE
@@ -257,10 +258,7 @@ stringData:
     izXUrnyP2zG1AqpxMWo6n0ncmXOEGc/wvDEOCtAO/6K+xd1yM9CWcJfSpKP7eV+i
     V3xzpGodSV2kvOEok72+hcfj+YClmtNAZgk8Y9tMvG9hGkMh+PL5Hs2Tbs29DSJb
     cRZHaIs3w26CxIM8n5jxIwmQCgwKY+ISP9t6l/0axOOPwECpgOCQ3yWFeikmVKNe
-    xA/N894Ru/yG0JdJMIbcQJAUd7v53jZI/F2F7QvTLBJtM5zBoH1ycnidGGzPagIn
-    +WaREXAMPLEERE5mUULC73Ve6tzomZMceb
-    kY6GjrZKbWw9/Hjb2gv4d/9vo4QZE8FFeXB4NJMnWfK8JyB3QgWX+cM0xndsOhzD
-    us9nMBn3gK2W2pZdonx86unTbx0uqRG75YSojaXUCcWCF+dG7hzTviTctvr9tZV9
+    xAEXAMPLERG75YSojaXUCcWCF+dG7hzTviTctvr9tZV9
     yBEJAoGAFjw2ZLLaeE2QgOweFpqncEC5/qinpFc51dX8qTMfgNzDxb8EUOTfklBV
     hTpDPqU5c3ttLkACemOfp9eGUsIXPgCTYrDPzpKk6IIY+QLF8T7ANr1/zyju8SRK
     jtiM9JLrHsl6kUYB/3G4lUPo6hTcsavKTr1t4FeS1rcOfzswc1I=
@@ -275,7 +273,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: dckr_pat_EXAMPLECbAaQ8TWo
+  password: dckr_pat_gBEXAMPLEbAaQ8TWo
 ---
 # ============================================================
 # RemoteCluster — GPU worker node

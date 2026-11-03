@@ -369,6 +369,11 @@ type NodeProvisionStatus struct {
 	// +optional
 	RuntimeCredentialsHash string `json:"runtimeCredentialsHash,omitempty"`
 
+	// ImagePrepullFailed is true when the node joined but the image pre-pull
+	// Job exhausted its retries. The node is Ready; images are pulled on demand.
+	// +optional
+	ImagePrepullFailed bool `json:"imagePrepullFailed,omitempty"`
+
 	// ProvisionRetryCount is the number of consecutive provisioning failures.
 	// When it reaches maxProvisionRetries the controller stops retrying and
 	// leaves the resource in Failed phase; manual intervention is required.

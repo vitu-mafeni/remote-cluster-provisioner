@@ -162,7 +162,7 @@ func TestBuildPrepullScriptQuotesImages(t *testing.T) {
 	if !strings.Contains(s, `--creds "${REGISTRY_USER}:${REGISTRY_PASS}"`) || !strings.Contains(s, "${CREDS[@]+") {
 		t.Errorf("credentials must be a quoted array element:\n%s", s)
 	}
-	if strings.Count(s, "pull ") != 2 {
+	if strings.Count(s, "pull ") != 4 { // creds attempt + anonymous fallback per image
 		t.Errorf("blank image must be skipped:\n%s", s)
 	}
 }
