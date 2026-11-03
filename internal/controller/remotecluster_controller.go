@@ -3167,6 +3167,22 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 				"approval.nephio.org/policy": "initial",
 			},
 		})
+
+		variants = append(variants, packageVariantSpec{
+			name: "trainer-variant",
+			upstream: packageRef{
+				pkg:      "ml-platform/trainer-plugin",
+				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
+				revision: cluster.Spec.GitConfig.PackageRevision,
+			},
+			downstream: packageRef{
+				pkg:  "trainer-plugin",
+				repo: cluster.Spec.ClusterName,
+			},
+			annotations: map[string]interface{}{
+				"approval.nephio.org/policy": "initial",
+			},
+		})
 	} else {
 		variants = append(variants, packageVariantSpec{
 			name: "hami-variant",

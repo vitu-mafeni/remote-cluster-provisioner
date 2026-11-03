@@ -30,3 +30,23 @@ func TestCRIOCDIDropInSteps(t *testing.T) {
 		}
 	}
 }
+
+func TestNvidiaLegacyRuntimeSteps(t *testing.T) {
+	steps := nvidiaLegacyRuntimeSteps()
+	joined := strings.Join(steps, "\n")
+	for _, want := range []string{"/etc/crio/crio.conf.d/9998-nvidia-legacy.conf", "nvidia-legacy", "nvidia-container-runtime.legacy", `runtime_type = "oci"`} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("nvidia-legacy steps missing %q", want)
+		}
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	for i, s := range steps {
+		cmd := exec.Command("bash", "-n")
+		cmd.Stdin = strings.NewReader(s)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("step %d: bash -n failed: %v\n%s", i, err, out)
+		}
+	}
+}

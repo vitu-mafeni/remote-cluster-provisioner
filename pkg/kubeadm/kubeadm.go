@@ -361,6 +361,24 @@ printf '[crio.runtime]\nenable_cdi = true\ncdi_spec_dirs = ["/etc/cdi", "/var/ru
 	}
 }
 
+// nvidiaLegacyRuntimeSteps registers the GPU Operator toolkit's legacy NVIDIA
+// runtime ("nvidia-legacy") as a CRI-O runtime handler. Volcano's vGPU device
+// plugin needs it. The toolkit only lands in /usr/local/nvidia/toolkit after the
+// GPU Operator runs, but CRI-O validates runtime_path at start, so a placeholder
+// executable is created when the real binary is absent (the toolkit overwrites
+// it). Callers must run these before a CRI-O (re)start.
+func nvidiaLegacyRuntimeSteps() []string {
+	const bin = "/usr/local/nvidia/toolkit/nvidia-container-runtime.legacy"
+	return []string{
+		"sudo mkdir -p /usr/local/nvidia/toolkit /etc/crio/crio.conf.d",
+		`test -e ` + bin + ` || \
+printf '#!/bin/sh\necho "nvidia toolkit not installed yet" >&2\nexit 1\n' \
+  | sudo tee ` + bin + ` > /dev/null && sudo chmod 0755 ` + bin,
+		`printf '[crio.runtime]\n  [crio.runtime.runtimes]\n    [crio.runtime.runtimes.nvidia-legacy]\n      runtime_path = "` + bin + `"\n      runtime_type = "oci"\n' \
+  | sudo tee /etc/crio/crio.conf.d/9998-nvidia-legacy.conf > /dev/null`,
+	}
+}
+
 // insecureRegistriesConfStep returns a shell step that marks insecure (plain
 // HTTP / untrusted TLS) every registry in the effective list: the explicit
 // softwareConfig.insecureRegistries plus, for backward compatibility, the
@@ -1071,6 +1089,9 @@ func JoinWorkerNode(client *sshhelper.Client, cpClient *sshhelper.Client, cluste
 	var gpuCDISteps []string
 	if strings.EqualFold(cluster.Spec.NodeInfo.HardwareType, "gpu") {
 		gpuCDISteps = crioCDIDropInSteps()
+		if clusterParent.Spec.NodeInfo.SoftwareConfig.SchedulerType == "volcano" {
+			gpuCDISteps = append(gpuCDISteps, nvidiaLegacyRuntimeSteps()...)
+		}
 	}
 
 	crioInstallSteps := pkgruntime.InstallSteps(runtimeCfg)
