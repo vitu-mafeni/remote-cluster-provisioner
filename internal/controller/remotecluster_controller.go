@@ -3155,12 +3155,12 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		variants = append(variants, packageVariantSpec{
 			name: "kueue-variant",
 			upstream: packageRef{
-				pkg:      "ml-platform/kueue-plugin",
+				pkg:      "ml-platform/kueue",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
 			downstream: packageRef{
-				pkg:  "kueue-plugin",
+				pkg:  "kueue",
 				repo: cluster.Spec.ClusterName,
 			},
 			annotations: map[string]interface{}{
@@ -3171,12 +3171,12 @@ func (r *RemoteClusterReconciler) createCorePackageVariants(ctx context.Context,
 		variants = append(variants, packageVariantSpec{
 			name: "trainer-variant",
 			upstream: packageRef{
-				pkg:      "ml-platform/trainer-plugin",
+				pkg:      "ml-platform/trainer",
 				repo:     cluster.Spec.GitConfig.UpstreamPlatformRepo,
 				revision: cluster.Spec.GitConfig.PackageRevision,
 			},
 			downstream: packageRef{
-				pkg:  "trainer-plugin",
+				pkg:  "trainer",
 				repo: cluster.Spec.ClusterName,
 			},
 			annotations: map[string]interface{}{
