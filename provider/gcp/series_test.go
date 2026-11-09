@@ -438,3 +438,30 @@ func TestBootDiskTypeNameValidation(t *testing.T) {
 		t.Error("an invalid disk type name must be refused")
 	}
 }
+
+// The 503 GCE returned for g4-standard-12 + nvidia-rtx-pro-6000-vws in
+// asia-northeast3-a: stockout error code, but an unsupported configuration.
+const unsupportedConfigMsg = `SERVICE UNAVAILABLE: errors:{code:"ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS" error_details:{localized_message:{locale:"en-US" message:"A g4-standard-12 VM instance with 1 nvidia-rtx-pro-6000-vws accelerator(s) is not supported in the asia-northeast3-a zone with your configuration.  Retry your request in a zone that supports the machine type and configuration you require."}} error_details:{error_info:{domain:"compute.googleapis.com" metadatas:{key:"attachment" value:"nvidia-rtx-pro-6000-vws:1"} metadatas:{key:"zonesAvailable" value:"us-central1-b,europe-west4-b"}}}}`
+
+func TestUnsupportedConfigIsNotAStockoutAndIsNotRetried(t *testing.T) {
+	gerrUnsupported := gerr(503, "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS", unsupportedConfigMsg)
+	if Classify(gerrUnsupported) != KindUnsupportedConfig || IsStockout(gerrUnsupported) {
+		t.Fatalf("kind = %v", Classify(gerrUnsupported))
+	}
+	// a genuine stockout stays a retryable stockout
+	if k := Classify(gerr(503, "ZONE_RESOURCE_POOL_EXHAUSTED", "The zone 'z' does not have enough resources available to fulfill the request.")); k != KindStockout {
+		t.Errorf("genuine stockout kind = %v", k)
+	}
+	f, _, err := launchEnv(t, nil, func(f *fakeCompute) { f.insertInstanceErr = gerrUnsupported })
+	if err == nil || !IsPermanent(err) || len(f.inserted) != 1 {
+		t.Fatalf("err=%v inserts=%d", err, len(f.inserted))
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "retrying will not help") || !strings.Contains(msg, "Zones that support it: us-central1-b,europe-west4-b") ||
+		!strings.Contains(msg, "is not supported in the asia-northeast3-a zone with your configuration") {
+		t.Errorf("message must lead with the advice and keep Google's text: %s", msg)
+	}
+	if strings.Index(msg, "retrying will not help") > 200 {
+		t.Error("the actionable part must come first (status messages are truncated)")
+	}
+}

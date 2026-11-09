@@ -706,6 +706,23 @@ func TestGCP_CrashRecovery_VPNModeWithoutRecordedPeerDeletesAndFailsForRetry(t *
 	}
 }
 
+// A reconcile running on a stale cache (phase still CreatingInstance) must not
+// adopt the half-created instance of a launch that already failed.
+func TestGCP_CrashRecovery_StaleCacheDoesNotAdoptAnAlreadyFailedLaunch(t *testing.T) {
+	np := gcpCreatingNP(func(np *mlv1alpha1.NodeProvision) { np.Spec.DisableVPN = true })
+	live := np.DeepCopy()
+	live.Status.Phase = mlv1alpha1.NodeProvisionPhaseFailed
+	live.Status.ProvisionRetryCount = 1
+	r := fixReconciler(t, np, gcpCredsSecret())
+	r.APIReader = fixReconciler(t, live).Client
+	(&gcpStub{found: "n"}).install(r)
+	reconcileOnce(t, r, "n")
+	got := getNP(t, r, "n")
+	if got.Status.InstanceID != "" || got.Status.Phase != mlv1alpha1.NodeProvisionPhaseCreatingInstance || got.Status.ProvisionRetryCount != 0 {
+		t.Errorf("nothing may be adopted or counted from a stale view: %+v", got.Status)
+	}
+}
+
 func TestGCP_CreatingInstanceNothingLaunchedHonoursTheStallTimeout(t *testing.T) {
 	stalled := gcpCreatingNP(func(np *mlv1alpha1.NodeProvision) {
 		np.Spec.DisableVPN = true

@@ -509,6 +509,16 @@ func (r *NodeProvisionReconciler) adoptExistingGCPInstance(
 // stall handling.
 func (r *NodeProvisionReconciler) recoverLaunchedGCPInstance(ctx context.Context, np *mlv1alpha1.NodeProvision) (res ctrl.Result, handled bool, err error) {
 	log := logf.FromContext(ctx)
+	// This reconcile may be running on a stale cache: the launch that just failed
+	// can leave a half-created instance behind for a moment, and adopting it would
+	// poll an instance that is about to vanish and count the same failure twice.
+	// Trust the live object: once it is Failed or holds an InstanceID, do nothing.
+	live := &mlv1alpha1.NodeProvision{}
+	if gErr := r.apiReader().Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, live); gErr == nil &&
+		(live.Status.Phase == mlv1alpha1.NodeProvisionPhaseFailed || live.Status.InstanceID != "") {
+		log.Info("Not adopting a GCE instance: the live NodeProvision already moved on", "phase", live.Status.Phase)
+		return ctrl.Result{RequeueAfter: requeueShort}, true, nil
+	}
 	creds, cErr := r.teardownGCPCreds(ctx, np)
 	if cErr != nil {
 		log.Info("No usable GCP credentials to look for a launched instance", "err", cErr.Error())

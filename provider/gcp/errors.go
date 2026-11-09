@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 
 	"golang.org/x/oauth2"
@@ -37,6 +38,11 @@ const (
 	KindPermissionDenied
 	KindAuth
 	KindTransient
+	// KindUnsupportedConfig is GCE's "the machine type/accelerator combination is
+	// not supported in this zone with your configuration", delivered with the
+	// stockout error code (ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS) although no
+	// capacity shortage is involved: retrying cannot help.
+	KindUnsupportedConfig
 )
 
 func (k Kind) String() string {
@@ -55,6 +61,8 @@ func (k Kind) String() string {
 		return "AuthFailure"
 	case KindTransient:
 		return "Transient"
+	case KindUnsupportedConfig:
+		return "UnsupportedConfig"
 	default:
 		return "Other"
 	}
@@ -97,6 +105,9 @@ func Classify(err error) Kind {
 	text := errText(err)
 	code := httpCode(err)
 
+	if isUnsupportedConfigText(text) {
+		return KindUnsupportedConfig
+	}
 	switch {
 	case strings.Contains(text, "quota_exceeded"), strings.Contains(text, "quotaexceeded"),
 		strings.Contains(text, "quota '") && strings.Contains(text, "exceeded"),
@@ -144,6 +155,23 @@ func Classify(err error) Kind {
 	return KindOther
 }
 
+// isUnsupportedConfigText matches "A <machine type> VM instance with N <gpu>
+// accelerator(s) is not supported in the <zone> zone with your configuration".
+func isUnsupportedConfigText(lowerText string) bool {
+	return strings.Contains(lowerText, "is not supported in the") && strings.Contains(lowerText, "zone with your configuration")
+}
+
+var zonesAvailableRE = regexp.MustCompile(`key:"zonesAvailable"\s+value:"([^"]*)"`)
+
+// zonesAvailable extracts the zones GCE lists as supporting the configuration
+// (error_info metadata "zonesAvailable"); "" when absent.
+func zonesAvailable(err error) string {
+	if m := zonesAvailableRE.FindStringSubmatch(err.Error()); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
 // IsNotFound reports whether err means the resource does not exist.
 func IsNotFound(err error) bool { return Classify(err) == KindNotFound }
 
@@ -179,6 +207,13 @@ func Describe(err error) string {
 		return fmt.Sprintf("GCP quota exceeded (raise the quota or pick another region/machine type): %v", err)
 	case KindStockout:
 		return fmt.Sprintf("the zone has no capacity for this machine type/GPU right now (try another zone): %v", err)
+	case KindUnsupportedConfig:
+		// The actionable part comes first: status messages are truncated.
+		zones := ""
+		if z := zonesAvailable(err); z != "" {
+			zones = " Zones that support it: " + z + "."
+		}
+		return fmt.Sprintf("this machine type/accelerator configuration is not supported in the zone (not a capacity shortage; retrying will not help — use another zone or change the machine type/accelerator).%s Google's error: %v", zones, err)
 	case KindPermissionDenied:
 		return fmt.Sprintf("permission denied (the service account needs roles/compute.instanceAdmin.v1 and roles/compute.securityAdmin or equivalent, and the Compute Engine API must be enabled): %v", err)
 	case KindAuth:
@@ -230,7 +265,7 @@ func IsPermanent(err error) bool {
 // transient and stay retryable.
 func permanentAPIError(err error) bool {
 	switch Classify(err) {
-	case KindQuota, KindNotFound:
+	case KindQuota, KindNotFound, KindUnsupportedConfig:
 		return true
 	case KindOther:
 		c := httpCode(err)
