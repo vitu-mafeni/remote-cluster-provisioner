@@ -200,8 +200,14 @@ type GCPConfig struct {
 	// +kubebuilder:validation:Minimum=10
 	// +optional
 	BootDiskSizeGB int32 `json:"bootDiskSizeGB,omitempty"`
-	// BootDiskType is the persistent disk type, e.g. "pd-balanced" (default),
-	// "pd-ssd", "pd-standard" or a hyperdisk type required by newer machine series.
+	// BootDiskType is the boot disk type, used verbatim when set (e.g.
+	// "pd-balanced", "pd-ssd", "hyperdisk-balanced"); it must be offered in the
+	// zone (diskTypes.list) or provisioning fails with a clear message. When unset
+	// it is chosen by machine series (the part of instanceType before the first
+	// "-"): the first type of the series' preference list that the zone offers,
+	// e.g. pd-balanced for n1/n2/e2/c3/g2, hyperdisk-balanced for c4/n4/a4/g4 (see the user guide table). If
+	// GCE still rejects it for the machine type, the next of pd-balanced,
+	// hyperdisk-balanced, pd-ssd is tried once.
 	// +optional
 	BootDiskType string `json:"bootDiskType,omitempty"`
 	// Labels are extra GCE labels for the instance. Controller labels cannot be overridden.
@@ -218,7 +224,10 @@ type GCPConfig struct {
 	// Defaults to cloud-platform (access is then governed by IAM).
 	// +optional
 	ServiceAccountScopes []string `json:"serviceAccountScopes,omitempty"`
-	// Accelerator attaches GPUs to an N1 instance (see GCPAccelerator). GPU
+	// Accelerator attaches GPUs to an N1 instance (see GCPAccelerator). For
+	// machine types with built-in GPUs (g2, g4, a-series) it may only name that
+	// series' "-vws" workstation licence (e.g. nvidia-rtx-pro-6000-vws on g4,
+	// nvidia-l4-vws on g2), with count equal to the machine's GPU count. GPU
 	// instances always use onHostMaintenance=TERMINATE.
 	// +optional
 	Accelerator *GCPAccelerator `json:"accelerator,omitempty"`

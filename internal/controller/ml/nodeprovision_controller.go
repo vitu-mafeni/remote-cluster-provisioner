@@ -2763,6 +2763,20 @@ func (r *NodeProvisionReconciler) failNodeProvisionWith(
 	msg string,
 	mutate func(*mlv1alpha1.NodeProvisionStatus),
 ) (ctrl.Result, error) {
+	return r.failNodeProvisionOpts(ctx, np, msg, mutate, false)
+}
+
+// failNodeProvisionOpts is failNodeProvisionWith with noRetry: the failure
+// cannot be fixed by trying again (invalid configuration, machine type not in
+// the zone, quota), so the NodeProvision goes straight to the terminal Failed
+// state instead of burning every retry. The message is kept unchanged.
+func (r *NodeProvisionReconciler) failNodeProvisionOpts(
+	ctx context.Context,
+	np *mlv1alpha1.NodeProvision,
+	msg string,
+	mutate func(*mlv1alpha1.NodeProvisionStatus),
+	noRetry bool,
+) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	msg = sanitizeStatusMessage(msg)
 	var terminal bool
@@ -2781,7 +2795,12 @@ func (r *NodeProvisionReconciler) failNodeProvisionWith(
 		if mutate != nil {
 			mutate(&fresh.Status)
 		}
-		if fresh.Status.ProvisionRetryCount >= maxProvisionRetries {
+		if noRetry {
+			terminal = true
+			fresh.Status.ProvisionRetryCount = maxProvisionRetries
+			fresh.Status.Message = sanitizeStatusMessage(fmt.Sprintf(
+				"provisioning failed, not retrying (the error cannot be fixed by a retry): %s — fix the spec and reset .status.provisionRetryCount to retry", msg))
+		} else if fresh.Status.ProvisionRetryCount >= maxProvisionRetries {
 			terminal = true
 			fresh.Status.Message = sanitizeStatusMessage(fmt.Sprintf(
 				"provisioning failed after %d attempts (last error: %s) — manual intervention required",

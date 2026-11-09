@@ -16,7 +16,7 @@ metadata:
 type: Opaque
 stringData:
   username: "vitu-mafeni"
-  token: "ghp_EXAMPLES6SFgEBT3H22Bf"  # packages:read scope minimum
+  token: "ghp_tzldwREXAMPLEIS6SFgEBT3H22Bf"  # packages:read scope minimum
 
 ---
 
@@ -87,7 +87,7 @@ spec:
         # Image repository path. Default: vitu-mafeni/cnlab-runtime
         repository: "vitu-mafeni/cnlab-runtime"
         # Artifact version tag. Default: 1.0.0-beta
-        version: "1.0.2"
+        version: "1.0.3"
         osVariant: auto
         # ORAS CLI version used to pull the artifact. Default: 1.3.2
         orasVersion: "1.3.2"
@@ -131,13 +131,13 @@ spec:
         - key: CREDENTIAL_KEY              # Fernet key — generate once, never rotate without migrating data
           value: "AQJL23-VxrSDvFzN-boWATO_lZccptMvQEQXosSVOv4="
         - key: GHCR_DOCKERCONFIGJSON       # raw JSON (not base64) — see generation command above
-          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_EXAMPLES6SFgEBT3H22Bf","auth":"dml0dS1tYWZlbmEXAMPLEM2U0ZnRUJUMkhKMjJCZg=="}}}'
+          value: '{"auths":{"ghcr.io":{"username":"vitu-mafeni","password":"ghp_tzldwREXAMPLEIS6SFgEBT3H22Bf","auth":"dml0dS1tYWZlEXAMPLEXprSVM2U0ZnRUJUM0gyMkJm"}}}'
 
         # ── Image tags (required — whatever you built and pushed to GHCR) ──────
         - key: QUOTA_API_IMAGE
-          value: "ghcr.io/vitu-mafeni/quota-api:0.1.0-storage"
+          value: "ghcr.io/vitu-mafeni/quota-api:0.1.0-cnlabrm"
         - key: FRONTEND_IMAGE
-          value: "ghcr.io/vitu-mafeni/ml-platform-frontend:0.1.0-storage"
+          value: "ghcr.io/vitu-mafeni/ml-platform-frontend:0.1.0-cnlabrm"
 
         # ── Network overrides (optional — auto-computed from spec.host) ────────
         - key: JUPYTERHUB_PUBLIC_URL
@@ -225,7 +225,7 @@ spec:
     gitServer: "http://192.168.3.182:31810"
     gitUsername: "nephio"
     upstreamPlatformRepo: "cnlab-catalog"
-    packageRevision: "v1.0.0"
+    packageRevision: "v1.0.1"
 
 ---
 # SSH credential for the control-plane node.
@@ -257,8 +257,12 @@ stringData:
     6naU2QNVfQ2r2gGEeLhidktFmJE3oA+YJ2lGpQIDAQABAoIBAA8byNrGbkdBXjIJ
     izXUrnyP2zG1AqpxMWo6n0ncmXOEGc/wvDEOCtAO/6K+xd1yM9CWcJfSpKP7eV+i
     V3xzpGodSV2kvOEok72+hcfj+YClmtNAZgk8Y9tMvG9hGkMh+PL5Hs2Tbs29DSJb
-    cRZHaIs3w26CxIM8n5jxIwmQCgwKY+ISP9t6l/0axOOPwECpgOCQ3yWFeikmVKNe
-    xAEXAMPLERG75YSojaXUCcWCF+dG7hzTviTctvr9tZV9
+    cRZEXAMPLEkLSvzP9hJKNSBX/PhNUF
+    tA2kHQN9OarIrbFI8Ib/GG5ifPszcqeTHx2zUzciTbG+2maytPBn9ux5mKtrvtQT
+    6TpcDPIREuyrm1V69Ifj25zDDOYyNluLo4KuDBSjtlR+ep9p7veSadeeHClWzn65
+    4whYT5uz0XPQQ7RfmvcyTQKBgAa+MlZsnb/81LZgzERE5mUULC73Ve6tzomZMceb
+    kY6GjrZKbWw9/Hjb2gv4d/9vo4QZE8FFeXB4NJMnWfK8JyB3QgWX+cM0xndsOhzD
+    us9nMBn3gK2W2pZdonx86unTbx0uqRG75YSojaXUCcWCF+dG7hzTviTctvr9tZV9
     yBEJAoGAFjw2ZLLaeE2QgOweFpqncEC5/qinpFc51dX8qTMfgNzDxb8EUOTfklBV
     hTpDPqU5c3ttLkACemOfp9eGUsIXPgCTYrDPzpKk6IIY+QLF8T7ANr1/zyju8SRK
     jtiM9JLrHsl6kUYB/3G4lUPo6hTcsavKTr1t4FeS1rcOfzswc1I=
@@ -273,7 +277,7 @@ metadata:
 type: Opaque
 stringData:
   username: vitu1
-  password: dckr_pat_gBEXAMPLEbAaQ8TWo
+  password: dckr_pat_EXAMPLEAaQ8TWo
 ---
 # ============================================================
 # RemoteCluster — GPU worker node

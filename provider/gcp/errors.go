@@ -201,3 +201,40 @@ func (e *apiError) Unwrap() error { return e.cause }
 func apiErrorf(cause error, format string, args ...any) error {
 	return &apiError{msg: fmt.Sprintf(format, args...) + ": " + Describe(cause), cause: cause}
 }
+
+// permanentError marks a failure that retrying cannot fix (an invalid
+// configuration, a machine type the zone does not offer, a quota). The text is
+// the wrapped error's, unchanged.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+// Permanent marks err as not worth retrying (nil stays nil).
+func Permanent(err error) error {
+	if err == nil || IsPermanent(err) {
+		return err
+	}
+	return &permanentError{err: err}
+}
+
+// IsPermanent reports whether err (or a cause) was marked with Permanent.
+func IsPermanent(err error) bool {
+	var pe *permanentError
+	return errors.As(err, &pe)
+}
+
+// permanentAPIError reports whether a Compute API error can never succeed on a
+// retry: a quota, or a 4xx other than auth/permission (handled by their own
+// advice), not-found, conflict and throttling. Stockouts and 5xx/429 are
+// transient and stay retryable.
+func permanentAPIError(err error) bool {
+	switch Classify(err) {
+	case KindQuota, KindNotFound:
+		return true
+	case KindOther:
+		c := httpCode(err)
+		return c >= 400 && c < 500
+	}
+	return false
+}

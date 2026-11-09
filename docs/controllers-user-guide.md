@@ -677,7 +677,7 @@ spec:
   #   # sourceSnapshot: my-boot-snapshot   # boots from a snapshot; excludes the image fields
   #   disableExternalIP: false      # true for private subnets (needs Cloud NAT)
   #   bootDiskSizeGB: 100
-  #   bootDiskType: pd-ssd
+  #   bootDiskType: pd-ssd                 # default: chosen by machine series (see below)
   #   labels: {team: ml}
   #   networkTags: [ml-nodes]
   #   spot: false
@@ -710,10 +710,51 @@ No VPN server is contacted. The kubelet node IP is the VM's **internal** IP (rea
 metadata server), so the control plane must be able to route to it (same VPC, VPC peering, Cloud
 VPN/Interconnect), and the control plane's API endpoint must be reachable from the VM.
 
-**GPUs** — N1: `gcpConfig.accelerator: {type: nvidia-tesla-t4, count: 1}`. A2/A3/G2 machine types
-(`a2-highgpu-1g`, `g2-standard-8`, …) include their GPUs: leave `accelerator` unset. GPU VMs use
-`onHostMaintenance: TERMINATE`. As on AWS, the bootstrap installs no NVIDIA software: the GPU Operator
-owns the driver, container toolkit and CDI (leave Secure Boot off, the default, so its driver loads).
+**GPUs** — N1: `gcpConfig.accelerator: {type: nvidia-tesla-t4, count: 1}` (attachable types only). A2/A3/A4/G2/G4
+machine types (`a2-highgpu-1g`, `g2-standard-8`, `g4-standard-12`, …) include their GPUs: leave `accelerator`
+unset, or set it to the series' `-vws` workstation licence only (`nvidia-l4-vws` on g2,
+`nvidia-rtx-pro-6000-vws` on g4) with `count` equal to the machine's GPU count (omit it to use that count).
+Any other accelerator/machine combination is refused. GPU VMs use `onHostMaintenance: TERMINATE`. As on AWS,
+the bootstrap installs no NVIDIA software: the GPU Operator owns the driver, container toolkit and CDI (leave
+Secure Boot off, the default, so its driver loads). Only x86_64 series are accepted (t2a, c4a, n4a, a4x are refused).
+
+**Boot disk type, NIC and scheduling** — `gcpConfig.bootDiskType` is used verbatim when set (it must be offered
+in the zone, checked with `diskTypes.list`). When unset the controller takes the first type of the series'
+preference list (series = the part of `instanceType` before the first `-`; `custom-*` is N1) that the zone
+offers, and if GCE still answers "disk type … cannot be used by … machine type" it retries once with the next
+of `pd-balanced`, `hyperdisk-balanced`, `pd-ssd` (not counted as a provisioning retry). `bootDiskSizeGB` must meet
+the disk type's minimum. Defaults (one table, `provider/gcp/series.go`):
+
+| Series | Boot disk (preference) | nicType | onHostMaintenance |
+|---|---|---|---|
+| n1, n2, n2d, t2d, c2, c2d | pd-balanced, pd-ssd | VIRTIO_NET | MIGRATE |
+| e2 | pd-balanced, pd-ssd | VIRTIO_NET | MIGRATE |
+| m1, m2 | pd-balanced, pd-ssd, hyperdisk-balanced | VIRTIO_NET | MIGRATE |
+| m3 | pd-balanced, pd-ssd, hyperdisk-balanced | GVNIC | MIGRATE |
+| c3, c3d | pd-balanced, pd-ssd, hyperdisk-balanced | GVNIC | MIGRATE |
+| h3 | pd-balanced, hyperdisk-balanced | GVNIC | MIGRATE |
+| z3 | pd-balanced, pd-ssd, hyperdisk-balanced | GVNIC | not set (live migration depends on the Titanium SSD size) |
+| c4, c4d, n4, m4 | hyperdisk-balanced | GVNIC | MIGRATE |
+| any `*-metal` type (c3/c4/z3/x4 bare metal), x4 | hyperdisk-balanced | IDPF | TERMINATE (Spot refused) |
+| a2, g2 (GPU) | pd-balanced, pd-ssd | VIRTIO_NET | TERMINATE |
+| a3 highgpu/megagpu/edgegpu (GPU) | pd-balanced, pd-ssd, hyperdisk-balanced | GVNIC | TERMINATE |
+| a3-ultragpu, a4, g4 (GPU) | hyperdisk-balanced | GVNIC | TERMINATE |
+| N1 + `accelerator` | as n1 | VIRTIO_NET | TERMINATE |
+| unknown series | pd-balanced, hyperdisk-balanced (+ create-time fallback) | API default | not set |
+
+Sources (Google Cloud docs, checked 2026-11-10): general-purpose / compute- / memory- / storage- /
+accelerator-optimized machines, machine-resource, disks/hyperdisks, using-gvnic, host-maintenance-overview,
+setting-vm-host-options, gpus/about-gpus. Notes: Hyperdisk Balanced is listed for n1/n2/n2d/e2/c2d only behind
+"contact your account team" and the docs tell you to use Persistent Disk for boot disks of 1st/2nd-generation
+series, so it is not a default there; t2d, c2, a2 and g2 do not support it. Hyperdisk Balanced needs at least 4 GiB.
+`a3-highgpu-1g/2g/4g` can only be created as Spot VMs (`gcpConfig.spot: true`); `a3-ultragpu` and `a4` need a
+reservation, Spot or Flex-start capacity, which the spec cannot express beyond `spot`.
+Accelerators: only T4, P4 (and their `-vws`) and V100 attach to N1; a2/a3/a4 have no vWS option.
+
+Local SSDs are never requested (series that attach them, e.g. `-lssd` types, do so themselves). Errors that a
+retry cannot fix (invalid configuration, quota, machine type not offered in the zone) fail the NodeProvision
+immediately instead of using the 5 retries; Google's error text is kept in `status.message`. If the zone does not
+offer the machine type, the message names the zones of the region that do.
 
 **Firewall rules** — created per node, targeted at the node's own network tag, named
 `np-<instance>-<wg|ssh|mgmt>`, and deleted with the node:

@@ -127,7 +127,7 @@ func ProvisionInstance(
 
 	// ── Parse + validate everything that needs no side effects first ───────
 	if err := ValidateGCPConfig(np.Spec); err != nil {
-		return nil, err
+		return nil, Permanent(err)
 	}
 	clean := strings.TrimPrefix(nc.Spec.SoftwareConfig.KubernetesVersion, "v")
 	parts := strings.Split(clean, ".")
@@ -208,6 +208,15 @@ func ProvisionInstance(
 		return &ProvisionResult{InstanceID: instance, Adopted: true}, nil
 	}
 
+	// ── Zone preflight: machine type, GPU, boot disk type ───────────────────
+	// Before any firewall rule or VPN peer exists, so a configuration that can
+	// never launch fails without side effects.
+	lp, err := preflight(ctx, c, project, np)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[INFO] NodeProvision/%s: boot disk type %s (%s)", name, lp.DiskType, lp.Reason)
+
 	// ── Firewall rules (no VPN server involved; cleaned up on deletion) ─────
 	// Without a VPN and without explicit ranges the controller and control plane
 	// reach the node from its own network: allow the node's subnetwork too, or a
@@ -250,14 +259,25 @@ func ProvisionInstance(
 	if err != nil {
 		return vpnResult, fmt.Errorf("building startup script: %w", err)
 	}
-	instProto, err = buildInstance(np, project, instance, script, sshKeys)
-	if err != nil {
-		return vpnResult, err
-	}
-
 	log.Printf("[INFO] NodeProvision/%s: Creating GCE instance %s (machineType=%s zone=%s)",
 		name, instance, np.Spec.InstanceType, cfg.Zone)
-	if err := c.InsertInstance(ctx, project, cfg.Zone, RequestIDForAttempt(string(np.UID), np.Status.ProvisionRetryCount), instProto); err != nil {
+	attempt := np.Status.ProvisionRetryCount
+	tried := map[string]bool{}
+	diskType := lp.DiskType
+	for {
+		tried[diskType] = true
+		instProto, err = buildInstanceWith(np, project, instance, script, sshKeys, launchPlan{DiskType: diskType, GPUCount: lp.GPUCount})
+		if err != nil {
+			return vpnResult, Permanent(err)
+		}
+		reqID := RequestIDForAttempt(string(np.UID), attempt)
+		if len(tried) > 1 {
+			reqID = RequestIDForVariant(string(np.UID), attempt, diskType)
+		}
+		err = c.InsertInstance(ctx, project, cfg.Zone, reqID, instProto)
+		if err == nil {
+			break
+		}
 		if IsAlreadyExists(err) {
 			// An instance of this name exists but the lookup above did not see it
 			// (created concurrently). The peer registered for THIS attempt will
@@ -269,7 +289,22 @@ func ProvisionInstance(
 			}
 			return &ProvisionResult{}, fmt.Errorf("%w: insert: %v", ErrInstanceAlreadyLaunched, err)
 		}
-		return vpnResult, apiErrorf(err, "launching GCE instance")
+		// Google adds machine series faster than any table: when the disk type is
+		// rejected for this machine type, try the next candidate ONCE. This is part
+		// of the same provisioning attempt, not a retry of it.
+		if cfg.BootDiskType == "" && len(tried) == 1 && isDiskTypeMismatch(err) {
+			if next := nextDiskFallback(tried, lp.Offered); next != "" && diskFits(lp.Offered[next], diskSizeGB(cfg)) {
+				log.Printf("[WARN] NodeProvision/%s: boot disk type %s was rejected for %s (%v); retrying once with %s",
+					name, diskType, np.Spec.InstanceType, err, next)
+				diskType = next
+				continue
+			}
+		}
+		wrapped := apiErrorf(err, "launching GCE instance")
+		if permanentAPIError(err) || isDiskTypeMismatch(err) {
+			wrapped = Permanent(wrapped)
+		}
+		return vpnResult, wrapped
 	}
 	vpnResult.InstanceID = instance
 	log.Printf("[INFO] NodeProvision/%s: GCE instance %s created", name, instance)
@@ -279,6 +314,111 @@ func ProvisionInstance(
 // buildInstance assembles the Instances.Insert body. script may be empty for a
 // dry build (the real one is rendered after a VPN peer exists).
 func buildInstance(np *mlv1alpha1.NodeProvision, project, instance, script, sshKeys string) (*computepb.Instance, error) {
+	lp := launchPlan{DiskType: diskPDBalanced}
+	if s, _ := lookupSeries(np.Spec.InstanceType); len(s.BootDisks) > 0 {
+		lp.DiskType = s.BootDisks[0]
+	}
+	if cfg := np.Spec.GCPConfig; cfg != nil && cfg.BootDiskType != "" {
+		lp.DiskType = diskTypeName(cfg.BootDiskType)
+	}
+	return buildInstanceWith(np, project, instance, script, sshKeys, lp)
+}
+
+// launchPlan carries what the zone preflight decided.
+type launchPlan struct {
+	// DiskType is the boot disk type name (e.g. "hyperdisk-balanced").
+	DiskType string
+	// GPUCount is the guestAccelerators count, used when an accelerator is set.
+	GPUCount int32
+	// Offered, Reason: preflight output (unused by buildInstanceWith).
+	Offered map[string]*computepb.DiskType
+	Reason  string
+}
+
+// diskSizeGB is the boot disk size in GB.
+func diskSizeGB(cfg *mlv1alpha1.GCPConfig) int64 {
+	if cfg.BootDiskSizeGB > 0 {
+		return int64(cfg.BootDiskSizeGB)
+	}
+	return DefaultBootDiskGB
+}
+
+// diskFits reports whether size meets the disk type's minimum.
+func diskFits(d *computepb.DiskType, size int64) bool { return size >= minDiskGB(d) }
+
+// preflight checks, against the zone, everything the instance body depends on:
+// the machine type exists (naming the zones that offer it when not), is x86_64,
+// the accelerator is consistent with the machine's GPUs, and which boot disk
+// type to use. Its errors are permanent: retrying cannot change them.
+func preflight(ctx context.Context, c computeAPI, project string, np *mlv1alpha1.NodeProvision) (*launchPlan, error) {
+	cfg := np.Spec.GCPConfig
+	zone, mtName := cfg.Zone, np.Spec.InstanceType
+	region, _ := RegionOfZone(zone)
+
+	mt, err := c.GetMachineType(ctx, project, zone, mtName)
+	if err != nil {
+		if IsNotFound(err) {
+			nf := Permanent(fmt.Errorf("machine type %s is not available in zone %s", mtName, zone))
+			return nil, withOfferingZones(ctx, c, project, region, zone, mtName, nf)
+		}
+		return nil, apiErrorf(err, "checking machine type %s in zone %s", mtName, zone)
+	}
+	if strings.EqualFold(mt.GetArchitecture(), "ARM64") {
+		return nil, Permanent(fmt.Errorf("machine type %q is an Arm shape; only x86_64 machine types are supported", mtName))
+	}
+
+	lp := &launchPlan{}
+	if a := cfg.Accelerator; a != nil && a.Type != "" {
+		if _, err := c.GetAcceleratorType(ctx, project, zone, a.Type); err != nil {
+			if IsNotFound(err) {
+				return nil, Permanent(fmt.Errorf("accelerator type %s is not available in zone %s", a.Type, zone))
+			}
+			return nil, apiErrorf(err, "checking accelerator type %s in zone %s", a.Type, zone)
+		}
+		if HasImpliedGPU(mtName) {
+			n := builtinGPUCount(mt)
+			switch {
+			case n > 0 && a.Count > 0 && a.Count != n:
+				return nil, Permanent(fmt.Errorf("spec.gcpConfig.accelerator.count is %d but machine type %s has %d GPU(s): the %s licence count must equal the machine's GPU count", a.Count, mtName, n, a.Type))
+			case n > 0:
+				lp.GPUCount = n
+			case a.Count > 0:
+				lp.GPUCount = a.Count // the API did not report the machine's GPUs
+			default:
+				return nil, Permanent(fmt.Errorf("cannot tell how many GPUs machine type %s has: set spec.gcpConfig.accelerator.count to the machine's GPU count", mtName))
+			}
+		} else {
+			lp.GPUCount = a.Count
+			if lp.GPUCount <= 0 {
+				lp.GPUCount = 1
+			}
+		}
+	}
+
+	dts, err := c.ListDiskTypes(ctx, project, zone)
+	if err != nil {
+		return nil, apiErrorf(err, "listing disk types of zone %s", zone)
+	}
+	offered := map[string]*computepb.DiskType{}
+	for _, d := range dts {
+		if st := d.GetDeprecated().GetState(); st == "DELETED" || st == "OBSOLETE" {
+			continue
+		}
+		offered[d.GetName()] = d
+	}
+	cands, reason, err := bootDiskCandidates(mtName, cfg.BootDiskType, offered, zone)
+	if err != nil {
+		return nil, err
+	}
+	size := diskSizeGB(cfg)
+	if min := minDiskGB(offered[cands[0]]); size < min {
+		return nil, Permanent(fmt.Errorf("spec.gcpConfig.bootDiskSizeGB %d is below the %d GB minimum of disk type %s: raise bootDiskSizeGB", size, min, cands[0]))
+	}
+	lp.DiskType, lp.Offered, lp.Reason = cands[0], offered, reason
+	return lp, nil
+}
+
+func buildInstanceWith(np *mlv1alpha1.NodeProvision, project, instance, script, sshKeys string, lp launchPlan) (*computepb.Instance, error) {
 	cfg := np.Spec.GCPConfig
 	if cfg == nil {
 		return nil, fmt.Errorf("spec.gcpConfig is required for GCP provider")
@@ -309,17 +449,8 @@ func buildInstance(np *mlv1alpha1.NodeProvision, project, instance, script, sshK
 		initParams.SourceImage = proto.String(image)
 	}
 
-	diskGB := int64(DefaultBootDiskGB)
-	if cfg.BootDiskSizeGB > 0 {
-		diskGB = int64(cfg.BootDiskSizeGB)
-	}
-	diskType := cfg.BootDiskType
-	if diskType == "" {
-		diskType = DefaultBootDiskType
-	}
-	if !strings.Contains(diskType, "/") {
-		diskType = fmt.Sprintf("zones/%s/diskTypes/%s", zone, diskType)
-	}
+	diskGB := diskSizeGB(cfg)
+	diskType := diskTypeURL(project, zone, lp.DiskType)
 
 	netProject, netName := ParseNetworkRef(project, cfg.Network)
 	nic := &computepb.NetworkInterface{
@@ -331,6 +462,9 @@ func buildInstance(np *mlv1alpha1.NodeProvision, project, instance, script, sshK
 			return nil, err
 		}
 		nic.Subnetwork = proto.String(fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", subProject, subRegion, subName))
+	}
+	if nt := nicTypeFor(np.Spec.InstanceType); nt != "" {
+		nic.NicType = proto.String(nt)
 	}
 	if !cfg.DisableExternalIP {
 		// Ephemeral external IPv4, like AssociatePublicIpAddress on EC2.
@@ -381,7 +515,10 @@ func buildInstance(np *mlv1alpha1.NodeProvision, project, instance, script, sshK
 	}
 
 	if a := cfg.Accelerator; a != nil && a.Type != "" {
-		count := a.Count
+		count := lp.GPUCount
+		if count <= 0 {
+			count = a.Count
+		}
 		if count <= 0 {
 			count = 1
 		}
@@ -390,24 +527,7 @@ func buildInstance(np *mlv1alpha1.NodeProvision, project, instance, script, sshK
 			AcceleratorCount: proto.Int32(count),
 		}}
 	}
-
-	// GPU instances cannot live-migrate. Spot VMs cannot auto-restart and are
-	// deleted when preempted, so a preempted node vanishes instead of lingering
-	// stopped (and billed for its disk).
-	switch {
-	case cfg.Spot:
-		inst.Scheduling = &computepb.Scheduling{
-			ProvisioningModel:         proto.String("SPOT"),
-			InstanceTerminationAction: proto.String("DELETE"),
-			AutomaticRestart:          proto.Bool(false),
-			OnHostMaintenance:         proto.String("TERMINATE"),
-		}
-	case UsesGPU(np.Spec.InstanceType, cfg):
-		inst.Scheduling = &computepb.Scheduling{
-			OnHostMaintenance: proto.String("TERMINATE"),
-			AutomaticRestart:  proto.Bool(true),
-		}
-	}
+	inst.Scheduling = schedulingFor(np.Spec.InstanceType, cfg)
 
 	if cfg.ServiceAccountEmail != "" {
 		scopes := cfg.ServiceAccountScopes
@@ -591,3 +711,35 @@ func defaultMgmtSources(ctx context.Context, c computeAPI, project string, cfg *
 }
 
 func maskLen(n *net.IPNet) int { o, _ := n.Mask.Size(); return o }
+
+// schedulingFor is the instance's scheduling block. Spot VMs cannot auto-restart
+// and are deleted when preempted, so a preempted node vanishes instead of
+// lingering stopped (and billed for its disk). Machines with GPUs (built in or
+// attached) and series that cannot live-migrate use TERMINATE; the others
+// MIGRATE. A series missing from the table gets no block (Google's default).
+func schedulingFor(machineType string, cfg *mlv1alpha1.GCPConfig) *computepb.Scheduling {
+	if cfg.Spot {
+		return &computepb.Scheduling{
+			ProvisioningModel:         proto.String("SPOT"),
+			InstanceTerminationAction: proto.String("DELETE"),
+			AutomaticRestart:          proto.Bool(false),
+			OnHostMaintenance:         proto.String(hostMaintenanceTerm),
+		}
+	}
+	s, known := lookupSeries(machineType)
+	switch {
+	case s.SchedulingUnset && !UsesGPU(machineType, cfg):
+		return nil
+	case UsesGPU(machineType, cfg) || (known && !s.LiveMigrate):
+		return &computepb.Scheduling{
+			OnHostMaintenance: proto.String(hostMaintenanceTerm),
+			AutomaticRestart:  proto.Bool(true),
+		}
+	case known:
+		return &computepb.Scheduling{
+			OnHostMaintenance: proto.String(hostMaintenanceMigrate),
+			AutomaticRestart:  proto.Bool(true),
+		}
+	}
+	return nil
+}

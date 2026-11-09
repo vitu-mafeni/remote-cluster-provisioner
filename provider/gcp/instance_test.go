@@ -295,7 +295,7 @@ func TestBuildInstance_Defaults(t *testing.T) {
 	}
 	d := inst.GetDisks()[0]
 	if !d.GetBoot() || !d.GetAutoDelete() || d.GetInitializeParams().GetDiskSizeGb() != 50 ||
-		d.GetInitializeParams().GetDiskType() != "zones/us-central1-a/diskTypes/pd-balanced" ||
+		d.GetInitializeParams().GetDiskType() != "projects/proj-1/zones/us-central1-a/diskTypes/pd-balanced" ||
 		!strings.Contains(d.GetInitializeParams().GetSourceImage(), "ubuntu-2204") {
 		t.Errorf("boot disk: %v", d)
 	}
@@ -306,8 +306,8 @@ func TestBuildInstance_Defaults(t *testing.T) {
 	if len(nic.GetAccessConfigs()) != 1 || nic.GetAccessConfigs()[0].GetType() != "ONE_TO_ONE_NAT" {
 		t.Error("an ephemeral external IP is attached by default")
 	}
-	if inst.GetScheduling() != nil || len(inst.GetGuestAccelerators()) != 0 || len(inst.GetServiceAccounts()) != 0 {
-		t.Error("a plain CPU node needs no scheduling override, accelerators or service account")
+	if inst.GetScheduling().GetOnHostMaintenance() != "MIGRATE" || len(inst.GetGuestAccelerators()) != 0 || len(inst.GetServiceAccounts()) != 0 {
+		t.Error("a plain CPU node live-migrates and needs no accelerators or service account")
 	}
 	if tags := inst.GetTags().GetItems(); len(tags) != 1 || tags[0] != NodeTag("worker-1") {
 		t.Errorf("tags: %v", tags)
@@ -331,7 +331,7 @@ func TestBuildInstance_Overrides(t *testing.T) {
 		c.ServiceAccountEmail = "sa@proj-1.iam.gserviceaccount.com"
 	})
 	d := inst.GetDisks()[0].GetInitializeParams()
-	if d.GetDiskSizeGb() != 200 || d.GetDiskType() != "zones/us-central1-a/diskTypes/pd-ssd" {
+	if d.GetDiskSizeGb() != 200 || d.GetDiskType() != "projects/proj-1/zones/us-central1-a/diskTypes/pd-ssd" {
 		t.Errorf("disk: %v", d)
 	}
 	nic := inst.GetNetworkInterfaces()[0]

@@ -186,7 +186,7 @@ func (r *NodeProvisionReconciler) reconcileGCPProvisioning(
 	// event trigger a fresh reconcile on the up-to-date object.
 	patched, err := r.resolveGCPDefaults(ctx, np, creds)
 	if err != nil {
-		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving GCP defaults: %v", err))
+		return r.failNodeProvisionOpts(ctx, np, fmt.Sprintf("resolving GCP defaults: %v", err), nil, gcpprovision.IsPermanent(err))
 	}
 	if patched {
 		return ctrl.Result{}, nil
@@ -194,7 +194,7 @@ func (r *NodeProvisionReconciler) reconcileGCPProvisioning(
 
 	// ── Validate ────────────────────────────────────────────────────────────
 	if err := gcpprovision.ValidateGCPConfig(np.Spec); err != nil {
-		return r.failNodeProvision(ctx, np, fmt.Sprintf("GCP validation failed: %v", err))
+		return r.failNodeProvisionOpts(ctx, np, fmt.Sprintf("GCP validation failed: %v", err), nil, true)
 	}
 	log.Info("GCP validation successful")
 
@@ -278,7 +278,7 @@ func (r *NodeProvisionReconciler) reconcileGCPProvisioning(
 		}
 	}
 	if err != nil {
-		return r.failNodeProvisionWith(ctx, np, fmt.Sprintf("GCE provisioning failed: %v", err), recordVPN)
+		return r.failNodeProvisionOpts(ctx, np, fmt.Sprintf("GCE provisioning failed: %v", err), recordVPN, gcpprovision.IsPermanent(err))
 	}
 	if result.Adopted {
 		log.Info("ProvisionInstance adopted an existing GCE instance", "instance", result.InstanceID)

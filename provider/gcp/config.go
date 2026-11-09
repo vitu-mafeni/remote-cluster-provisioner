@@ -64,6 +64,7 @@ var (
 	labelValRE  = regexp.MustCompile(`^[a-z0-9_-]{0,63}$`)
 	zoneRE      = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)?[0-9]+-[a-z]$`)
 	regionRE    = regexp.MustCompile(`^[a-z]+(?:-[a-z]+)?[0-9]+$`)
+	diskTypeRE  = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 	invalidChar = regexp.MustCompile(`[^a-z0-9-]+`)
 )
 
@@ -208,15 +209,11 @@ func MachineFamily(machineType string) string {
 	return mt
 }
 
-// impliedGPUFamilies are the series whose machine types include their GPUs
-// (accelerators are attached automatically and must not be declared).
-var impliedGPUFamilies = map[string]bool{"a2": true, "a3": true, "a4": true, "g2": true, "g4": true}
-
-// armFamilies are the Arm series; the bootstrap script and image are x86_64.
-var armFamilies = map[string]bool{"t2a": true, "c4a": true, "n4a": true, "a4x": true}
-
 // HasImpliedGPU reports whether the machine type is a GPU series with built-in GPUs.
-func HasImpliedGPU(machineType string) bool { return impliedGPUFamilies[MachineFamily(machineType)] }
+func HasImpliedGPU(machineType string) bool {
+	s, _ := lookupSeries(machineType)
+	return s.BuiltinGPU
+}
 
 // UsesGPU reports whether the instance will have a GPU (and therefore needs
 // onHostMaintenance=TERMINATE): an accelerator on N1 or a built-in-GPU series.
@@ -263,23 +260,23 @@ func ValidateGCPConfig(spec mlv1alpha1.NodeProvisionSpec) error {
 	if spec.Region != "" && spec.Region != region {
 		return fmt.Errorf("spec.gcpConfig.zone %q is in region %q but spec.region is %q", cfg.Zone, region, spec.Region)
 	}
-	fam := MachineFamily(spec.InstanceType)
-	if armFamilies[fam] {
+	if s, _ := lookupSeries(spec.InstanceType); s.Arm {
 		return fmt.Errorf("machine type %q is an Arm shape; only x86_64 machine types are supported", spec.InstanceType)
 	}
 	if cfg.BootDiskSizeGB != 0 && cfg.BootDiskSizeGB < minBootDiskGB {
 		return fmt.Errorf("spec.gcpConfig.bootDiskSizeGB must be at least %d", minBootDiskGB)
 	}
-	if a := cfg.Accelerator; a != nil && a.Type != "" {
-		if impliedGPUFamilies[fam] {
-			return fmt.Errorf("machine type %q already includes its GPUs; leave spec.gcpConfig.accelerator unset", spec.InstanceType)
-		}
-		if fam != "n1" {
-			return fmt.Errorf("spec.gcpConfig.accelerator is only supported on N1 machine types, not %q (use an a2/a3/g2 type for built-in GPUs)", spec.InstanceType)
-		}
-		if a.Count < 0 || a.Count > maxAccelerators {
-			return fmt.Errorf("spec.gcpConfig.accelerator.count must be between 1 and %d", maxAccelerators)
-		}
+	if cfg.Spot && isMetal(spec.InstanceType) {
+		return fmt.Errorf("machine type %q is bare metal, which does not support Spot VMs", spec.InstanceType)
+	}
+	if spotOnlyMachine(spec.InstanceType) && !cfg.Spot {
+		return fmt.Errorf("machine type %q can only be created as a Spot VM (or Flex-start, which is not supported here): set spec.gcpConfig.spot: true", spec.InstanceType)
+	}
+	if err := validateAccelerator(spec.InstanceType, cfg.Accelerator); err != nil {
+		return err
+	}
+	if cfg.BootDiskType != "" && !diskTypeRE.MatchString(diskTypeName(cfg.BootDiskType)) {
+		return fmt.Errorf("spec.gcpConfig.bootDiskType %q is not a valid disk type name (e.g. pd-balanced, pd-ssd, hyperdisk-balanced)", cfg.BootDiskType)
 	}
 	if cfg.SourceSnapshot != "" {
 		if cfg.SourceImage != "" || cfg.ImageFamily != "" || cfg.ImageProject != "" {
@@ -375,7 +372,10 @@ func ResolveDefaults(ctx context.Context, creds Credentials, np *mlv1alpha1.Node
 		MachineFamily(res.InstanceType) == "n1" {
 		cfg.Accelerator = &mlv1alpha1.GCPAccelerator{Type: DefaultGPUAccelerator, Count: 1}
 	}
-	if cfg.Accelerator != nil && cfg.Accelerator.Type != "" && cfg.Accelerator.Count == 0 {
+	// N1 GPUs are attached one by default; a "-vws" licence on a built-in-GPU
+	// machine defaults to the machine's own GPU count at launch (see preflight).
+	if cfg.Accelerator != nil && cfg.Accelerator.Type != "" && cfg.Accelerator.Count == 0 &&
+		MachineFamily(res.InstanceType) == "n1" {
 		cfg.Accelerator.Count = 1
 	}
 
@@ -407,7 +407,7 @@ func ResolveDefaults(ctx context.Context, creds Credentials, np *mlv1alpha1.Node
 	}
 	probe.GCPConfig = &pcfg
 	if err := ValidateGCPConfig(probe); err != nil {
-		return nil, err
+		return nil, Permanent(err)
 	}
 
 	c, err := newClient(ctx, creds)
@@ -419,7 +419,7 @@ func ResolveDefaults(ctx context.Context, creds Credentials, np *mlv1alpha1.Node
 	// ── zone ──────────────────────────────────────────────────────────────────
 	if cfg.Zone != "" {
 		if err := checkShape(ctx, c, cfg.ProjectID, cfg.Zone, res.InstanceType, cfg.Accelerator); err != nil {
-			return nil, err
+			return nil, withOfferingZones(ctx, c, cfg.ProjectID, res.Region, cfg.Zone, res.InstanceType, err)
 		}
 	} else {
 		zone, err := pickZone(ctx, c, cfg.ProjectID, res.Region, res.InstanceType, cfg.Accelerator)
@@ -740,14 +740,14 @@ func ParseSubnetworkRef(defaultProject, defaultRegion, ref string) (project, reg
 func checkShape(ctx context.Context, c computeAPI, project, zone, machineType string, acc *mlv1alpha1.GCPAccelerator) error {
 	if _, err := c.GetMachineType(ctx, project, zone, machineType); err != nil {
 		if IsNotFound(err) {
-			return fmt.Errorf("machine type %s is not available in zone %s", machineType, zone)
+			return Permanent(fmt.Errorf("machine type %s is not available in zone %s", machineType, zone))
 		}
 		return apiErrorf(err, "checking machine type %s in zone %s", machineType, zone)
 	}
 	if acc != nil && acc.Type != "" {
 		if _, err := c.GetAcceleratorType(ctx, project, zone, acc.Type); err != nil {
 			if IsNotFound(err) {
-				return fmt.Errorf("accelerator type %s is not available in zone %s", acc.Type, zone)
+				return Permanent(fmt.Errorf("accelerator type %s is not available in zone %s", acc.Type, zone))
 			}
 			return apiErrorf(err, "checking accelerator type %s in zone %s", acc.Type, zone)
 		}
@@ -787,5 +787,38 @@ func pickZone(ctx context.Context, c computeAPI, project, region, machineType st
 	if acc != nil && acc.Type != "" {
 		what += " with accelerator " + acc.Type
 	}
-	return "", fmt.Errorf("%s is not available in any zone of region %s (last: %v)", what, region, lastErr)
+	return "", Permanent(fmt.Errorf("%s is not available in any zone of region %s (last: %v)", what, region, lastErr))
+}
+
+// withOfferingZones appends the zones of region that do offer machineType to a
+// "not available in zone" error (best effort: lookup failures leave err as is).
+func withOfferingZones(ctx context.Context, c computeAPI, project, region, zone, machineType string, err error) error {
+	if !IsPermanent(err) || !strings.Contains(err.Error(), "is not available in zone") {
+		return err
+	}
+	zones, lerr := c.ListZones(ctx, project, region)
+	if lerr != nil {
+		return err
+	}
+	var offering []string
+	for _, z := range zones {
+		if z.GetName() == zone || (z.GetStatus() != "UP" && z.GetStatus() != "") {
+			continue
+		}
+		if _, merr := c.GetMachineType(ctx, project, z.GetName(), machineType); merr == nil {
+			offering = append(offering, z.GetName())
+		}
+	}
+	sort.Strings(offering)
+	if len(offering) == 0 {
+		return Permanent(fmt.Errorf("%w; no other zone of region %s offers it", err, region))
+	}
+	return Permanent(fmt.Errorf("%w; zones of region %s that offer it: %s", err, region, strings.Join(offering, ", ")))
+}
+
+// RequestIDForVariant is RequestIDForAttempt for a variant of the same attempt
+// (the boot-disk-type fallback): the server replays a failed operation for a
+// reused requestId, so a changed request needs a new one.
+func RequestIDForVariant(uid string, attempt int, variant string) string {
+	return RequestIDForAttempt(uid+"/"+variant, attempt)
 }

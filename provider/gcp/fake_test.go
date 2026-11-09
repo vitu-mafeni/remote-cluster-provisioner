@@ -38,19 +38,26 @@ type fakeCompute struct {
 	subnets   map[string]*computepb.Subnetwork // key project/region/name
 	zones     []*computepb.Zone
 	machines  map[string]bool // zone/type available
-	accels    map[string]bool // zone/type available
-	images    map[string]*computepb.Image
-	imgByName map[string]*computepb.Image    // key project/name
-	snapshots map[string]*computepb.Snapshot // key project/name
+	// machineInfo optionally enriches GetMachineType (key zone/type).
+	machineInfo map[string]*computepb.MachineType
+	// diskTypes lists the disk types per zone; nil means the default set.
+	diskTypes        map[string][]*computepb.DiskType
+	listDiskTypesErr error
+	accels           map[string]bool // zone/type available
+	images           map[string]*computepb.Image
+	imgByName        map[string]*computepb.Image    // key project/name
+	snapshots        map[string]*computepb.Snapshot // key project/name
 
 	// error injection (nil = succeed)
 	getInstanceErr    error
 	insertInstanceErr error
-	deleteInstanceErr error
-	getFirewallErr    error
-	insertFirewallErr error
-	deleteFirewallErr error
-	listZonesErr      error
+	// insertInstanceErrs are returned by successive inserts (then insertInstanceErr).
+	insertInstanceErrs []error
+	deleteInstanceErr  error
+	getFirewallErr     error
+	insertFirewallErr  error
+	deleteFirewallErr  error
+	listZonesErr       error
 
 	// call records
 	inserted        []*computepb.Instance
@@ -115,7 +122,13 @@ func (f *fakeCompute) InsertInstance(_ context.Context, project, zone, requestID
 	f.rec(project)
 	f.inserted = append(f.inserted, inst)
 	f.insertRequestID = append(f.insertRequestID, requestID)
-	if f.insertInstanceErr != nil {
+	if len(f.insertInstanceErrs) > 0 {
+		err := f.insertInstanceErrs[0]
+		f.insertInstanceErrs = f.insertInstanceErrs[1:]
+		if err != nil {
+			return err
+		}
+	} else if f.insertInstanceErr != nil {
 		return f.insertInstanceErr
 	}
 	key := zone + "/" + inst.GetName()
@@ -222,9 +235,36 @@ func (f *fakeCompute) GetMachineType(_ context.Context, _, zone, name string) (*
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.machines[zone+"/"+name] {
+		if mt, ok := f.machineInfo[zone+"/"+name]; ok {
+			return mt, nil
+		}
 		return &computepb.MachineType{Name: proto.String(name)}, nil
 	}
 	return nil, gerr(404, "notFound", "machine type not found")
+}
+
+func diskTypeFixture(name, valid string) *computepb.DiskType {
+	return &computepb.DiskType{Name: proto.String(name), ValidDiskSize: proto.String(valid)}
+}
+
+// defaultDiskTypes is what a typical zone offers.
+func defaultDiskTypes() []*computepb.DiskType {
+	return []*computepb.DiskType{
+		diskTypeFixture("pd-standard", "10GB-65536GB"), diskTypeFixture("pd-balanced", "10GB-65536GB"),
+		diskTypeFixture("pd-ssd", "10GB-65536GB"), diskTypeFixture("hyperdisk-balanced", "4GB-65536GB"),
+	}
+}
+
+func (f *fakeCompute) ListDiskTypes(_ context.Context, _, zone string) ([]*computepb.DiskType, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listDiskTypesErr != nil {
+		return nil, f.listDiskTypesErr
+	}
+	if d, ok := f.diskTypes[zone]; ok {
+		return d, nil
+	}
+	return defaultDiskTypes(), nil
 }
 
 func (f *fakeCompute) GetAcceleratorType(_ context.Context, _, zone, name string) (*computepb.AcceleratorType, error) {
@@ -369,6 +409,7 @@ esac
 		t.Fatal(err)
 	}
 	gce := newFakeCompute()
+	gce.machines["us-central1-a/e2-standard-4"] = true
 	useFake(t, gce)
 	return &provEnv{Stubs: stubs, client: &sshhelper.Client{Conn: srv.Dial(t)}, conf: conf, gce: gce, np: testNP(), nc: nc, pubKey: pub}
 }

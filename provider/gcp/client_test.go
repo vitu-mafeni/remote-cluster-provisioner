@@ -303,6 +303,11 @@ func TestSDK_EndToEndProvisionInstanceVPNless(t *testing.T) {
 				return
 			}
 			writeJSON(w, 404, map[string]any{"error": map[string]any{"code": 404, "message": "not found"}})
+		case r.Method == http.MethodGet && strings.Contains(p, "/machineTypes/"):
+			writeJSON(w, 200, map[string]any{"name": p[strings.LastIndex(p, "/")+1:], "architecture": "X86_64"})
+		case r.Method == http.MethodGet && strings.HasSuffix(p, "/diskTypes"):
+			writeJSON(w, 200, map[string]any{"items": []map[string]any{
+				{"name": "pd-balanced", "validDiskSize": "10GB-65536GB"}, {"name": "hyperdisk-balanced", "validDiskSize": "4GB-65536GB"}}})
 		case r.Method == http.MethodGet && strings.Contains(p, "/global/firewalls/"):
 			writeJSON(w, 404, map[string]any{"error": map[string]any{"code": 404, "message": "not found"}})
 		case r.Method == http.MethodPost && strings.HasSuffix(p, "/global/firewalls"):
