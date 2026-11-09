@@ -36,6 +36,9 @@ type computeAPI interface {
 	GetSubnetwork(ctx context.Context, project, region, name string) (*computepb.Subnetwork, error)
 	ListZones(ctx context.Context, project, region string) ([]*computepb.Zone, error)
 	GetMachineType(ctx context.Context, project, zone, name string) (*computepb.MachineType, error)
+	// GetDisk / DeleteDisk manage a zonal disk (cleanup of a failed zone attempt).
+	GetDisk(ctx context.Context, project, zone, name string) (*computepb.Disk, error)
+	DeleteDisk(ctx context.Context, project, zone, name string) error
 	// ListDiskTypes lists the disk types offered in a zone (diskTypes.list).
 	ListDiskTypes(ctx context.Context, project, zone string) ([]*computepb.DiskType, error)
 	GetAcceleratorType(ctx context.Context, project, zone, name string) (*computepb.AcceleratorType, error)
@@ -64,6 +67,7 @@ type sdkCompute struct {
 	zones     *compute.ZonesClient
 	machines  *compute.MachineTypesClient
 	diskTypes *compute.DiskTypesClient
+	disks     *compute.DisksClient
 	accels    *compute.AcceleratorTypesClient
 	images    *compute.ImagesClient
 	snapshots *compute.SnapshotsClient
@@ -104,6 +108,10 @@ func newSDKComputeWithOptions(ctx context.Context, opts ...option.ClientOption) 
 		_ = c.Close()
 		return nil, fmt.Errorf("creating GCE machine types client: %w", err)
 	}
+	if c.disks, err = compute.NewDisksRESTClient(ctx, opts...); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("creating GCE disks client: %w", err)
+	}
 	if c.diskTypes, err = compute.NewDiskTypesRESTClient(ctx, opts...); err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("creating GCE disk types client: %w", err)
@@ -142,6 +150,9 @@ func (c *sdkCompute) Close() error {
 	}
 	if c.machines != nil {
 		errs = append(errs, c.machines.Close())
+	}
+	if c.disks != nil {
+		errs = append(errs, c.disks.Close())
 	}
 	if c.diskTypes != nil {
 		errs = append(errs, c.diskTypes.Close())
@@ -255,6 +266,18 @@ func (c *sdkCompute) ListZones(ctx context.Context, project, region string) ([]*
 
 func (c *sdkCompute) GetMachineType(ctx context.Context, project, zone, name string) (*computepb.MachineType, error) {
 	return c.machines.Get(ctx, &computepb.GetMachineTypeRequest{Project: project, Zone: zone, MachineType: name})
+}
+
+func (c *sdkCompute) GetDisk(ctx context.Context, project, zone, name string) (*computepb.Disk, error) {
+	return c.disks.Get(ctx, &computepb.GetDiskRequest{Project: project, Zone: zone, Disk: name})
+}
+
+func (c *sdkCompute) DeleteDisk(ctx context.Context, project, zone, name string) error {
+	op, err := c.disks.Delete(ctx, &computepb.DeleteDiskRequest{Project: project, Zone: zone, Disk: name})
+	if err != nil {
+		return err
+	}
+	return waitOp(ctx, op)
 }
 
 func (c *sdkCompute) ListDiskTypes(ctx context.Context, project, zone string) ([]*computepb.DiskType, error) {

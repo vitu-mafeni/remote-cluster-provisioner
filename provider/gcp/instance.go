@@ -30,6 +30,9 @@ type ProvisionResult struct {
 	// peer or launch another one. VpnIP/PublicKey are then empty: the caller must
 	// recover the peer recorded for that instance.
 	Adopted bool
+	// Zone is the zone the instance lives in (it differs from
+	// spec.gcpConfig.zone when the zone fell back after a capacity error).
+	Zone string
 }
 
 // projectOf is the GCP project of the node: the spec's, else the key's.
@@ -41,6 +44,9 @@ func projectOf(np *mlv1alpha1.NodeProvision, creds Credentials) string {
 }
 
 func zoneOf(np *mlv1alpha1.NodeProvision) string {
+	if np.Status.Zone != "" {
+		return np.Status.Zone // where the instance actually landed
+	}
 	if np.Spec.GCPConfig == nil {
 		return ""
 	}
@@ -60,30 +66,37 @@ func lookupInstance(ctx context.Context, c computeAPI, project, zone, name, uid 
 	return inst, inst.GetLabels()[LabelUID] == sanitizeLabelValue(uid) || (uid == "" && inst.GetLabels()[LabelUID] == ""), nil
 }
 
-// FindInstance returns the name of the instance launched for this NodeProvision
-// (matched by its deterministic name AND the UID label), or "" when there is none
-// or the zone was never resolved. An instance of that name that belongs to
-// something else is reported as absent: it is never adopted or deleted.
-func FindInstance(ctx context.Context, np *mlv1alpha1.NodeProvision, creds Credentials) (string, error) {
-	zone := zoneOf(np)
+// FindInstance returns the name and zone of the instance launched for this
+// NodeProvision (matched by its deterministic name AND the UID label), or "" when
+// there is none or the zone was never resolved. With zoneFallback the instance may
+// be in any zone of the region, so all of them are searched. An instance of that
+// name that belongs to something else is reported as absent: it is never adopted
+// or deleted.
+func FindInstance(ctx context.Context, np *mlv1alpha1.NodeProvision, creds Credentials) (string, string, error) {
 	project := projectOf(np, creds)
-	if zone == "" || project == "" {
-		return "", nil
+	if zoneOf(np) == "" || project == "" {
+		return "", "", nil
 	}
 	c, err := newClient(ctx, creds)
 	if err != nil {
-		return "", fmt.Errorf("creating GCE client: %w", err)
+		return "", "", fmt.Errorf("creating GCE client: %w", err)
 	}
 	defer c.Close() //nolint:errcheck
 	name := InstanceName(np)
-	inst, owned, err := lookupInstance(ctx, c, project, zone, name, string(np.UID))
+	zones, err := instanceSearchZones(ctx, c, project, np)
 	if err != nil {
-		return "", fmt.Errorf("looking up instance %s: %w", name, err)
+		return "", "", err
 	}
-	if inst == nil || !owned {
-		return "", nil
+	for _, zone := range zones {
+		inst, owned, err := lookupInstance(ctx, c, project, zone, name, string(np.UID))
+		if err != nil {
+			return "", "", fmt.Errorf("looking up instance %s in %s: %w", name, zone, err)
+		}
+		if inst != nil && owned {
+			return name, zone, nil
+		}
 	}
-	return name, nil
+	return "", "", nil
 }
 
 // ProvisionInstance performs the full GCE provisioning workflow (the VPN steps
@@ -182,8 +195,7 @@ func ProvisionInstance(
 	if _, err := desiredFirewalls(plan); err != nil {
 		return nil, err
 	}
-	instProto, err := buildInstance(np, project, instance, "", sshKeys)
-	if err != nil {
+	if _, err := buildInstance(np, project, instance, "", sshKeys); err != nil {
 		return nil, err
 	}
 
@@ -205,17 +217,44 @@ func ProvisionInstance(
 			return nil, fmt.Errorf("%w: instance %q in zone %s", ErrInstanceNameTaken, instance, cfg.Zone)
 		}
 		log.Printf("[INFO] NodeProvision/%s: adopting existing GCE instance %s (no VPN peer allocated)", name, instance)
-		return &ProvisionResult{InstanceID: instance, Adopted: true}, nil
+		return &ProvisionResult{InstanceID: instance, Adopted: true, Zone: cfg.Zone}, nil
+	}
+	if fallbackEnabled(cfg) {
+		// A previous pass may have landed the instance in another zone of the region.
+		others, zerr := regionZones(ctx, c, project, cfg.Zone, false)
+		if zerr != nil {
+			return nil, zerr
+		}
+		for _, z := range others {
+			inst, own, lerr := lookupInstance(ctx, c, project, z, instance, string(np.UID))
+			if lerr != nil {
+				return nil, apiErrorf(lerr, "checking for an existing instance in zone %s", z)
+			}
+			if inst != nil && own {
+				log.Printf("[INFO] NodeProvision/%s: adopting existing GCE instance %s in zone %s (no VPN peer allocated)", name, instance, z)
+				return &ProvisionResult{InstanceID: instance, Adopted: true, Zone: z}, nil
+			}
+		}
 	}
 
 	// ── Zone preflight: machine type, GPU, boot disk type ───────────────────
 	// Before any firewall rule or VPN peer exists, so a configuration that can
 	// never launch fails without side effects.
-	lp, err := preflight(ctx, c, project, np)
+	exhausted := exhaustedSet(np)
+	cands, err := zoneCandidates(ctx, c, project, np, exhausted)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[INFO] NodeProvision/%s: boot disk type %s (%s)", name, lp.DiskType, lp.Reason)
+	if len(cands) == 0 {
+		// Every candidate was recorded as exhausted by an earlier part of this pass
+		// (e.g. before a controller restart): nothing is left to try.
+		return nil, noCapacity(np, np.Status.ExhaustedZones, nil)
+	}
+	lp0, err := preflight(ctx, c, project, np, cands[0])
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[INFO] NodeProvision/%s: zone candidates %s", name, strings.Join(cands, ", "))
 
 	// ── Firewall rules (no VPN server involved; cleaned up on deletion) ─────
 	// Without a VPN and without explicit ranges the controller and control plane
@@ -259,23 +298,69 @@ func ProvisionInstance(
 	if err != nil {
 		return vpnResult, fmt.Errorf("building startup script: %w", err)
 	}
-	log.Printf("[INFO] NodeProvision/%s: Creating GCE instance %s (machineType=%s zone=%s)",
-		name, instance, np.Spec.InstanceType, cfg.Zone)
 	attempt := np.Status.ProvisionRetryCount
-	tried := map[string]bool{}
-	diskType := lp.DiskType
-	for {
-		tried[diskType] = true
-		instProto, err = buildInstanceWith(np, project, instance, script, sshKeys, launchPlan{DiskType: diskType, GPUCount: lp.GPUCount})
-		if err != nil {
-			return vpnResult, Permanent(err)
+
+	// requestFor gives each distinct request its own requestId (the server replays
+	// a failed operation for a reused id): the plain attempt id for the named zone
+	// and the preferred disk type, a variant otherwise.
+	requestFor := func(zone string, diskIdx int, diskType string) string {
+		variant := ""
+		if zone != cfg.Zone {
+			variant = zone
 		}
-		reqID := RequestIDForAttempt(string(np.UID), attempt)
-		if len(tried) > 1 {
-			reqID = RequestIDForVariant(string(np.UID), attempt, diskType)
+		if diskIdx > 0 {
+			variant += "/" + diskType
 		}
-		err = c.InsertInstance(ctx, project, cfg.Zone, reqID, instProto)
+		if variant == "" {
+			return RequestIDForAttempt(string(np.UID), attempt)
+		}
+		return RequestIDForVariant(string(np.UID), attempt, variant)
+	}
+	// tryZone inserts the instance in zone, with the one-shot disk type fallback.
+	tryZone := func(zone string, lp *launchPlan) error {
+		tried := map[string]bool{}
+		diskType := lp.DiskType
+		for {
+			tried[diskType] = true
+			instProto, berr := buildInstanceWith(np, project, instance, script, sshKeys, launchPlan{DiskType: diskType, GPUCount: lp.GPUCount, Zone: zone})
+			if berr != nil {
+				return Permanent(berr)
+			}
+			ierr := c.InsertInstance(ctx, project, zone, requestFor(zone, len(tried)-1, diskType), instProto)
+			if ierr == nil {
+				return nil
+			}
+			// Google adds machine series faster than any table: when the disk type is
+			// rejected for this machine type, try the next candidate ONCE. This is part
+			// of the same provisioning attempt, not a retry of it.
+			if cfg.BootDiskType == "" && len(tried) == 1 && isDiskTypeMismatch(ierr) {
+				if next := nextDiskFallback(tried, lp.Offered); next != "" && diskFits(lp.Offered[next], diskSizeGB(cfg)) {
+					log.Printf("[WARN] NodeProvision/%s: boot disk type %s was rejected for %s (%v); retrying once with %s",
+						name, diskType, np.Spec.InstanceType, ierr, next)
+					diskType = next
+					continue
+				}
+			}
+			return ierr
+		}
+	}
+
+	var exhaustedNow []string // zones that had no capacity during this call
+	var lastErr error
+	capacityZones := 0 // of those, zones with a real capacity shortage (not "unsupported here")
+	usedZone := ""
+	for zi, zone := range cands {
+		lp := lp0
+		if zi > 0 {
+			if lp, err = preflight(ctx, c, project, np, zone); err != nil {
+				return vpnResult, err
+			}
+		}
+		log.Printf("[INFO] NodeProvision/%s: Creating GCE instance %s (machineType=%s zone=%s boot disk %s: %s)",
+			name, instance, np.Spec.InstanceType, zone, lp.DiskType, lp.Reason)
+		err = tryZone(zone, lp)
 		if err == nil {
+			usedZone = zone
 			break
 		}
 		if IsAlreadyExists(err) {
@@ -289,26 +374,59 @@ func ProvisionInstance(
 			}
 			return &ProvisionResult{}, fmt.Errorf("%w: insert: %v", ErrInstanceAlreadyLaunched, err)
 		}
-		// Google adds machine series faster than any table: when the disk type is
-		// rejected for this machine type, try the next candidate ONCE. This is part
-		// of the same provisioning attempt, not a retry of it.
-		if cfg.BootDiskType == "" && len(tried) == 1 && isDiskTypeMismatch(err) {
-			if next := nextDiskFallback(tried, lp.Offered); next != "" && diskFits(lp.Offered[next], diskSizeGB(cfg)) {
-				log.Printf("[WARN] NodeProvision/%s: boot disk type %s was rejected for %s (%v); retrying once with %s",
-					name, diskType, np.Spec.InstanceType, err, next)
-				diskType = next
-				continue
+		if IsPermanent(err) {
+			return vpnResult, err
+		}
+		if !IsZoneCapacityError(err) {
+			wrapped := apiErrorf(err, "launching GCE instance")
+			if permanentAPIError(err) || isDiskTypeMismatch(err) {
+				wrapped = Permanent(wrapped)
 			}
+			return vpnResult, wrapped
 		}
-		wrapped := apiErrorf(err, "launching GCE instance")
-		if permanentAPIError(err) || isDiskTypeMismatch(err) {
-			wrapped = Permanent(wrapped)
+		// Capacity (or "not supported in this zone"): clean the zone, remember it,
+		// and go on with the next candidate. Not a provisioning retry.
+		log.Printf("[WARN] NodeProvision/%s: zone %s has no capacity for %s: %v", name, zone, np.Spec.InstanceType, err)
+		if cerr := cleanupZoneAttempt(ctx, c, project, zone, instance, string(np.UID)); cerr != nil {
+			return vpnResult, apiErrorf(cerr, "cleaning up zone %s after a capacity error", zone)
 		}
-		return vpnResult, wrapped
+		notifyZoneExhausted(ctx, zone)
+		exhaustedNow = append(exhaustedNow, zone)
+		lastErr = err
+		if Classify(err) != KindUnsupportedConfig {
+			capacityZones++
+		}
+	}
+	if usedZone == "" {
+		all := append(append([]string(nil), np.Status.ExhaustedZones...), exhaustedNow...)
+		if capacityZones == 0 && len(np.Status.ExhaustedZones) == 0 {
+			// Every zone said this configuration is not supported there (not a
+			// capacity shortage): waiting will not change that.
+			return vpnResult, Permanent(&apiError{
+				msg:   fmt.Sprintf("launching GCE instance (tried zone(s) %s): %s", strings.Join(all, ", "), Describe(lastErr)),
+				cause: lastErr,
+			})
+		}
+		return vpnResult, noCapacity(np, all, lastErr)
 	}
 	vpnResult.InstanceID = instance
-	log.Printf("[INFO] NodeProvision/%s: GCE instance %s created", name, instance)
+	vpnResult.Zone = usedZone
+	log.Printf("[INFO] NodeProvision/%s: GCE instance %s created in zone %s", name, instance, usedZone)
 	return vpnResult, nil
+}
+
+// noCapacity builds the "every zone exhausted" error for np.
+func noCapacity(np *mlv1alpha1.NodeProvision, zones []string, last error) error {
+	cfg := np.Spec.GCPConfig
+	region, _ := RegionOfZone(cfg.Zone)
+	e := &NoCapacityError{Machine: np.Spec.InstanceType, Region: region, Zones: zones, Fallback: fallbackEnabled(cfg), Last: last}
+	if a := cfg.Accelerator; a != nil {
+		e.Accelerator = a.Type
+	}
+	if len(e.Zones) == 0 {
+		e.Zones = []string{cfg.Zone}
+	}
+	return e
 }
 
 // buildInstance assembles the Instances.Insert body. script may be empty for a
@@ -330,6 +448,8 @@ type launchPlan struct {
 	DiskType string
 	// GPUCount is the guestAccelerators count, used when an accelerator is set.
 	GPUCount int32
+	// Zone overrides spec.gcpConfig.zone (zone fallback); "" = the spec's zone.
+	Zone string
 	// Offered, Reason: preflight output (unused by buildInstanceWith).
 	Offered map[string]*computepb.DiskType
 	Reason  string
@@ -350,9 +470,9 @@ func diskFits(d *computepb.DiskType, size int64) bool { return size >= minDiskGB
 // the machine type exists (naming the zones that offer it when not), is x86_64,
 // the accelerator is consistent with the machine's GPUs, and which boot disk
 // type to use. Its errors are permanent: retrying cannot change them.
-func preflight(ctx context.Context, c computeAPI, project string, np *mlv1alpha1.NodeProvision) (*launchPlan, error) {
+func preflight(ctx context.Context, c computeAPI, project string, np *mlv1alpha1.NodeProvision, zone string) (*launchPlan, error) {
 	cfg := np.Spec.GCPConfig
-	zone, mtName := cfg.Zone, np.Spec.InstanceType
+	mtName := np.Spec.InstanceType
 	region, _ := RegionOfZone(zone)
 
 	mt, err := c.GetMachineType(ctx, project, zone, mtName)
@@ -367,7 +487,7 @@ func preflight(ctx context.Context, c computeAPI, project string, np *mlv1alpha1
 		return nil, Permanent(fmt.Errorf("machine type %q is an Arm shape; only x86_64 machine types are supported", mtName))
 	}
 
-	lp := &launchPlan{}
+	lp := &launchPlan{Zone: zone}
 	if a := cfg.Accelerator; a != nil && a.Type != "" {
 		if _, err := c.GetAcceleratorType(ctx, project, zone, a.Type); err != nil {
 			if IsNotFound(err) {
@@ -424,6 +544,9 @@ func buildInstanceWith(np *mlv1alpha1.NodeProvision, project, instance, script, 
 		return nil, fmt.Errorf("spec.gcpConfig is required for GCP provider")
 	}
 	zone := cfg.Zone
+	if lp.Zone != "" {
+		zone = lp.Zone
+	}
 	region, ok := RegionOfZone(zone)
 	if !ok {
 		return nil, fmt.Errorf("spec.gcpConfig.zone %q is not a valid zone name", zone)
@@ -637,19 +760,27 @@ func DeleteInstance(ctx context.Context, np *mlv1alpha1.NodeProvision, creds Cre
 
 	if instanceName != "" {
 		log.Printf("[INFO] NodeProvision/%s: Deleting GCE instance %s", name, instanceName)
-		inst, owned, lerr := lookupInstance(ctx, c, project, zone, instanceName, string(np.UID))
-		switch {
-		case lerr != nil:
-			return fmt.Errorf("looking up instance %s: %w", instanceName, lerr)
-		case inst == nil:
-			log.Printf("[INFO] NodeProvision/%s: Instance %s already gone", name, instanceName)
-		case !owned:
-			log.Printf("[WARN] NodeProvision/%s: instance %s carries a different NodeProvision UID label; NOT deleting it", name, instanceName)
-		default:
-			if derr := c.DeleteInstance(ctx, project, zone, instanceName); derr != nil && !IsNotFound(derr) {
-				return fmt.Errorf("deleting instance %s: %w", instanceName, derr)
+		// With zoneFallback and no recorded zone the instance may be in any zone of
+		// the region (a delete that follows a crash before the zone was persisted).
+		zones, zerr := instanceSearchZones(ctx, c, project, np)
+		if zerr != nil {
+			return zerr
+		}
+		for _, zone := range zones {
+			inst, owned, lerr := lookupInstance(ctx, c, project, zone, instanceName, string(np.UID))
+			switch {
+			case lerr != nil:
+				return fmt.Errorf("looking up instance %s: %w", instanceName, lerr)
+			case inst == nil:
+				log.Printf("[INFO] NodeProvision/%s: Instance %s already gone (zone %s)", name, instanceName, zone)
+			case !owned:
+				log.Printf("[WARN] NodeProvision/%s: instance %s carries a different NodeProvision UID label; NOT deleting it", name, instanceName)
+			default:
+				if derr := c.DeleteInstance(ctx, project, zone, instanceName); derr != nil && !IsNotFound(derr) {
+					return fmt.Errorf("deleting instance %s: %w", instanceName, derr)
+				}
+				log.Printf("[INFO] NodeProvision/%s: Instance %s deleted", name, instanceName)
 			}
-			log.Printf("[INFO] NodeProvision/%s: Instance %s deleted", name, instanceName)
 		}
 	}
 

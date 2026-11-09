@@ -51,6 +51,19 @@ type fakeCompute struct {
 	// error injection (nil = succeed)
 	getInstanceErr    error
 	insertInstanceErr error
+	// disks are the zonal disks (key zone/name); deletedDisks records DeleteDisk calls.
+	disks        map[string]*computepb.Disk
+	deletedDisks []string
+	// insertedZones records the zone of every insert, in order.
+	insertedZones []string
+	deleteDiskErr error
+	// accelInfo optionally enriches GetAcceleratorType (key zone/type).
+	accelInfo map[string]*computepb.AcceleratorType
+	// leftoverOnFail makes a failed insert leave a labelled boot disk behind, as a
+	// partially created instance would.
+	leftoverOnFail bool
+	// zoneInsertErrs maps a zone to the error every insert in it returns.
+	zoneInsertErrs map[string]error
 	// insertInstanceErrs are returned by successive inserts (then insertInstanceErr).
 	insertInstanceErrs []error
 	deleteInstanceErr  error
@@ -121,15 +134,28 @@ func (f *fakeCompute) InsertInstance(_ context.Context, project, zone, requestID
 	defer f.mu.Unlock()
 	f.rec(project)
 	f.inserted = append(f.inserted, inst)
+	f.insertedZones = append(f.insertedZones, zone)
 	f.insertRequestID = append(f.insertRequestID, requestID)
+	fail := func(err error) error {
+		if f.leftoverOnFail {
+			if f.disks == nil {
+				f.disks = map[string]*computepb.Disk{}
+			}
+			f.disks[zone+"/"+inst.GetName()] = &computepb.Disk{Name: proto.String(inst.GetName()), Labels: inst.GetLabels()}
+		}
+		return err
+	}
+	if zerr, ok := f.zoneInsertErrs[zone]; ok {
+		return fail(zerr)
+	}
 	if len(f.insertInstanceErrs) > 0 {
 		err := f.insertInstanceErrs[0]
 		f.insertInstanceErrs = f.insertInstanceErrs[1:]
 		if err != nil {
-			return err
+			return fail(err)
 		}
 	} else if f.insertInstanceErr != nil {
-		return f.insertInstanceErr
+		return fail(f.insertInstanceErr)
 	}
 	key := zone + "/" + inst.GetName()
 	if _, ok := f.instances[key]; ok {
@@ -243,6 +269,29 @@ func (f *fakeCompute) GetMachineType(_ context.Context, _, zone, name string) (*
 	return nil, gerr(404, "notFound", "machine type not found")
 }
 
+func (f *fakeCompute) GetDisk(_ context.Context, _, zone, name string) (*computepb.Disk, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if d, ok := f.disks[zone+"/"+name]; ok {
+		return d, nil
+	}
+	return nil, gerr(404, "notFound", "disk not found")
+}
+
+func (f *fakeCompute) DeleteDisk(_ context.Context, _, zone, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deletedDisks = append(f.deletedDisks, zone+"/"+name)
+	if f.deleteDiskErr != nil {
+		return f.deleteDiskErr
+	}
+	if _, ok := f.disks[zone+"/"+name]; !ok {
+		return gerr(404, "notFound", "disk not found")
+	}
+	delete(f.disks, zone+"/"+name)
+	return nil
+}
+
 func diskTypeFixture(name, valid string) *computepb.DiskType {
 	return &computepb.DiskType{Name: proto.String(name), ValidDiskSize: proto.String(valid)}
 }
@@ -271,6 +320,9 @@ func (f *fakeCompute) GetAcceleratorType(_ context.Context, _, zone, name string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.accels[zone+"/"+name] {
+		if at, ok := f.accelInfo[zone+"/"+name]; ok {
+			return at, nil
+		}
 		return &computepb.AcceleratorType{Name: proto.String(name)}, nil
 	}
 	return nil, gerr(404, "notFound", "accelerator type not found")

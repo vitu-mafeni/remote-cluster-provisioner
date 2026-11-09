@@ -258,6 +258,8 @@ func clearProvisionedIdentity(st *mlv1alpha1.NodeProvisionStatus) {
 	st.PublicIP = ""
 	st.PrivateIP = ""
 	st.NodeName = ""
+	st.Zone = ""
+	st.ExhaustedZones = nil // a new pass starts with every zone eligible again
 }
 
 // stopJobForFailed cancels and forgets np's on-prem bootstrap job, if any,
@@ -594,6 +596,12 @@ func (r *NodeProvisionReconciler) terminateAWSInstance(ctx context.Context, np *
 // persistInstanceID records an EC2 instance (and its VPN address) on the
 // NodeProvision status with a bounded retry against conflicts.
 func (r *NodeProvisionReconciler) persistInstanceID(ctx context.Context, np *mlv1alpha1.NodeProvision, instanceID, vpnIP string) error {
+	return r.persistInstanceIDWith(ctx, np, instanceID, vpnIP, nil)
+}
+
+// persistInstanceIDWith is persistInstanceID plus an optional mutation applied in
+// the same status write (GCP records the zone the instance landed in).
+func (r *NodeProvisionReconciler) persistInstanceIDWith(ctx context.Context, np *mlv1alpha1.NodeProvision, instanceID, vpnIP string, mutate func(*mlv1alpha1.NodeProvisionStatus)) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &mlv1alpha1.NodeProvision{}
 		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
@@ -609,6 +617,9 @@ func (r *NodeProvisionReconciler) persistInstanceID(ctx context.Context, np *mlv
 		}
 		fresh.Status.Progress = 30
 		fresh.Status.LastUpdated = &now
+		if mutate != nil {
+			mutate(&fresh.Status)
+		}
 		if fresh.Status.StartTime == nil {
 			fresh.Status.StartTime = &now
 		}

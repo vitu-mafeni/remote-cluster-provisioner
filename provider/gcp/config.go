@@ -427,6 +427,12 @@ func ResolveDefaults(ctx context.Context, creds Credentials, np *mlv1alpha1.Node
 			return nil, err
 		}
 		cfg.Zone = zone
+		// Only a region was given: let the launch fall back to the region's other
+		// zones on a capacity error (recorded here so the choice is visible and stable).
+		if cfg.ZoneFallback == nil {
+			t := true
+			cfg.ZoneFallback = &t
+		}
 	}
 
 	// ── subnetwork ────────────────────────────────────────────────────────────

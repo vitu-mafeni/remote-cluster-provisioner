@@ -52,7 +52,8 @@ spec:
   # Uncomment to override any individual value:
   # gcpConfig:
   #   projectId: my-project
-  #   zone: us-central1-a
+  #   zone: us-central1-a                    # or only spec.region: a zone offering the machine type (+ accelerator) is chosen
+  #   zoneFallback: true                     # on a capacity error try the region's other zones (default: true without zone, false with one)
   #   network: default                       # or projects/<host>/global/networks/<vpc> (Shared VPC); derived from subnetwork when unset
   #   subnetwork: default                    # name, regions/<r>/subnetworks/<n> or projects/<p>/regions/<r>/subnetworks/<n>; required for custom-mode networks
   #   disableExternalIP: true                # private subnet: no external IP (needs Cloud NAT)

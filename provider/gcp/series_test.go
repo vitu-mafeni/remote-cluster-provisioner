@@ -16,6 +16,11 @@ const mismatchMsg = "Invalid value for field 'resource.disks[0].initializeParams
 // launchEnv provisions a VPN-less node with a fake GCE that offers the machine.
 func launchEnv(t *testing.T, mutate func(np *mlv1alpha1.NodeProvision), setup func(f *fakeCompute)) (*fakeCompute, *ProvisionResult, error) {
 	t.Helper()
+	return launchEnvCtx(t, context.Background(), mutate, setup)
+}
+
+func launchEnvCtx(t *testing.T, ctx context.Context, mutate func(np *mlv1alpha1.NodeProvision), setup func(f *fakeCompute)) (*fakeCompute, *ProvisionResult, error) {
+	t.Helper()
 	np := testNP()
 	np.Spec.DisableVPN = true
 	if mutate != nil {
@@ -31,7 +36,7 @@ func launchEnv(t *testing.T, mutate func(np *mlv1alpha1.NodeProvision), setup fu
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := ProvisionInstance(context.Background(), np, testCreds(), pub, nil, newProvEnvNetConfig(), pkgruntimeConfig())
+	res, err := ProvisionInstance(ctx, np, testCreds(), pub, nil, newProvEnvNetConfig(), pkgruntimeConfig())
 	return f, res, err
 }
 

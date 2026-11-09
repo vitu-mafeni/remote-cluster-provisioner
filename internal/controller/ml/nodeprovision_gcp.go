@@ -60,7 +60,8 @@ import (
 // the launch path). A nil field means the real implementation.
 type gcpAPI struct {
 	ResolveDefaults func(ctx context.Context, np *mlv1alpha1.NodeProvision, creds gcpprovision.Credentials) (*gcpprovision.Resolved, error)
-	FindInstance    func(ctx context.Context, np *mlv1alpha1.NodeProvision, creds gcpprovision.Credentials) (string, error)
+	// FindInstance returns the instance name and the zone it lives in.
+	FindInstance func(ctx context.Context, np *mlv1alpha1.NodeProvision, creds gcpprovision.Credentials) (id, zone string, err error)
 	// ProvisionInstance inserts the instance; sshPublicKey is the authorized_keys
 	// public half of the key stored in the <name>-ssh-key Secret.
 	ProvisionInstance func(ctx context.Context, np *mlv1alpha1.NodeProvision, creds gcpprovision.Credentials, sshPublicKey []byte,
@@ -255,7 +256,10 @@ func (r *NodeProvisionReconciler) reconcileGCPProvisioning(
 		return r.failNodeProvision(ctx, np, fmt.Sprintf("resolving cnlab-runtime config: %v", err))
 	}
 
-	result, err := r.gcp().ProvisionInstance(ctx, np, creds, sshPub, vpnServerClient, netConfig, runtimeCfg)
+	// Each zone that turns out to have no capacity is recorded in status as it
+	// happens, so a pass interrupted by a restart does not retry it.
+	provCtx := gcpprovision.WithZoneExhaustedHook(ctx, func(zone string) { r.recordExhaustedZone(ctx, np, zone) })
+	result, err := r.gcp().ProvisionInstance(provCtx, np, creds, sshPub, vpnServerClient, netConfig, runtimeCfg)
 	if errors.Is(err, gcpprovision.ErrInstanceAlreadyLaunched) {
 		// The insert reports that an instance of this name exists and the peer
 		// registered for this attempt was released. Not a failure: the next
@@ -282,7 +286,7 @@ func (r *NodeProvisionReconciler) reconcileGCPProvisioning(
 	}
 	if result.Adopted {
 		log.Info("ProvisionInstance adopted an existing GCE instance", "instance", result.InstanceID)
-		return r.adoptGCPInstance(ctx, np, result.InstanceID, netConfig)
+		return r.adoptGCPInstance(ctx, np, result.InstanceID, result.Zone, netConfig)
 	}
 	log.Info("GCE instance created", "instance", result.InstanceID)
 
@@ -292,7 +296,7 @@ func (r *NodeProvisionReconciler) reconcileGCPProvisioning(
 	// it is still recoverable: it carries this NodeProvision's UID label, so the
 	// CreatingInstance/ConfiguringVPN branch (recoverLaunchedInstance) adopts it,
 	// and deletion removes it by name.
-	if persistErr := r.persistInstanceID(ctx, np, result.InstanceID, result.VpnIP); persistErr != nil {
+	if persistErr := r.persistInstanceIDWith(ctx, np, result.InstanceID, result.VpnIP, gcpZoneMutation(result.Zone)); persistErr != nil {
 		log.Error(persistErr, "failed to persist InstanceID after retries — will retry on next reconcile",
 			"instance", result.InstanceID)
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
@@ -491,7 +495,7 @@ func (r *NodeProvisionReconciler) adoptExistingGCPInstance(
 	creds gcpprovision.Credentials,
 	netConfig *mlv1alpha1.NodeProvisionNetConfig,
 ) (res ctrl.Result, handled bool, err error) {
-	id, findErr := r.gcp().FindInstance(ctx, np, creds)
+	id, zone, findErr := r.gcp().FindInstance(ctx, np, creds)
 	if findErr != nil {
 		res, err = r.failNodeProvision(ctx, np, fmt.Sprintf("looking up existing GCE instance: %v", findErr))
 		return res, true, err
@@ -499,7 +503,7 @@ func (r *NodeProvisionReconciler) adoptExistingGCPInstance(
 	if id == "" {
 		return ctrl.Result{}, false, nil
 	}
-	res, err = r.adoptGCPInstance(ctx, np, id, netConfig)
+	res, err = r.adoptGCPInstance(ctx, np, id, zone, netConfig)
 	return res, true, err
 }
 
@@ -524,7 +528,7 @@ func (r *NodeProvisionReconciler) recoverLaunchedGCPInstance(ctx context.Context
 		log.Info("No usable GCP credentials to look for a launched instance", "err", cErr.Error())
 		return ctrl.Result{}, false, nil
 	}
-	id, fErr := r.gcp().FindInstance(ctx, np, creds)
+	id, zone, fErr := r.gcp().FindInstance(ctx, np, creds)
 	if fErr != nil {
 		log.Error(fErr, "looking for an already-launched GCE instance (will retry)")
 		return ctrl.Result{}, false, nil
@@ -539,7 +543,7 @@ func (r *NodeProvisionReconciler) recoverLaunchedGCPInstance(ctx context.Context
 			return ctrl.Result{RequeueAfter: requeueShort}, true, nil
 		}
 	}
-	res, err = r.adoptGCPInstance(ctx, np, id, netConfig)
+	res, err = r.adoptGCPInstance(ctx, np, id, zone, netConfig)
 	return res, true, err
 }
 
@@ -552,7 +556,7 @@ func (r *NodeProvisionReconciler) recoverLaunchedGCPInstance(ctx context.Context
 func (r *NodeProvisionReconciler) adoptGCPInstance(
 	ctx context.Context,
 	np *mlv1alpha1.NodeProvision,
-	id string,
+	id, zone string,
 	netConfig *mlv1alpha1.NodeProvisionNetConfig,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -570,7 +574,7 @@ func (r *NodeProvisionReconciler) adoptGCPInstance(
 	}
 
 	log.Info("Adopting GCE instance found by name and NodeProvision UID instead of launching another", "instance", id)
-	if pErr := r.persistInstanceID(ctx, np, id, vpnIP); pErr != nil {
+	if pErr := r.persistInstanceIDWith(ctx, np, id, vpnIP, gcpZoneMutation(zone)); pErr != nil {
 		log.Error(pErr, "persisting adopted InstanceID — will retry", "instance", id)
 	}
 	return ctrl.Result{RequeueAfter: requeueShort}, nil
@@ -623,7 +627,7 @@ func (r *NodeProvisionReconciler) resolveUnrecordedGCPInstance(ctx context.Conte
 		log.Info("No usable GCP credentials to look for an unrecorded instance — continuing", "err", err.Error())
 		return ctrl.Result{}, false
 	}
-	id, err := r.gcp().FindInstance(ctx, np, creds)
+	id, zone, err := r.gcp().FindInstance(ctx, np, creds)
 	if err != nil {
 		log.Error(err, "looking for an unrecorded GCE instance before retrying — will retry")
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, true
@@ -650,7 +654,7 @@ func (r *NodeProvisionReconciler) resolveUnrecordedGCPInstance(ctx context.Conte
 		return ctrl.Result{}, false
 	}
 	log.Info("Adopting the GCE instance of the failed attempt instead of replacing it", "instance", id)
-	if pErr := r.persistInstanceID(ctx, np, id, vpnIP); pErr != nil {
+	if pErr := r.persistInstanceIDWith(ctx, np, id, vpnIP, gcpZoneMutation(zone)); pErr != nil {
 		log.Error(pErr, "persisting adopted InstanceID — will retry", "instance", id)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, true
 	}
@@ -729,7 +733,7 @@ func (r *NodeProvisionReconciler) terminateOrphanedGCPInstance(ctx context.Conte
 		log.Error(err, what+" — will retry")
 		return true
 	}
-	id, err := r.gcp().FindInstance(ctx, np, creds)
+	id, _, err := r.gcp().FindInstance(ctx, np, creds)
 	if err != nil {
 		return giveUp("looking for an orphaned GCE instance", err)
 	}
@@ -786,4 +790,42 @@ func (r *NodeProvisionReconciler) cleanupGCPOnDelete(ctx context.Context, np *ml
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, true
 	}
 	return ctrl.Result{}, false
+}
+
+// gcpZoneMutation records the zone the instance landed in (and ends the pass's
+// exhausted-zone bookkeeping: the instance exists now).
+func gcpZoneMutation(zone string) func(*mlv1alpha1.NodeProvisionStatus) {
+	return func(st *mlv1alpha1.NodeProvisionStatus) {
+		if zone != "" {
+			st.Zone = zone
+		}
+		st.ExhaustedZones = nil
+	}
+}
+
+// recordExhaustedZone persists a zone without capacity in status (durable across
+// controller restarts) and mirrors it on np, so the rest of this pass sees it.
+// Best effort: a failed write only costs a repeated attempt in that zone.
+func (r *NodeProvisionReconciler) recordExhaustedZone(ctx context.Context, np *mlv1alpha1.NodeProvision, zone string) {
+	log := logf.FromContext(ctx)
+	add := func(st *mlv1alpha1.NodeProvisionStatus) {
+		for _, z := range st.ExhaustedZones {
+			if z == zone {
+				return
+			}
+		}
+		st.ExhaustedZones = append(st.ExhaustedZones, zone)
+	}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &mlv1alpha1.NodeProvision{}
+		if err := r.Get(ctx, types.NamespacedName{Name: np.Name, Namespace: np.Namespace}, fresh); err != nil {
+			return err
+		}
+		add(&fresh.Status)
+		return r.Status().Update(ctx, fresh)
+	})
+	if err != nil {
+		log.Error(err, "recording exhausted zone in status (continuing)", "zone", zone)
+	}
+	add(&np.Status)
 }

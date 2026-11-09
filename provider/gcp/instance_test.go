@@ -564,21 +564,21 @@ func TestFindInstance(t *testing.T) {
 
 	f := newFakeCompute()
 	useFake(t, f)
-	if id, err := FindInstance(ctx, np, testCreds()); err != nil || id != "" {
+	if id, _, err := FindInstance(ctx, np, testCreds()); err != nil || id != "" {
 		t.Errorf("nothing launched: %q %v", id, err)
 	}
 	f.put("us-central1-a", ownedInstance(np, "TERMINATED"))
-	if id, err := FindInstance(ctx, np, testCreds()); err != nil || id != "worker-1" {
+	if id, _, err := FindInstance(ctx, np, testCreds()); err != nil || id != "worker-1" {
 		t.Errorf("an owned instance is found whatever its state (the wait step judges it): %q %v", id, err)
 	}
 	foreign := ownedInstance(np, "RUNNING")
 	foreign.Labels = map[string]string{LabelUID: "other"}
 	f.put("us-central1-a", foreign)
-	if id, err := FindInstance(ctx, np, testCreds()); err != nil || id != "" {
+	if id, _, err := FindInstance(ctx, np, testCreds()); err != nil || id != "" {
 		t.Errorf("someone else's instance must be reported absent: %q %v", id, err)
 	}
 	f.getInstanceErr = gerr(503, "backendError", "x")
-	if _, err := FindInstance(ctx, np, testCreds()); err == nil {
+	if _, _, err := FindInstance(ctx, np, testCreds()); err == nil {
 		t.Error("lookup errors must surface")
 	}
 	// zone never resolved: nothing can exist, and no API call is made
@@ -586,7 +586,7 @@ func TestFindInstance(t *testing.T) {
 	useFake(t, f)
 	unresolved := testNP()
 	unresolved.Spec.GCPConfig.Zone = ""
-	if id, err := FindInstance(ctx, unresolved, testCreds()); err != nil || id != "" || f.getInstanceN != 0 {
+	if id, _, err := FindInstance(ctx, unresolved, testCreds()); err != nil || id != "" || f.getInstanceN != 0 {
 		t.Errorf("unresolved zone: %q %v calls=%d", id, err, f.getInstanceN)
 	}
 }

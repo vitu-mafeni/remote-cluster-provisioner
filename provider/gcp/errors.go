@@ -115,6 +115,7 @@ func Classify(err error) Kind {
 		return KindQuota
 	case strings.Contains(text, "zone_resource_pool_exhausted"), strings.Contains(text, "resource pool exhausted"),
 		strings.Contains(text, "does not have enough resources"), strings.Contains(text, "stockout"),
+		strings.Contains(text, "currently unavailable in the"),
 		strings.Contains(text, "resource_pool_exhausted"):
 		return KindStockout
 	}
@@ -273,3 +274,30 @@ func permanentAPIError(err error) bool {
 	}
 	return false
 }
+
+// IsZoneCapacityError reports whether an instances.insert error is zone-specific
+// and may succeed in another zone: a capacity shortage (ZONE_RESOURCE_POOL_EXHAUSTED,
+// ..._WITH_DETAILS, "does not have enough resources", "currently unavailable in
+// the") or GCE's "not supported in this zone with your configuration" (sent with
+// the same code). The structured reason is checked first, then the message.
+func IsZoneCapacityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ge *googleapi.Error
+	if errors.As(err, &ge) {
+		for _, e := range ge.Errors {
+			r := strings.ToUpper(e.Reason)
+			if strings.HasPrefix(r, "ZONE_RESOURCE_POOL_EXHAUSTED") || r == "RESOURCE_POOL_EXHAUSTED" {
+				return true
+			}
+		}
+	}
+	switch Classify(err) {
+	case KindStockout, KindUnsupportedConfig:
+		return true
+	}
+	return false
+}
+
+func asNoCapacity(err error, target **NoCapacityError) bool { return errors.As(err, target) }

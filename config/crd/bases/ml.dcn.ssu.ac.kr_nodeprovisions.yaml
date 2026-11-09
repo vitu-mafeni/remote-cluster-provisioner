@@ -324,6 +324,17 @@ spec:
                     description: Zone is the compute zone, e.g. "us-central1-a" (see
                       the type comment).
                     type: string
+                  zoneFallback:
+                    description: |-
+                      ZoneFallback lets the controller try the other zones of the region when the
+                      chosen zone has no capacity for the machine type (and accelerator)
+                      (ZONE_RESOURCE_POOL_EXHAUSTED and similar). Candidates are the UP zones of
+                      the region that offer the machine type and accelerator: the zone first, then
+                      the others alphabetically. Defaults to true when zone is left empty (the
+                      controller records the resolved choice here) and to false when zone is set
+                      explicitly. Only capacity errors fall back; configuration, quota and
+                      permission errors never do.
+                    type: boolean
                 type: object
               hardwareType:
                 description: |-
@@ -359,6 +370,14 @@ spec:
                 description: Timestamp when provisioning completed.
                 format: date-time
                 type: string
+              exhaustedZones:
+                description: |-
+                  ExhaustedZones are the zones in which the current GCP provisioning pass
+                  found no capacity. They are skipped when the pass continues (also after a
+                  controller restart) and cleared when a new pass starts.
+                items:
+                  type: string
+                type: array
               hostname:
                 description: Assigned hostname.
                 type: string
@@ -417,6 +436,11 @@ spec:
                 type: string
               vpnIp:
                 description: VpnIP is the WireGuard VPN IP allocated for this node.
+                type: string
+              zone:
+                description: |-
+                  Zone is the zone the GCE instance was created in (GCP). With
+                  gcpConfig.zoneFallback it can differ from spec.gcpConfig.zone.
                 type: string
             type: object
         required:

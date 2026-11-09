@@ -669,7 +669,8 @@ spec:
   # gcpConfig is optional — everything below is auto-populated when omitted:
   # gcpConfig:
   #   projectId: my-project
-  #   zone: us-central1-a
+  #   zone: us-central1-a                  # or only spec.region: the controller picks a zone offering the machine type (+ accelerator)
+  #   zoneFallback: true                   # try the region's other zones on a capacity error (default: true without zone, false with one)
   #   network: default              # or projects/<host>/global/networks/<vpc> (Shared VPC); derived from subnetwork when unset
   #   subnetwork: default           # name, regions/<r>/subnetworks/<n> or projects/<p>/regions/<r>/subnetworks/<n>
   #   imageFamily: ubuntu-2204-lts  # the default; or a custom image:
@@ -717,6 +718,23 @@ unset, or set it to the series' `-vws` workstation licence only (`nvidia-l4-vws`
 Any other accelerator/machine combination is refused. GPU VMs use `onHostMaintenance: TERMINATE`. As on AWS,
 the bootstrap installs no NVIDIA software: the GPU Operator owns the driver, container toolkit and CDI (leave
 Secure Boot off, the default, so its driver loads). Only x86_64 series are accepted (t2a, c4a, n4a, a4x are refused).
+
+**Zone fallback and capacity errors** — a zone can list a machine type and still have no capacity for it
+(`ZONE_RESOURCE_POOL_EXHAUSTED`, `ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS`, "does not have enough resources",
+"currently unavailable in the …"). `gcpConfig.zoneFallback` controls whether the other zones of the region are
+tried then: it defaults to **true when only `spec.region` is given** (the controller records the choice in the
+spec) and to **false when you name a `zone`**. Candidates are the `UP` zones of the region that offer the machine
+type and, if set, the accelerator type (within its per-instance count limit): the named zone first, then the others
+alphabetically. Only capacity errors move on to the next zone (GCE's "not supported in this zone with your
+configuration" does too); invalid configuration, quota, permission, disk-type and machine-type-not-found errors never
+do — they fail as before, with Google's text unchanged. The instance, its boot disk and any leftover of a failed
+zone are deleted before the next zone is tried; subnetwork, firewall rules and the VPN peer are regional and are
+created once. Each zone found without capacity is recorded in `status.exhaustedZones` immediately, so a controller
+restart in the middle of a pass does not retry it. A fallback to another zone does **not** use one of the 5
+`provisionRetryCount` attempts; only a pass over all candidates that finds nothing counts as one, fails with
+`no capacity for <machine> (+ <accelerator>) in <zones tried>; tried all zones of <region>. Try again later or use
+another region` (distinct from configuration errors) and is retried later with the normal backoff. If every zone says
+the configuration is not supported there, the failure is permanent instead. `status.zone` shows where the node landed.
 
 **Boot disk type, NIC and scheduling** — `gcpConfig.bootDiskType` is used verbatim when set (it must be offered
 in the zone, checked with `diskTypes.list`). When unset the controller takes the first type of the series'
@@ -1504,7 +1522,7 @@ metrics endpoint on the controller Deployment.
 | `credentialsRef` | secret ref | key auto-detected if omitted |
 | `disableVPN` | bool | default `false`; join the node without WireGuard. Normally **inherited** from the cluster (`RemoteCluster` control-plane → `NodeProvisionNetConfig` → `NodeProvision`); setting `true` against a VPN cluster fails the provision. Set at creation; not changeable afterwards (see [§5.3](#53-nodeprovision--add-a-node-from-the-remote-cluster), [§7.5](#75-operational-notes)) |
 | `awsConfig` | object | `vpcId`, `subnetId`, `securityGroupIds[]`, `disablePublicIp`, `amiName`, `amiOwners[]`, `rootSnapshotId`, `skipControlPlaneVpcCheck`, `ami`, `keyPairName`, `iamInstanceProfile`, `tags{}`, `rootVolumeSizeGB` — all auto-resolved if omitted |
-| `gcpConfig` | object | `projectId`, `zone`, `network`, `subnetwork`, `sourceImage` / `imageFamily` / `imageProject` / `sourceSnapshot`, `bootDiskSizeGB`, `bootDiskType`, `labels{}`, `networkTags[]`, `serviceAccountEmail`, `serviceAccountScopes[]`, `accelerator{type,count}`, `spot`, `disableExternalIP`, `firewallSourceRanges[]` — all optional, auto-resolved if omitted (see [§5.4](#54-nodeprovision-on-google-cloud-gcp)) |
+| `gcpConfig` | object | `projectId`, `zone`, `zoneFallback`, `network`, `subnetwork`, `sourceImage` / `imageFamily` / `imageProject` / `sourceSnapshot`, `bootDiskSizeGB`, `bootDiskType`, `labels{}`, `networkTags[]`, `serviceAccountEmail`, `serviceAccountScopes[]`, `accelerator{type,count}`, `spot`, `disableExternalIP`, `firewallSourceRanges[]` — all optional, auto-resolved if omitted (see [§5.4](#54-nodeprovision-on-google-cloud-gcp)) |
 
 **Status:**
 
@@ -1513,6 +1531,7 @@ metrics endpoint on the controller Deployment.
 | `phase` | `Pending`, `Validating`, `Provisioning`, `CreatingInstance` and `WaitingForInstance` (AWS, GCP), `ConfiguringVPN` (skipped when the VPN is disabled), `Bootstrapping`, `Joining`, `RegisteringNode`, `VerifyingHealth`, `PrePullingImages`, `Ready`, `Failed`, `Deleting`; the order differs by provider — see [§2.3](#23-nodeprovision-what-happens-phase-by-phase) |
 | `message` | Human-readable status |
 | `instanceId` / `hostname` / `ipAddress` | Identity (`instanceId` is the instance name on GCP) |
+| `zone` / `exhaustedZones[]` | GCP only: the zone the instance landed in (can differ from `gcpConfig.zone` after a zone fallback); the zones found without capacity during the current pass (cleared when a new pass starts) |
 | `publicIp` / `privateIp` | AWS and GCP (the instance's external / internal address) |
 | `vpnIp` | VPN IP allocated for this node |
 | `progress` | 0–100 |

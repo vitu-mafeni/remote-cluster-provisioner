@@ -161,6 +161,16 @@ type GCPConfig struct {
 	// Zone is the compute zone, e.g. "us-central1-a" (see the type comment).
 	// +optional
 	Zone string `json:"zone,omitempty"`
+	// ZoneFallback lets the controller try the other zones of the region when the
+	// chosen zone has no capacity for the machine type (and accelerator)
+	// (ZONE_RESOURCE_POOL_EXHAUSTED and similar). Candidates are the UP zones of
+	// the region that offer the machine type and accelerator: the zone first, then
+	// the others alphabetically. Defaults to true when zone is left empty (the
+	// controller records the resolved choice here) and to false when zone is set
+	// explicitly. Only capacity errors fall back; configuration, quota and
+	// permission errors never do.
+	// +optional
+	ZoneFallback *bool `json:"zoneFallback,omitempty"`
 	// Network is the VPC network name or "projects/<host>/global/networks/<n>"
 	// (Shared VPC). When unset it is taken from subnetwork if that is set,
 	// otherwise "default". If both are set the subnetwork must belong to it.
@@ -344,6 +354,17 @@ type NodeProvisionStatus struct {
 
 	// Assigned hostname.
 	Hostname string `json:"hostname,omitempty"`
+
+	// Zone is the zone the GCE instance was created in (GCP). With
+	// gcpConfig.zoneFallback it can differ from spec.gcpConfig.zone.
+	// +optional
+	Zone string `json:"zone,omitempty"`
+
+	// ExhaustedZones are the zones in which the current GCP provisioning pass
+	// found no capacity. They are skipped when the pass continues (also after a
+	// controller restart) and cleared when a new pass starts.
+	// +optional
+	ExhaustedZones []string `json:"exhaustedZones,omitempty"`
 
 	// IPAddress is the VPN (WireGuard) IP assigned to the node.
 	IPAddress string `json:"ipAddress,omitempty"`

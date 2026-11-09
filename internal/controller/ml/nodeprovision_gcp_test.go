@@ -83,13 +83,14 @@ type gcpStub struct {
 	resolve      func() (*gcpprovision.Resolved, error)
 	resolveCalls int
 
-	found    string
-	findErr  error
-	finds    int
-	provCall int
-	sawVPN   []bool // per ProvisionInstance call: was a VPN client passed
-	sawKey   []byte
-	provSeen *mlv1alpha1.NodeProvision
+	found     string
+	foundZone string // zone returned with found
+	findErr   error
+	finds     int
+	provCall  int
+	sawVPN    []bool // per ProvisionInstance call: was a VPN client passed
+	sawKey    []byte
+	provSeen  *mlv1alpha1.NodeProvision
 
 	provision func() (*gcpprovision.ProvisionResult, error)
 
@@ -118,11 +119,11 @@ func (s *gcpStub) install(r *NodeProvisionReconciler) {
 			}
 			return f()
 		},
-		FindInstance: func(context.Context, *mlv1alpha1.NodeProvision, gcpprovision.Credentials) (string, error) {
+		FindInstance: func(context.Context, *mlv1alpha1.NodeProvision, gcpprovision.Credentials) (string, string, error) {
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			s.finds++
-			return s.found, s.findErr
+			return s.found, s.foundZone, s.findErr
 		},
 		ProvisionInstance: func(_ context.Context, np *mlv1alpha1.NodeProvision, _ gcpprovision.Credentials, pub []byte,
 			vpn *ssh.Client, _ *mlv1alpha1.NodeProvisionNetConfig, _ pkgruntime.Config) (*gcpprovision.ProvisionResult, error) {
@@ -1386,5 +1387,82 @@ func TestGCP_SampleManifestsDecodeStrictly(t *testing.T) {
 		if err := gcpprovision.ValidateGCPConfig(spec); err != nil {
 			t.Errorf("%s: %v", np.Name, err)
 		}
+	}
+}
+
+// ── zone fallback ───────────────────────────────────────────────────────────
+
+func TestGCP_ZoneLandedInIsRecordedAndExhaustedZonesAreCleared(t *testing.T) {
+	np := gcpNP("n", func(np *mlv1alpha1.NodeProvision) {
+		np.Spec.DisableVPN = true
+		np.Status.ExhaustedZones = []string{"us-central1-a"}
+	})
+	stub := &gcpStub{provision: func() (*gcpprovision.ProvisionResult, error) {
+		res := gcpResult("")
+		res.Zone = "us-central1-b"
+		return res, nil
+	}}
+	r := gcpProvisioningReconciler(t, np, stub)
+	reconcileOnce(t, r, "n")
+	got := getNP(t, r, "n")
+	if got.Status.Zone != "us-central1-b" || len(got.Status.ExhaustedZones) != 0 || got.Status.InstanceID != "n" {
+		t.Errorf("status.zone must say where the node landed: %+v", got.Status)
+	}
+	if stub.provSeen == nil || len(stub.provSeen.Status.ExhaustedZones) != 1 || stub.provSeen.Status.ExhaustedZones[0] != "us-central1-a" {
+		t.Errorf("a pass resumed after a restart must hand the recorded zones to the provider: %+v", stub.provSeen)
+	}
+}
+
+func TestGCP_NoCapacityInAnyZoneCountsOneAttemptAndStaysRetryable(t *testing.T) {
+	np := gcpNP("n", func(np *mlv1alpha1.NodeProvision) { np.Spec.DisableVPN = true })
+	stub := &gcpStub{provision: func() (*gcpprovision.ProvisionResult, error) {
+		return &gcpprovision.ProvisionResult{}, &gcpprovision.NoCapacityError{
+			Machine: "e2-standard-4", Region: "us-central1", Fallback: true,
+			Zones: []string{"us-central1-a", "us-central1-b", "us-central1-c"},
+		}
+	}}
+	r := gcpProvisioningReconciler(t, np, stub)
+	res, err := r.Reconcile(context.Background(), reqFor("n"))
+	if err != nil || res.RequeueAfter <= 0 {
+		t.Fatalf("a full pass without capacity backs off and retries: %+v %v", res, err)
+	}
+	got := getNP(t, r, "n")
+	if got.Status.Phase != mlv1alpha1.NodeProvisionPhaseFailed || got.Status.ProvisionRetryCount != 1 {
+		t.Errorf("one failed pass is one attempt: phase=%q count=%d", got.Status.Phase, got.Status.ProvisionRetryCount)
+	}
+	if !strings.Contains(got.Status.Message, "no capacity for e2-standard-4 in us-central1-a, us-central1-b, us-central1-c") {
+		t.Errorf("the message must say there was no capacity and list the zones: %q", got.Status.Message)
+	}
+}
+
+func TestGCP_RecordExhaustedZonePersistsOnceAndAFreshPassStartsClean(t *testing.T) {
+	np := gcpNP("n", nil)
+	r := fixReconciler(t, np)
+	r.recordExhaustedZone(context.Background(), np, "us-central1-a")
+	r.recordExhaustedZone(context.Background(), np, "us-central1-b")
+	r.recordExhaustedZone(context.Background(), np, "us-central1-a")
+	got := getNP(t, r, "n")
+	if len(got.Status.ExhaustedZones) != 2 || got.Status.ExhaustedZones[0] != "us-central1-a" || got.Status.ExhaustedZones[1] != "us-central1-b" {
+		t.Errorf("zones must be persisted in order without duplicates: %v", got.Status.ExhaustedZones)
+	}
+	if len(np.Status.ExhaustedZones) != 2 {
+		t.Errorf("the in-memory object must mirror the status: %v", np.Status.ExhaustedZones)
+	}
+	st := got.Status
+	st.Zone = "us-central1-b"
+	clearProvisionedIdentity(&st)
+	if st.Zone != "" || len(st.ExhaustedZones) != 0 {
+		t.Errorf("a retry pass must start with every zone eligible: %+v", st)
+	}
+}
+
+func TestGCP_AdoptedInstanceRecordsItsZone(t *testing.T) {
+	np := gcpCreatingNP(func(np *mlv1alpha1.NodeProvision) { np.Spec.DisableVPN = true })
+	r := fixReconciler(t, np, gcpCredsSecret())
+	(&gcpStub{found: "n", foundZone: "us-central1-c"}).install(r)
+	reconcileOnce(t, r, "n")
+	got := getNP(t, r, "n")
+	if got.Status.InstanceID != "n" || got.Status.Zone != "us-central1-c" {
+		t.Errorf("adoption must record the zone the instance lives in: %+v", got.Status)
 	}
 }
