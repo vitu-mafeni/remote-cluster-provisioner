@@ -719,6 +719,40 @@ Any other accelerator/machine combination is refused. GPU VMs use `onHostMainten
 the bootstrap installs no NVIDIA software: the GPU Operator owns the driver, container toolkit and CDI (leave
 Secure Boot off, the default, so its driver loads). Only x86_64 series are accepted (t2a, c4a, n4a, a4x are refused).
 
+**GPU request → machine type** — `ResolveDefaults` turns `gcpConfig.accelerator` into a valid machine type + accelerator:
+
+- *Attached* GPUs (T4, P4, V100) stay on N1: the accelerator is kept and `count` is validated.
+- *Built-in* GPUs (everything else): the accelerator name only selects the machine type; it is then **cleared**
+  (built-in GPUs are not attached) and the substitution is logged and written to `status.message`. This happens only
+  when `instanceType` is empty or is the generic default `n1-standard-8`. A machine type you chose yourself that
+  conflicts with the accelerator is **never rewritten**: it fails permanently with the machine type to use.
+- A count no machine carries fails permanently and lists the valid counts and machine types.
+- `-vws` names (`nvidia-l4-vws`, `nvidia-rtx-pro-6000-vws`) are licences on g2/g4 and are kept; a non-`-vws` L4 / RTX PRO 6000
+  name selects the machine type with nothing attached.
+- `hardwareType: gpu` with neither `instanceType` nor `accelerator` is an error (a bare `nodeLabel: gpu` still defaults to N1 + 1 T4).
+
+| GPU | `accelerator.type` | Attached / built in | Machine type → GPU count | Notes |
+|---|---|---|---|---|
+| NVIDIA T4 | `nvidia-tesla-t4` (`-vws`) | attached to N1 | n1-* → 1, 2, 4 | |
+| NVIDIA P4 | `nvidia-tesla-p4` (`-vws`) | attached to N1 | n1-* → 1, 2, 4 | |
+| NVIDIA V100 | `nvidia-tesla-v100` | attached to N1 | n1-* → 1, 2, 4, 8 | no `-vws` name on the GPU page |
+| A100 40GB | `nvidia-tesla-a100` | built in (A2) | a2-highgpu-1g/2g/4g/8g → 1/2/4/8; a2-megagpu-16g → 16 | |
+| A100 80GB | `nvidia-a100-80gb` | built in (A2 Ultra) | a2-ultragpu-1g/2g/4g/8g → 1/2/4/8 | |
+| L4 | `nvidia-l4`; licence `nvidia-l4-vws` | built in (G2) | g2-standard-4/8/12/16/32 → 1; -24 → 2; -48 → 4; -96 → 8 | count 1 picks g2-standard-4 |
+| H100 80GB | `nvidia-h100-80gb` | built in (A3 High / Edge) | a3-highgpu-1g/2g/4g/8g → 1/2/4/8; a3-edgegpu-8g → 8 | 1g/2g/4g: Spot or Flex-start only (set `spot: true`) |
+| H100 Mega | `nvidia-h100-mega-80gb` | built in (A3 Mega) | a3-megagpu-8g → 8 | |
+| H200 | `nvidia-h200-141gb` | built in (A3 Ultra) | a3-ultragpu-8g → 8 | |
+| B200 | `nvidia-b200` | built in (A4) | a4-highgpu-8g → 8 | |
+| GB200 | `nvidia-gb200` | built in (A4X) | a4x-highgpu-4g → 4 | Arm: refused (x86_64 only) |
+| RTX PRO 6000 | `nvidia-rtx-pro-6000`; licence `nvidia-rtx-pro-6000-vws` | built in (G4) | g4-standard-48/96/192/384 → 1/2/4/8; g4-standard-6/12/24 → 1/8, 1/4, 1/2 | fractional sizes only via explicit `instanceType` |
+
+Sources (Google Cloud docs, read 2026-11-11): <https://docs.cloud.google.com/compute/docs/gpus> (GPU platforms, accelerator names, machine-type
+tables; "For these machine types, the GPU model is automatically attached to the instance."; "N1 machine types don't come with a set number of
+attached GPUs. Instead, you specify the number of GPUs to attach when creating the instance."),
+<https://docs.cloud.google.com/compute/docs/accelerator-optimized-machines>, <https://docs.cloud.google.com/compute/docs/gpus/gpu-regions-zones>.
+Not confirmed (UNVERIFIED): that A4X is Arm (taken from the series table); whether V100 supports `-vws` (the regions page says "T4 or V100 vWS",
+the GPU page says no — not accepted here); P100/K80 do not appear in the current docs and are not accepted.
+
 **Zone fallback and capacity errors** — a zone can list a machine type and still have no capacity for it
 (`ZONE_RESOURCE_POOL_EXHAUSTED`, `ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS`, "does not have enough resources",
 "currently unavailable in the …"). `gcpConfig.zoneFallback` controls whether the other zones of the region are

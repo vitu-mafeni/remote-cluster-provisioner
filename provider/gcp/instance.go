@@ -241,6 +241,8 @@ func ProvisionInstance(
 	// Before any firewall rule or VPN peer exists, so a configuration that can
 	// never launch fails without side effects.
 	exhausted := exhaustedSet(np)
+	// Snapshot: the exhausted-zone hook may update np.Status in place while we loop.
+	priorExhausted := append([]string(nil), np.Status.ExhaustedZones...)
 	cands, err := zoneCandidates(ctx, c, project, np, exhausted)
 	if err != nil {
 		return nil, err
@@ -398,8 +400,8 @@ func ProvisionInstance(
 		}
 	}
 	if usedZone == "" {
-		all := append(append([]string(nil), np.Status.ExhaustedZones...), exhaustedNow...)
-		if capacityZones == 0 && len(np.Status.ExhaustedZones) == 0 {
+		all := uniqueZones(append(append([]string(nil), priorExhausted...), exhaustedNow...))
+		if capacityZones == 0 && len(priorExhausted) == 0 {
 			// Every zone said this configuration is not supported there (not a
 			// capacity shortage): waiting will not change that.
 			return vpnResult, Permanent(&apiError{
@@ -873,4 +875,17 @@ func schedulingFor(machineType string, cfg *mlv1alpha1.GCPConfig) *computepb.Sch
 		}
 	}
 	return nil
+}
+
+// uniqueZones drops duplicates, keeping first-seen order.
+func uniqueZones(zs []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(zs))
+	for _, z := range zs {
+		if !seen[z] {
+			seen[z] = true
+			out = append(out, z)
+		}
+	}
+	return out
 }

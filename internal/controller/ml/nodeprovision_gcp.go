@@ -311,6 +311,7 @@ func (r *NodeProvisionReconciler) reconcileGCPProvisioning(
 func gcpDefaultsComplete(np *mlv1alpha1.NodeProvision) bool {
 	c := np.Spec.GCPConfig
 	return c != nil && np.Spec.InstanceType != "" && np.Spec.Region != "" &&
+		!gcpprovision.NeedsGPUResolution(np.Spec.InstanceType, c.Accelerator) &&
 		c.ProjectID != "" && c.Zone != "" && (c.SourceImage != "" || c.SourceSnapshot != "") && c.Network != ""
 }
 
@@ -346,6 +347,13 @@ func (r *NodeProvisionReconciler) resolveGCPDefaults(
 	np.Spec.GCPConfig = &cfg
 	if err := r.Patch(ctx, np, client.MergeFrom(base)); err != nil {
 		return false, fmt.Errorf("patching NodeProvision spec with resolved defaults: %w", err)
+	}
+	if res.Message != "" {
+		log.Info("GPU request resolved to a valid machine type", "detail", res.Message)
+		np.Status.Message = res.Message
+		if err := r.Status().Update(ctx, np); err != nil {
+			log.Error(err, "recording GPU resolution in status.message")
+		}
 	}
 	log.Info("Patched NodeProvision spec with resolved GCP defaults",
 		"project", cfg.ProjectID, "zone", cfg.Zone, "machineType", res.InstanceType,

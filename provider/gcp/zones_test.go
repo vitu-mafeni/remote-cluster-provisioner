@@ -370,3 +370,24 @@ func TestZoneFallback_AdoptionAndDeletionFindAnInstanceInAnotherZone(t *testing.
 		t.Error("zoneOf must follow status.zone")
 	}
 }
+
+// The controller's exhausted-zone hook updates np.Status in place while the
+// provider loops. A single zone that says "not supported" must still be
+// permanent (not "no capacity") and must be listed once.
+func TestZoneFallback_HookMutatingStatusDoesNotHideUnsupportedOrDuplicateZones(t *testing.T) {
+	unsupported := gerr(503, "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS", unsupportedConfigMsg)
+	var live *mlv1alpha1.NodeProvision
+	ctx := WithZoneExhaustedHook(context.Background(), func(z string) {
+		live.Status.ExhaustedZones = append(live.Status.ExhaustedZones, z)
+	})
+	_, _, err := launchEnvCtx(t, ctx, func(np *mlv1alpha1.NodeProvision) {
+		live = np
+		np.Spec.GCPConfig.ZoneFallback = nil
+	}, func(f *fakeCompute) { f.insertInstanceErr = unsupported })
+	if err == nil || !IsPermanent(err) || IsNoCapacity(err) {
+		t.Fatalf("a lone unsupported zone must be permanent: %v", err)
+	}
+	if strings.Count(err.Error(), "tried zone(s)") != 1 || strings.Contains(err.Error(), "us-central1-a, us-central1-a") {
+		t.Errorf("zone listed twice: %v", err)
+	}
+}

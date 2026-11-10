@@ -334,6 +334,10 @@ type Resolved struct {
 	Region       string
 	InstanceType string
 	Config       mlv1alpha1.GCPConfig
+	// Message records a substitution ResolveDefaults made (GPU machine type
+	// selection); the controller logs it and puts it in status.message. Empty when
+	// nothing was rewritten.
+	Message string
 }
 
 // ResolveDefaults fills in everything the spec left empty, validating what
@@ -359,6 +363,27 @@ func ResolveDefaults(ctx context.Context, creds Credentials, np *mlv1alpha1.Node
 	if cfg.ProjectID == "" {
 		return nil, fmt.Errorf("spec.gcpConfig.projectId is required: the service-account key has no project_id")
 	}
+
+	// GPU request -> valid machine type + accelerator (see gpus.go). An explicit
+	// machine type that conflicts with the accelerator is an error, never rewritten;
+	// an empty one (or the generic gpu default) is replaced by the shape that carries
+	// the GPU.
+	if res.InstanceType == "" && strings.EqualFold(strings.TrimSpace(np.Spec.HardwareType), "gpu") &&
+		(cfg.Accelerator == nil || cfg.Accelerator.Type == "") {
+		return nil, Permanent(fmt.Errorf("spec.hardwareType is gpu but neither spec.instanceType nor spec.gcpConfig.accelerator is set: set spec.gcpConfig.accelerator (e.g. nvidia-l4, nvidia-a100-80gb, nvidia-h100-mega-80gb) or a GPU machine type (e.g. g2-standard-4, a3-megagpu-8g)"))
+	}
+	gr, gerr := resolveGPU(res.InstanceType, cfg.Accelerator)
+	if gerr != nil {
+		return nil, Permanent(gerr)
+	}
+	if gr.InstanceType != "" {
+		res.InstanceType = gr.InstanceType
+	} else if cfg.Accelerator != nil && cfg.Accelerator.Type != "" {
+		// An attached GPU needs N1; do not fall back to the label's CPU shape.
+		res.InstanceType = genericDefaultMachine()
+	}
+	cfg.Accelerator = gr.Accelerator
+	res.Message = gr.Note
 
 	instanceTypeDefaulted := false
 	if res.InstanceType == "" {
