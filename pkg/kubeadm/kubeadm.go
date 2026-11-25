@@ -699,6 +699,7 @@ sudo exportfs -ra`,
 			// The shared checkpoint directory every worker mounts (it lives under the
 			// /srv/nfs/k8s export above, so it needs no export line of its own).
 			checkpointExportStep(),
+			CheckpointStorageMountSnippet(nodeIP, "sudo"),
 
 			// Second, separate export for Enterprise Gateway's kernelspecs (see
 			// EGKernelspecsExportPath). Kept as its own always-run, self-idempotent
@@ -808,7 +809,8 @@ printf '[Unit]\nAfter=crio.service\nRequires=crio.service\n' \
 
 		// ── Phase 7: kubeadm init ─────────────────────────────────────────────────────
 		// kubeadm init is guarded by `test -f admin.conf` so it is safe to retry.
-		{Name: "kubeadm Init", Steps: kubeadmInitSteps(kubeadmConfig, cgroupV1ConfigStep, cgroupV1PreflightArg)},
+		{Name: "kubeadm Init", Steps: append([]string{ControlPlaneTimeSyncStep(nodeIP, !cluster.Spec.DisableVPN)},
+			kubeadmInitSteps(kubeadmConfig, cgroupV1ConfigStep, cgroupV1PreflightArg)...)},
 
 		// ── Phase 8: Post-init ───────────────────────────────────────────────────────
 		{Name: "Post-Init", Steps: []string{
@@ -1199,6 +1201,7 @@ sudo systemctl restart crio || { sudo journalctl -xeu crio.service --no-pager >&
 
 		// ── Phase 8: kubeadm join ─────────────────────────────────────────────────────
 		{Name: "kubeadm Join", Steps: append([]string{
+			WorkerTimeSyncSnippet(joinCmd, "sudo"),
 			// The cluster-wide flannel DaemonSet will schedule a pod onto this
 			// node once it joins. Its cni-conf.json chains the "flannel" plugin
 			// (installed by flannel's own init container) with the standard

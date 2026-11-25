@@ -562,3 +562,12 @@ func TestRenderBootstrapScript_NoStorageStepWithoutAControlPlaneHost(t *testing.
 	}
 	assertBashSyntax(t, s)
 }
+
+func TestE2E_UnsynchronizedClockBlocksJoin(t *testing.T) {
+	script := e2eScript(t, true, "1.35.0", nil)
+	r := (e2eHost{noVPN: true, minor: "35", setup: "export FAKE_NTP_FAIL=1\n"}).run(t, script)
+	joins, _ := joinLines(r.Calls())
+	if r.ExitCode == 0 || len(joins) != 0 || !strings.Contains(r.Log, "clock did not synchronize with 10.0.0.1") {
+		t.Fatalf("expected clock synchronization to block kubeadm join:\n%s", r.Dump())
+	}
+}

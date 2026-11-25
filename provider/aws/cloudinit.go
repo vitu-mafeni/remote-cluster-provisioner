@@ -256,6 +256,7 @@ type templateData struct {
 	// directory (kubeadm.CheckpointStorageMountSnippet); empty when the join
 	// command has no usable control-plane host.
 	CheckpointStorageSnippet string
+	TimeSyncSnippet          string
 	NodeIPScript             string // NoVPN node-IP lookup; trusted controller text, see CloudInitParams.NodeIPScript
 	InstanceIDScript         string // current_instance_id body; trusted controller text, see CloudInitParams.InstanceIDScript
 	// InsecureRegistriesScript is the registries.conf.d drop-in writer
@@ -343,6 +344,7 @@ func renderBootstrapScript(p CloudInitParams) (string, error) {
 		NodeJoinedFunc:           kubeadm.NodeAlreadyJoinedFunc,
 		CgroupV1JoinSnippet:      kubeadm.CgroupV1JoinSnippet(p.KubernetesVersion, ""),
 		LonghornPackages:         kubeadm.LonghornPackagesArg(),
+		TimeSyncSnippet:          kubeadm.WorkerTimeSyncSnippet(p.JoinCommand, ""),
 		CheckpointStorageSnippet: kubeadm.CheckpointStorageMountSnippet(kubeadm.NFSServerFromJoinCommand(p.JoinCommand), ""),
 		NodeIPScript:             nodeIPScript(p),
 		InstanceIDScript:         instanceIDScript(p),
@@ -666,6 +668,8 @@ ip -4 addr show wg0 | grep -Eq 'inet[[:space:]]+'"$NODE_IP"'([/[:space:]]|$)' ||
 }
 report "WireGuard is ready on ${NODE_IP}"
 {{end}}
+report "Synchronizing host clock with the control plane"
+{{.TimeSyncSnippet}}
 # -----------------------------------------------------------------------------
 # cnlab-runtime OCI artifact install (ORAS-based, replaces all source builds)
 # -----------------------------------------------------------------------------

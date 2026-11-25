@@ -524,6 +524,11 @@ fi`); rerr != nil {
 		return fail(rerr)
 	}
 
+	reportStep("synchronizing host clock with the control plane")
+	if rerr := runStep("synchronizing host clock", 1, 1, kubeadm.WorkerTimeSyncSnippet(netNodeConfig.Status.ClusterJoinCommand, "sudo")); rerr != nil {
+		return fail(rerr)
+	}
+
 	reportStep("running kubeadm join (may take several minutes — pulling images and bootstrapping TLS)")
 	joinCmd := joinNodeCommand(clean, netNodeConfig.Status.ClusterJoinCommand)
 	if rerr := runStep("kubeadm join", 1, 1, joinCmd); rerr != nil {

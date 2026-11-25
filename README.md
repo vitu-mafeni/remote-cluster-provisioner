@@ -595,3 +595,28 @@ kubectl patch svc dex -n auth --type=json \
 - The controller dynamically registers/removes WireGuard peers via SSH on the VPN server as nodes are provisioned and deleted.
 - The VPN range is configured in `NodeProvisionNetConfig.spec.vpnRange`. IPs are allocated from the start of the range and released IPs are reused.
 - All of the above applies only when `disableVPN` is `false`; clusters running with `disableVPN: true` do not use a VPN server at all.
+
+
+## Host time and checkpoint storage
+
+During provisioning, Chrony sets the host time zone to `Asia/Seoul`. The
+control plane synchronizes with `time.google.com` and serves NTP on its node IP
+(the WireGuard IP when VPN is enabled). RemoteCluster, OnPrem, AWS, and GCP
+workers use the control-plane address from their kubeadm join command. Allow
+outbound UDP 123 from the control plane to the upstream and inbound UDP 123 on
+the control-plane node IP from the worker networks. Restrict that inbound access
+at the firewall to trusted networks.
+
+Chrony stays enabled after reboot and can step the clock on any update when the
+offset exceeds one second, including after a host has been backdated. Provisioning
+checks synchronization for up to about two minutes before reporting an NTP
+failure. Check the active source and remaining offset with `chronyc sources -v`
+and `chronyc tracking`. An existing control plane must serve NTP on the join
+endpoint before newly provisioned workers can join it. Already-provisioned nodes
+are outside the bootstrap rollout.
+
+The control plane exports `/srv/nfs/k8s`. It and the workers mount the
+`checkpoint-storage` subdirectory at `/shared-pvc/checkpoint-storage` using
+`nfs-common`. The mount is persisted in `/etc/fstab` for automount after reboot.
+Provisioning logs a warning if the mount fails. Verify the active source with
+`findmnt -T /shared-pvc/checkpoint-storage`.

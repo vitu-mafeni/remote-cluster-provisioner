@@ -154,7 +154,7 @@ func Run(t *testing.T, opts Options) Result {
 // minimal container image lacks.
 const baseSystem = `mkdir -p /etc/modules-load.d /etc/sysctl.d /etc/default /etc/systemd/system /etc/systemd/system/kubelet.service.d \
   /etc/containers /etc/cni/net.d /etc/crio /etc/sudoers.d /etc/wireguard /etc/apt/keyrings /etc/apt/sources.list.d \
-  /etc/ssh /etc/cdi /var/lib/kubelet /usr/local/bin /usr/local/sbin /var/log /var/lock /run/crio
+  /etc/ssh /etc/cdi /etc/chrony /var/lib/kubelet /usr/local/bin /usr/local/sbin /var/log /var/lock /run/crio
 touch /etc/fstab /etc/hosts
 mkdir -p /opt/cni/bin
 for p in portmap bridge host-local loopback flannel; do printf '#!/bin/sh\n' > /opt/cni/bin/$p; chmod +x /opt/cni/bin/$p; done
@@ -185,7 +185,14 @@ case "$cmd" in
 esac
 exit 0
 `,
-		"apt-get":  logCall + "exit 0\n",
+		"apt-get":     logCall + "exit 0\n",
+		"timedatectl": logCall + "exit 0\n",
+		"chronyd":     logCall + "exit 0\n",
+		"chronyc": logCall + `if [ "$1" = waitsync ] && [ "${FAKE_NTP_FAIL:-0}" = 1 ]; then
+  exit 1
+fi
+exit 0
+`,
 		"apt-mark": logCall + "exit 0\n",
 		"hostnamectl": logCall + `[ "$1" = set-hostname ] && echo "$2" > "$FAKE_LOG/hostname"
 exit 0
